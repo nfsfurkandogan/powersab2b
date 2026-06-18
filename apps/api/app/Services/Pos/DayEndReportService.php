@@ -1,0 +1,514 @@
+<?php
+
+namespace App\Services\Pos;
+
+use App\Models\Collection;
+use App\Models\IntegrationSyncState;
+use App\Models\PosExpense;
+use App\Models\PosPayment;
+use App\Models\PosSale;
+use App\Models\PosSession;
+use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\DB;
+
+class DayEndReportService
+{
+    public function __construct(private readonly PosExpenseService $posExpenseService) {}
+
+    /**
+     * @param  array<string, mixed>  $filters
+     * @return array<string, mixed>
+     */
+    public function build(User $user, array $filters): array
+    {
+        return DB::transaction(function () use ($user, $filters): array {
+            $salesBaseQuery = PosSale::query();
+            $this->applySaleFilters($salesBaseQuery, $user, $filters);
+
+            $expenseBaseQuery = PosExpense::query();
+            $this->posExpenseService->applyFilters($expenseBaseQuery, $user, $filters);
+
+            $paidSalesQuery = (clone $salesBaseQuery)->where('status', 'paid');
+            $cancelledSalesQuery = (clone $salesBaseQuery)->where('status', 'cancelled');
+
+            $paidCount = (clone $paidSalesQuery)->count();
+            $cancelledCount = (clone $cancelledSalesQuery)->count();
+
+            $vatTotalPaid = (float) ((clone $paidSalesQuery)->sum('vat_total') ?? 0);
+            $vatTotalCancelled = (float) ((clone $cancelledSalesQuery)->sum('vat_total') ?? 0);
+            $grandTotalPaid = (float) ((clone $paidSalesQuery)->sum('grand_total') ?? 0);
+            $grandTotalCancelled = (float) ((clone $cancelledSalesQuery)->sum('grand_total') ?? 0);
+
+            $documentRows = (clone $paidSalesQuery)
+                ->selectRaw('document_type, COUNT(*) as total_count')
+                ->groupBy('document_type')
+                ->pluck('total_count', 'document_type');
+
+            $paymentsByMethodRows = PosPayment::query()
+                ->selectRaw('method, COUNT(*) as payment_count, COALESCE(SUM(amount), 0) as total_amount')
+                ->whereHas('posSale', function (Builder $query) use ($user, $filters) {
+                    $this->applySaleFilters($query, $user, $filters);
+                    $query->where('status', 'paid');
+                })
+                ->groupBy('method')
+                ->get()
+                ->keyBy('method');
+
+            $manualCollectionsQuery = Collection::query();
+            $this->applyPointCollectionFilters($manualCollectionsQuery, $user, $filters);
+
+            $manualCollectionRows = (clone $manualCollectionsQuery)
+                ->selectRaw('method, COUNT(*) as payment_count, COALESCE(SUM(amount), 0) as total_amount')
+                ->groupBy('method')
+                ->get()
+                ->keyBy('method');
+
+            $recentPaidSaleModels = (clone $paidSalesQuery)
+                ->with(['customer:id,code,name', 'payments:id,pos_sale_id,method,amount', 'createdBy.roles:id,slug'])
+                ->latest('id')
+                ->limit(80)
+                ->get();
+            $saleRows = $recentPaidSaleModels
+                ->map(function (PosSale $sale): array {
+                    $primaryPayment = $sale->payments
+                        ->sortByDesc(fn (PosPayment $payment): float => (float) $payment->amount)
+                        ->first();
+                    $paymentMethod = $primaryPayment?->method ?? $sale->sale_type;
+                    $createdByRoleSlugs = $sale->createdBy?->roles
+                        ->pluck('slug')
+                        ->map(fn ($slug): string => (string) $slug)
+                        ->values()
+                        ->all() ?? [];
+                    $isWarehouseSale = in_array('warehouse', $createdByRoleSlugs, true);
+
+                    return [
+                        'id' => $sale->id,
+                        'receipt_no' => $sale->receipt_no,
+                        'customer_code' => $sale->customer?->code,
+                        'customer_name' => $sale->customer?->name,
+                        'sale_type' => $sale->sale_type,
+                        'document_type' => $sale->document_type,
+                        'payment_method' => $paymentMethod,
+                        'is_warehouse_sale' => $isWarehouseSale,
+                        'grand_total' => number_format((float) $sale->grand_total, 2, '.', ''),
+                        'created_at' => $sale->created_at?->toIso8601String(),
+                    ];
+                })
+                ->values();
+            $normalSaleRows = $saleRows
+                ->filter(
+                    fn (array $row): bool => (bool) ($row['is_warehouse_sale'] ?? false)
+                        || ! in_array((string) ($row['payment_method'] ?? ''), ['cash', 'card'], true)
+                )
+                ->values();
+            $cashSaleRows = $saleRows
+                ->filter(
+                    fn (array $row): bool => ! (bool) ($row['is_warehouse_sale'] ?? false)
+                        && (string) ($row['payment_method'] ?? '') === 'cash'
+                )
+                ->values();
+            $cardSaleRows = $saleRows
+                ->filter(
+                    fn (array $row): bool => ! (bool) ($row['is_warehouse_sale'] ?? false)
+                        && (string) ($row['payment_method'] ?? '') === 'card'
+                )
+                ->values();
+
+            $recentCollectionRows = (clone $manualCollectionsQuery)
+                ->with(['customer:id,code,name'])
+                ->latest('id')
+                ->limit(80)
+                ->get()
+                ->map(fn (Collection $collection): array => [
+                    'id' => $collection->id,
+                    'reference_no' => $collection->reference_no,
+                    'customer_code' => $collection->customer?->code,
+                    'customer_name' => $collection->customer?->name,
+                    'method' => $collection->method,
+                    'amount' => number_format((float) $collection->amount, 2, '.', ''),
+                    'date' => optional($collection->date ?? $collection->collection_date)->toDateString(),
+                    'created_at' => $collection->created_at?->toIso8601String(),
+                ])
+                ->values();
+
+            $totalsByMethod = collect(['cash', 'card', 'transfer'])
+                ->map(function (string $method) use ($paymentsByMethodRows, $manualCollectionRows): array {
+                    $paymentRow = $paymentsByMethodRows->get($method);
+                    $collectionMethod = $method === 'card' ? 'cc' : $method;
+                    $collectionRow = $manualCollectionRows->get($collectionMethod);
+
+                    return [
+                        'method' => $method,
+                        'payment_count' => (int) ($paymentRow?->payment_count ?? 0) + (int) ($collectionRow?->payment_count ?? 0),
+                        'total_amount' => number_format(
+                            (float) ($paymentRow?->total_amount ?? 0) + (float) ($collectionRow?->total_amount ?? 0),
+                            2,
+                            '.',
+                            ''
+                        ),
+                    ];
+                })
+                ->values()
+                ->all();
+
+            $cashTotal = (float) (collect($totalsByMethod)->firstWhere('method', 'cash')['total_amount'] ?? 0);
+            $expenseCount = (clone $expenseBaseQuery)->count();
+            $expenseTotal = (float) ((clone $expenseBaseQuery)->sum('amount') ?? 0);
+            $expenseCategories = (clone $expenseBaseQuery)
+                ->selectRaw('category, COUNT(*) as expense_count, COALESCE(SUM(amount), 0) as total_amount')
+                ->groupBy('category')
+                ->orderByDesc('total_amount')
+                ->get()
+                ->map(fn ($row): array => [
+                    'category' => (string) $row->category,
+                    'expense_count' => (int) $row->expense_count,
+                    'total_amount' => number_format((float) $row->total_amount, 2, '.', ''),
+                ])
+                ->values()
+                ->all();
+            $recentExpenseModels = (clone $expenseBaseQuery)
+                ->with(['posSession.cashbox', 'createdBy'])
+                ->orderByDesc('expense_date')
+                ->orderByDesc('id')
+                ->limit(10)
+                ->get();
+            $recentExpenseSyncStates = $this->syncStatesForEntities(
+                'pos-expenses',
+                PosExpense::class,
+                $recentExpenseModels->pluck('id')->all()
+            );
+            $recentExpenses = $recentExpenseModels
+                ->map(function (PosExpense $expense) use ($recentExpenseSyncStates): array {
+                    $syncState = $recentExpenseSyncStates->get((int) $expense->id);
+
+                    return [
+                        'id' => $expense->id,
+                        'pos_session_id' => $expense->pos_session_id,
+                        'expense_date' => optional($expense->expense_date)->toDateString(),
+                        'category' => $expense->category,
+                        'amount' => number_format((float) $expense->amount, 2, '.', ''),
+                        'currency' => $expense->currency,
+                        'note' => $expense->note,
+                        'cashbox' => [
+                            'id' => $expense->posSession?->cashbox?->id,
+                            'code' => $expense->posSession?->cashbox?->code,
+                            'name' => $expense->posSession?->cashbox?->name,
+                        ],
+                        'created_by' => [
+                            'id' => $expense->createdBy?->id,
+                            'name' => $expense->createdBy?->name,
+                        ],
+                        'logo_sync_status' => $syncState?->status,
+                        'logo_sync_error' => $syncState?->last_error,
+                        'logo_external_ref' => $syncState?->external_ref,
+                        'logo_last_synced_at' => $syncState?->last_synced_at?->toIso8601String(),
+                        'created_at' => $expense->created_at?->toIso8601String(),
+                    ];
+                })
+                ->values()
+                ->all();
+
+            $deliverySaleIds = (clone $paidSalesQuery)
+                ->where('document_type', 'delivery')
+                ->pluck('id')
+                ->all();
+            $expenseIds = (clone $expenseBaseQuery)->pluck('id')->all();
+
+            $session = null;
+            $expectedCash = null;
+            if (! empty($filters['pos_session_id'])) {
+                $sessionModel = PosSession::query()
+                    ->with(['cashbox', 'openedBy'])
+                    ->find((int) $filters['pos_session_id']);
+
+                if ($sessionModel !== null) {
+                    $session = [
+                        'id' => $sessionModel->id,
+                        'status' => $sessionModel->status,
+                        'opened_at' => $sessionModel->opened_at,
+                        'closed_at' => $sessionModel->closed_at,
+                        'opening_cash' => number_format((float) $sessionModel->opening_cash, 2, '.', ''),
+                        'closing_cash_counted' => $sessionModel->closing_cash_counted !== null
+                            ? number_format((float) $sessionModel->closing_cash_counted, 2, '.', '')
+                            : null,
+                        'cashbox' => [
+                            'id' => $sessionModel->cashbox?->id,
+                            'code' => $sessionModel->cashbox?->code,
+                            'name' => $sessionModel->cashbox?->name,
+                        ],
+                        'opened_by' => [
+                            'id' => $sessionModel->openedBy?->id,
+                            'name' => $sessionModel->openedBy?->name,
+                        ],
+                    ];
+                    $expectedCash = (float) $sessionModel->opening_cash + $cashTotal - $expenseTotal;
+                }
+            }
+
+            return [
+                'filters' => [
+                    'pos_session_id' => $filters['pos_session_id'] ?? null,
+                    'cashbox_id' => $filters['cashbox_id'] ?? null,
+                    'date' => $filters['date'] ?? null,
+                    'date_from' => $filters['date_from'] ?? null,
+                    'date_to' => $filters['date_to'] ?? null,
+                ],
+                'session' => $session,
+                'summary' => [
+                    'sale_count' => $paidCount + $cancelledCount,
+                    'paid_count' => $paidCount,
+                    'cancelled_count' => $cancelledCount,
+                    'document_count' => [
+                        'invoice' => (int) ($documentRows['invoice'] ?? 0),
+                        'delivery' => (int) ($documentRows['delivery'] ?? 0),
+                    ],
+                    'cash_total' => number_format($cashTotal, 2, '.', ''),
+                    'vat_total' => number_format($vatTotalPaid, 2, '.', ''),
+                    'vat_total_cancelled' => number_format($vatTotalCancelled, 2, '.', ''),
+                    'grand_total' => number_format($grandTotalPaid, 2, '.', ''),
+                    'grand_total_cancelled' => number_format($grandTotalCancelled, 2, '.', ''),
+                    'expense_count' => $expenseCount,
+                    'expense_total' => number_format($expenseTotal, 2, '.', ''),
+                    'expected_cash' => $expectedCash !== null ? number_format($expectedCash, 2, '.', '') : null,
+                    'net_total' => number_format($grandTotalPaid - $grandTotalCancelled, 2, '.', ''),
+                ],
+                'totals_by_method' => $totalsByMethod,
+                'expenses' => [
+                    'count' => $expenseCount,
+                    'total_amount' => number_format($expenseTotal, 2, '.', ''),
+                    'by_category' => $expenseCategories,
+                    'recent' => $recentExpenses,
+                ],
+                'report_tables' => [
+                    'normal_sales' => $normalSaleRows->all(),
+                    'cash_sales' => $cashSaleRows->all(),
+                    'card_sales' => $cardSaleRows->all(),
+                    'cash_collections' => $recentCollectionRows->where('method', 'cash')->values()->all(),
+                    'card_collections' => $recentCollectionRows->where('method', 'cc')->values()->all(),
+                ],
+                'cancelled' => [
+                    'count' => $cancelledCount,
+                    'total_amount' => number_format($grandTotalCancelled, 2, '.', ''),
+                ],
+                'logo_sync' => [
+                    'sales' => $this->logoStateSummary('pos-sales', PosSale::class, $deliverySaleIds),
+                    'expenses' => $this->logoStateSummary('pos-expenses', PosExpense::class, $expenseIds),
+                    'collections' => $this->collectionSyncSummary(clone $manualCollectionsQuery),
+                ],
+                'generated_at' => now()->toIso8601String(),
+            ];
+        }, 2);
+    }
+
+    /**
+     * @param  Builder<PosSale>  $query
+     * @param  array<string, mixed>  $filters
+     * @return Builder<PosSale>
+     */
+    public function applySaleFilters(Builder $query, User $user, array $filters): Builder
+    {
+        if (! $user->hasRole('admin')) {
+            $query->whereHas('posSession.openedBy', fn (Builder $q) => $q->where('dealer_id', $user->dealer_id));
+
+            if ($user->hasAnyRole(['cashier', 'point']) && ! $user->hasRole('dealer_admin')) {
+                $query->whereHas('posSession', fn (Builder $q) => $q->where('opened_by', $user->id));
+            }
+        }
+
+        if (! empty($filters['pos_session_id'])) {
+            $query->where('pos_session_id', (int) $filters['pos_session_id']);
+        }
+
+        if (! empty($filters['cashbox_id'])) {
+            $query->whereHas('posSession', fn (Builder $q) => $q->where('cashbox_id', (int) $filters['cashbox_id']));
+        }
+
+        if (! empty($filters['date'])) {
+            $query->whereDate('created_at', (string) $filters['date']);
+        } else {
+            if (! empty($filters['date_from'])) {
+                $query->whereDate('created_at', '>=', (string) $filters['date_from']);
+            }
+
+            if (! empty($filters['date_to'])) {
+                $query->whereDate('created_at', '<=', (string) $filters['date_to']);
+            }
+        }
+
+        return $query;
+    }
+
+    /**
+     * @param  Builder<Collection>  $query
+     * @param  array<string, mixed>  $filters
+     * @return Builder<Collection>
+     */
+    private function applyPointCollectionFilters(Builder $query, User $user, array $filters): Builder
+    {
+        $dateColumn = 'COALESCE(`date`, collection_date)';
+
+        $query->where(function (Builder $scope) use ($filters): void {
+            $scope->whereRaw("json_extract(meta, '$.source') = ?", ['point_collection']);
+
+            if (! empty($filters['pos_session_id'])) {
+                $scope->orWhereRaw("json_extract(meta, '$.pos_session_id') = ?", [(int) $filters['pos_session_id']]);
+            }
+
+            if (! empty($filters['cashbox_id'])) {
+                $scope->orWhereRaw("json_extract(meta, '$.cashbox_id') = ?", [(int) $filters['cashbox_id']]);
+            }
+        });
+
+        if (! $user->hasRole('admin')) {
+            $query->where('dealer_id', $user->dealer_id);
+
+            if ($user->hasAnyRole(['cashier', 'point']) && ! $user->hasRole('dealer_admin')) {
+                $query->where('collected_by_user_id', $user->id);
+            }
+        }
+
+        if (! empty($filters['pos_session_id'])) {
+            $query->whereRaw("json_extract(meta, '$.pos_session_id') = ?", [(int) $filters['pos_session_id']]);
+        }
+
+        if (! empty($filters['cashbox_id'])) {
+            $query->whereRaw("json_extract(meta, '$.cashbox_id') = ?", [(int) $filters['cashbox_id']]);
+        }
+
+        if (! empty($filters['date'])) {
+            $query->whereRaw("DATE({$dateColumn}) = ?", [(string) $filters['date']]);
+        } else {
+            if (! empty($filters['date_from'])) {
+                $query->whereRaw("DATE({$dateColumn}) >= ?", [(string) $filters['date_from']]);
+            }
+
+            if (! empty($filters['date_to'])) {
+                $query->whereRaw("DATE({$dateColumn}) <= ?", [(string) $filters['date_to']]);
+            }
+        }
+
+        return $query;
+    }
+
+    /**
+     * @param  array<int, int|string>  $entityIds
+     * @return \Illuminate\Support\Collection<int, IntegrationSyncState>
+     */
+    private function syncStatesForEntities(string $domain, string $entityClass, array $entityIds): \Illuminate\Support\Collection
+    {
+        $ids = collect($entityIds)
+            ->filter(fn ($id) => is_numeric($id))
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values();
+
+        if ($ids->isEmpty()) {
+            return collect();
+        }
+
+        return IntegrationSyncState::query()
+            ->where('system', 'logo')
+            ->where('domain', $domain)
+            ->where('direction', 'outbound')
+            ->where('entity_type', $entityClass)
+            ->whereIn('entity_id', $ids->all())
+            ->latest('id')
+            ->get()
+            ->unique('entity_id')
+            ->keyBy(fn (IntegrationSyncState $state) => (int) $state->entity_id);
+    }
+
+    /**
+     * @param  array<int, int|string>  $entityIds
+     * @return array<string, int>
+     */
+    private function logoStateSummary(string $domain, string $entityClass, array $entityIds): array
+    {
+        $ids = collect($entityIds)
+            ->filter(fn ($id) => is_numeric($id))
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values();
+
+        $summary = $this->emptyLogoSyncSummary($ids->count());
+
+        if ($ids->isEmpty()) {
+            return $summary;
+        }
+
+        $rows = IntegrationSyncState::query()
+            ->selectRaw('status, COUNT(*) as total_count')
+            ->where('system', 'logo')
+            ->where('domain', $domain)
+            ->where('direction', 'outbound')
+            ->where('entity_type', $entityClass)
+            ->whereIn('entity_id', $ids->all())
+            ->groupBy('status')
+            ->pluck('total_count', 'status');
+
+        $tracked = 0;
+        foreach ($rows as $status => $count) {
+            $count = (int) $count;
+            $tracked += $count;
+            $this->addLogoSyncCount($summary, is_string($status) ? $status : null, $count);
+        }
+
+        $summary['missing'] = max(0, $summary['total'] - $tracked);
+
+        return $summary;
+    }
+
+    /**
+     * @param  Builder<Collection>  $query
+     * @return array<string, int>
+     */
+    private function collectionSyncSummary(Builder $query): array
+    {
+        $summary = $this->emptyLogoSyncSummary((clone $query)->count());
+
+        if ($summary['total'] === 0) {
+            return $summary;
+        }
+
+        $rows = (clone $query)
+            ->selectRaw('sync_status, COUNT(*) as total_count')
+            ->groupBy('sync_status')
+            ->pluck('total_count', 'sync_status');
+
+        foreach ($rows as $status => $count) {
+            $this->addLogoSyncCount($summary, is_string($status) ? $status : null, (int) $count);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @return array<string, int>
+     */
+    private function emptyLogoSyncSummary(int $total = 0): array
+    {
+        return [
+            'total' => $total,
+            'queued' => 0,
+            'processing' => 0,
+            'synced' => 0,
+            'failed' => 0,
+            'missing' => 0,
+        ];
+    }
+
+    /**
+     * @param  array<string, int>  $summary
+     */
+    private function addLogoSyncCount(array &$summary, ?string $status, int $count): void
+    {
+        match ($status) {
+            'queued', 'pending' => $summary['queued'] += $count,
+            'processing' => $summary['processing'] += $count,
+            'synced' => $summary['synced'] += $count,
+            'failed' => $summary['failed'] += $count,
+            default => $summary['missing'] += $count,
+        };
+    }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@powersa/logo-sync",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync:customers": "node logo-customers-sync.mjs",
+    "sync:customers-export": "node logo-customers-export.mjs",
+    "sync:products": "node logo-products-sync.mjs",
+    "sync:ledger": "node logo-ledger-sync.mjs",
+    "sync:collections": "node logo-collections-export.mjs",
+    "sync:pos-expenses-from-logo": "node logo-pos-expenses-sync.mjs",
+    "sync:pos-sales": "node logo-pos-sales-export.mjs",
+    "sync:pos-expenses": "node logo-pos-expenses-export.mjs",
+    "sync:documents-export": "node logo-documents-export.mjs",
+    "sync:all": "node logo-sync-all.mjs",
+    "sync:daemon": "node logo-sync-daemon.mjs",
+    "sync:doctor": "node logo-sync-doctor.mjs",
+    "write:preflight": "node logo-write-preflight.mjs",
+    "write:queue-status": "node logo-write-queue-status.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "mssql": "^11.0.1"
+  }
+}

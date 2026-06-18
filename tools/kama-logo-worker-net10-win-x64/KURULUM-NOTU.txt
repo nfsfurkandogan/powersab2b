@@ -1,0 +1,12 @@
+Kama Logo Worker - Windows x64 (.NET 10 self-contained)
+
+1. Bu klasoru Logo SQL'e erisebilen Windows bilgisayara kopyalayin.
+2. appsettings.json.example dosyasini appsettings.json olarak kopyalayin.
+3. appsettings.json icinde RabbitMQ, B2B ve Logo SQL bilgilerini doldurun.
+4. Test icin Kama.LogoWorker.exe dosyasini komut satirindan calistirin.
+5. Surekli calismasi gerekiyorsa Windows Service veya Task Scheduler ile calistirin.
+
+Not:
+- Bu paket .NET runtime istemeden calismasi icin self-contained publish edildi.
+- Hedef runtime: win-x64
+- Target framework: net10.0

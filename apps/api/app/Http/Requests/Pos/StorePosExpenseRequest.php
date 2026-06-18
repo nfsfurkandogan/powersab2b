@@ -1,0 +1,28 @@
+<?php
+
+namespace App\Http\Requests\Pos;
+
+use Illuminate\Foundation\Http\FormRequest;
+
+class StorePosExpenseRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return true;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function rules(): array
+    {
+        return [
+            'pos_session_id' => ['required', 'integer', 'exists:pos_sessions,id'],
+            'amount' => ['required', 'numeric', 'gt:0'],
+            'category' => ['required', 'string', 'max:80'],
+            'note' => ['nullable', 'string', 'max:255'],
+            'expense_date' => ['nullable', 'date'],
+            'meta' => ['nullable', 'array'],
+        ];
+    }
+}

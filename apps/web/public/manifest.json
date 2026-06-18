@@ -1,0 +1,29 @@
+{
+  "id": "/",
+  "name": "PowerSA B2B",
+  "short_name": "PowerSA B2B",
+  "description": "PowerSA B2B bayi ve operasyon paneli",
+  "lang": "tr",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#12362f",
+  "background_color": "#071312",
+  "categories": ["business", "productivity"],
+  "icons": [
+    {
+      "src": "/pwa/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

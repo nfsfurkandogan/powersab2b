@@ -1,0 +1,72 @@
+[
+  {
+    "slug": "kontrol-paneli",
+    "label": "Kontrol Paneli",
+    "svg": "svg/kontrol-paneli.svg",
+    "png_1024": "png-1024/kontrol-paneli.png",
+    "png_512": "png-512/kontrol-paneli.png"
+  },
+  {
+    "slug": "urun-arama",
+    "label": "Ürün Arama",
+    "svg": "svg/urun-arama.svg",
+    "png_1024": "png-1024/urun-arama.png",
+    "png_512": "png-512/urun-arama.png"
+  },
+  {
+    "slug": "moderator",
+    "label": "Moderatör",
+    "svg": "svg/moderator.svg",
+    "png_1024": "png-1024/moderator.png",
+    "png_512": "png-512/moderator.png"
+  },
+  {
+    "slug": "kataloglar",
+    "label": "Kataloglar",
+    "svg": "svg/kataloglar.svg",
+    "png_1024": "png-1024/kataloglar.png",
+    "png_512": "png-512/kataloglar.png"
+  },
+  {
+    "slug": "sepet",
+    "label": "Sepet",
+    "svg": "svg/sepet.svg",
+    "png_1024": "png-1024/sepet.png",
+    "png_512": "png-512/sepet.png"
+  },
+  {
+    "slug": "musteri",
+    "label": "Müşteri",
+    "svg": "svg/musteri.svg",
+    "png_1024": "png-1024/musteri.png",
+    "png_512": "png-512/musteri.png"
+  },
+  {
+    "slug": "cari-hesap",
+    "label": "Cari Hesap",
+    "svg": "svg/cari-hesap.svg",
+    "png_1024": "png-1024/cari-hesap.png",
+    "png_512": "png-512/cari-hesap.png"
+  },
+  {
+    "slug": "tahsilat",
+    "label": "Tahsilat",
+    "svg": "svg/tahsilat.svg",
+    "png_1024": "png-1024/tahsilat.png",
+    "png_512": "png-512/tahsilat.png"
+  },
+  {
+    "slug": "raporlar",
+    "label": "Raporlar",
+    "svg": "svg/raporlar.svg",
+    "png_1024": "png-1024/raporlar.png",
+    "png_512": "png-512/raporlar.png"
+  },
+  {
+    "slug": "ekstra",
+    "label": "Ekstra",
+    "svg": "svg/ekstra.svg",
+    "png_1024": "png-1024/ekstra.png",
+    "png_512": "png-512/ekstra.png"
+  }
+]

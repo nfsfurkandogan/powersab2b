@@ -1,0 +1,469 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\Customer;
+use App\Models\Dealer;
+use App\Models\Product;
+use App\Models\Role;
+use App\Models\StockSummary;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use Tests\TestCase;
+
+class PriceModelApiTest extends TestCase
+{
+    use RefreshDatabase;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        config()->set('cache.stores.redis', ['driver' => 'array']);
+        config()->set('meilisearch.enabled', false);
+    }
+
+    public function test_cart_item_requires_new_price_model_rows_when_legacy_table_is_absent(): void
+    {
+        $this->assertFalse(Schema::hasTable('dealer_product_price'));
+
+        $dealer = $this->createDealer('DLR-PRC-001');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [$customer, $product] = $this->createCustomerAndProduct($dealer, $user);
+
+        $this->actingAs($user);
+
+        $response = $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 2,
+        ]);
+
+        $response
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['product_id'])
+            ->assertJsonPath('errors.product_id.0', 'Bu ürün için fiyat gelmemiş. Logo fiyat senkronunu çalıştırın.');
+    }
+
+    public function test_cart_item_uses_base_price_from_assigned_price_list(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-002');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [$customer, $product] = $this->createCustomerAndProduct($dealer, $user);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 123.45,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 1,
+        ])->assertOk()
+            ->assertJsonPath('items.0.unit_price', '123.45');
+    }
+
+    public function test_cart_item_allows_zero_stock_when_price_exists(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-ZERO-STOCK');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [$customer, $product] = $this->createCustomerAndProduct($dealer, $user);
+        StockSummary::query()
+            ->where('product_id', $product->id)
+            ->update(['available_total' => 0]);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 123.45,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 3,
+        ])->assertOk()
+            ->assertJsonPath('items.0.quantity', 3)
+            ->assertJsonPath('items.0.available_total', 0)
+            ->assertJsonPath('items.0.unit_price', '123.45');
+    }
+
+    public function test_point_user_with_cart_order_permissions_can_submit_product_search_order(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-POINT-ORDER');
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+            'menu_permissions' => ['search', 'cart', 'orders'],
+        ])->save();
+        [$customer, $product] = $this->createCustomerAndProduct($dealer);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 170.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $cartResponse = $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 2,
+        ]);
+
+        $cartResponse
+            ->assertOk()
+            ->assertJsonPath('cart.customer_id', $customer->id)
+            ->assertJsonPath('items.0.product_id', $product->id)
+            ->assertJsonPath('items.0.quantity', 2);
+
+        $this->postJson('/api/orders', [
+            'cart_id' => $cartResponse->json('cart.id'),
+        ])->assertCreated()
+            ->assertJsonPath('order.customer.id', $customer->id)
+            ->assertJsonPath('order.status', 'pending');
+    }
+
+    public function test_point_user_can_submit_zero_stock_cart_when_price_exists(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-POINT-ZERO-STOCK');
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+            'menu_permissions' => ['search', 'cart'],
+            'feature_permissions' => ['search.add_to_cart', 'cart.view', 'cart.checkout'],
+        ])->save();
+        [$customer, $product] = $this->createCustomerAndProduct($dealer);
+
+        StockSummary::query()
+            ->where('product_id', $product->id)
+            ->update(['available_total' => 0, 'reserved_total' => 0]);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 170.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $cartResponse = $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 2,
+            'warehouse_transfer' => true,
+        ]);
+
+        $cartResponse
+            ->assertOk()
+            ->assertJsonPath('items.0.available_total', 0)
+            ->assertJsonPath('items.0.quantity', 2);
+
+        $this->postJson('/api/orders', [
+            'cart_id' => $cartResponse->json('cart.id'),
+        ])->assertCreated()
+            ->assertJsonPath('order.customer.id', $customer->id)
+            ->assertJsonPath('order.status', 'approved');
+
+        $this->assertDatabaseHas('stock_summary', [
+            'product_id' => $product->id,
+            'available_total' => 0,
+            'reserved_total' => 0,
+        ]);
+    }
+
+    public function test_batum_cart_item_converts_try_price_to_lari(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-BATUM');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        $user->forceFill([
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+        ])->save();
+        [$customer, $product] = $this->createCustomerAndProduct($dealer);
+        $customer->forceFill([
+            'salesperson_user_id' => $user->id,
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+        ])->save();
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 123.45,
+            'currency' => '160',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 1,
+        ])->assertOk()
+            ->assertJsonPath('cart.currency', 'GEL')
+            ->assertJsonPath('items.0.unit_price', '7.26')
+            ->assertJsonPath('items.0.currency', 'GEL');
+    }
+
+    public function test_batum_products_search_converts_try_price_to_lari(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-BATUM-SEARCH');
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+            'menu_permissions' => ['search'],
+        ])->save();
+        [, $product] = $this->createCustomerAndProduct($dealer);
+        $product->forceFill([
+            'sku' => 'CS0040',
+            'meta' => [
+                'specode4' => 'E',
+                'integrations' => [
+                    'logo' => [
+                        'synced_at' => now()->toIso8601String(),
+                        'external_ref' => 'CS0040',
+                        'payload' => [
+                            'raw' => [
+                                'SPECODE4' => 'E',
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])->save();
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 170.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $this->getJson('/api/products/search?q=cs0040&limit=20')
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $product->id)
+            ->assertJsonPath('data.0.net_price', '10.00')
+            ->assertJsonPath('data.0.list_price', '10.00')
+            ->assertJsonPath('data.0.currency', 'GEL');
+    }
+
+    public function test_cart_item_prefers_dealer_override_over_base_price(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-003');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [$customer, $product] = $this->createCustomerAndProduct($dealer, $user);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 100.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        DB::table('dealer_price_overrides')->insert([
+            'dealer_id' => $dealer->id,
+            'product_id' => $product->id,
+            'net_price' => 147.90,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 1,
+        ])->assertOk()
+            ->assertJsonPath('items.0.unit_price', '147.90');
+    }
+
+    public function test_products_search_applies_price_list_discount_rate_over_base_price(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-004');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [, $product] = $this->createCustomerAndProduct($dealer);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('price_lists')->where('id', $priceListId)->update([
+            'discount_rate' => 10,
+            'updated_at' => now(),
+        ]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 200.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $response = $this->getJson('/api/products/search?limit=20&sort=stock_desc');
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $product->id);
+        $response->assertJsonPath('data.0.net_price', '180.00');
+    }
+
+    public function test_products_search_prefers_dealer_override_over_price_list_discount_rate(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-005');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [, $product] = $this->createCustomerAndProduct($dealer);
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('price_lists')->where('id', $priceListId)->update([
+            'discount_rate' => 10,
+            'updated_at' => now(),
+        ]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 200.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        DB::table('dealer_price_overrides')->insert([
+            'dealer_id' => $dealer->id,
+            'product_id' => $product->id,
+            'net_price' => 133.33,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $response = $this->getJson('/api/products/search?limit=20&sort=stock_desc');
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $product->id);
+        $response->assertJsonPath('data.0.net_price', '133.33');
+    }
+
+    private function createDealer(string $code): Dealer
+    {
+        return Dealer::query()->create([
+            'code' => $code,
+            'name' => 'Dealer '.$code,
+            'is_active' => true,
+        ]);
+    }
+
+    private function createUserWithRole(string $roleSlug, ?Dealer $dealer = null): User
+    {
+        $role = Role::query()->firstOrCreate(
+            ['slug' => $roleSlug],
+            ['name' => Str::headline(str_replace('_', ' ', $roleSlug))]
+        );
+
+        $user = User::factory()->create([
+            'dealer_id' => $dealer?->id,
+            'is_active' => true,
+        ]);
+
+        $user->roles()->sync([$role->id]);
+
+        return $user;
+    }
+
+    /**
+     * @return array{0: Customer, 1: Product}
+     */
+    private function createCustomerAndProduct(Dealer $dealer, ?User $assignedUser = null): array
+    {
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'CR-'.Str::upper(Str::random(6)),
+            'name' => 'Price Test Customer',
+            'salesperson_user_id' => $assignedUser?->id,
+            'is_active' => true,
+        ]);
+
+        $product = Product::withoutEvents(function (): Product {
+            return Product::query()->create([
+                'sku' => 'SKU-'.Str::upper(Str::random(6)),
+                'oem_code' => 'OEM-'.Str::upper(Str::random(6)),
+                'name' => 'Price Test Product',
+                'vat_rate' => 20,
+                'is_active' => true,
+                'meta' => [
+                    'specode4' => 'E',
+                    'integrations' => [
+                        'logo' => [
+                            'synced_at' => now()->toIso8601String(),
+                            'external_ref' => 'PRICE-TEST',
+                            'payload' => [
+                                'raw' => [
+                                    'SPECODE4' => 'E',
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ]);
+        });
+
+        StockSummary::query()->create([
+            'product_id' => $product->id,
+            'available_total' => 100,
+            'reserved_total' => 0,
+            'updated_at' => now(),
+        ]);
+
+        return [$customer, $product];
+    }
+}

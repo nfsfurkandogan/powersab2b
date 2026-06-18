@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: powersa_postgres
+    environment:
+      POSTGRES_DB: powersa
+      POSTGRES_USER: powersa
+      POSTGRES_PASSWORD: powersa
+    ports:
+      - "5432:5432"
+    volumes:
+      - powersa_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U powersa -d powersa"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: powersa_redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - powersa_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.7
+    container_name: powersa_meili
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-dev_master_key_change_me}
+      MEILI_ENV: development
+    ports:
+      - "7700:7700"
+    volumes:
+      - powersa_meilidata:/meili_data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7700/health | grep -q available"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  powersa_pgdata:
+  powersa_redisdata:
+  powersa_meilidata:

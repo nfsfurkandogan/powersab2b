@@ -1,0 +1,39 @@
+{
+  "Worker": {
+    "PrefetchCount": 1,
+    "MaxRetryAttempts": 5
+  },
+  "RabbitMq": {
+    "Host": "127.0.0.1",
+    "Port": 5672,
+    "Username": "guest",
+    "Password": "guest",
+    "VirtualHost": "/",
+    "Exchange": "powersa.logo",
+    "QueueName": "logo.write.worker",
+    "RoutingKeys": [
+      "logo.customer.create",
+      "logo.customer.update",
+      "logo.collection.create"
+    ]
+  },
+  "B2B": {
+    "BaseUrl": "https://powersab2b.com/backend",
+    "CustomerAckPath": "/api/integrations/logo/customers/ack",
+    "CollectionAckPath": "/api/integrations/logo/collections/ack",
+    "CustomerSyncKey": "",
+    "CollectionSyncKey": ""
+  },
+  "Logo": {
+    "WriteMode": "StoredProcedure",
+    "CompanyNo": 2,
+    "PeriodNo": 1,
+    "Username": "",
+    "Password": "",
+    "MachineName": "LOGO-SERVER",
+    "SqlConnectionString": "Server=LOGO-SERVER\\LOGO;Database=LOGODB;User Id=sa;Password=***;TrustServerCertificate=True;Encrypt=False",
+    "CustomerCreateProcedure": "dbo.POWERSA_B2B_CUSTOMER_UPSERT",
+    "CustomerUpdateProcedure": "dbo.POWERSA_B2B_CUSTOMER_UPSERT",
+    "CollectionCreateProcedure": "dbo.POWERSA_B2B_COLLECTION_CREATE"
+  }
+}

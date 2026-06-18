@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Ürün Arama">
+  <defs>
+    <linearGradient id="bg" x1="130" y1="95" x2="880" y2="940" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#88c9ff"/>
+      <stop offset="0.24" stop-color="#176db5"/>
+      <stop offset="0.58" stop-color="#08335f"/>
+      <stop offset="1" stop-color="#07140F"/>
+    </linearGradient>
+    <radialGradient id="topGlow" cx="28%" cy="16%" r="62%">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.78"/>
+      <stop offset="0.33" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bottomGlow" cx="62%" cy="94%" r="60%">
+      <stop offset="0" stop-color="#2ee08a" stop-opacity="0.55"/>
+      <stop offset="0.48" stop-color="#176db5" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="border" x1="135" y1="80" x2="820" y2="950">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.78"/>
+      <stop offset="0.32" stop-color="#FFFFFF" stop-opacity="0.38"/>
+      <stop offset="0.64" stop-color="#2ee08a" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.10"/>
+    </linearGradient>
+    <linearGradient id="iconStroke" x1="260" y1="220" x2="780" y2="820" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.42" stop-color="#E8FFF1"/>
+      <stop offset="1" stop-color="#2ee08a"/>
+    </linearGradient>
+    <linearGradient id="iconFill" x1="270" y1="240" x2="760" y2="810" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.45" stop-color="#EAF6FF"/>
+      <stop offset="1" stop-color="#2ee08a"/>
+    </linearGradient>
+    <radialGradient id="accentGlow" cx="34%" cy="18%" r="90%">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.35" stop-color="#2ee08a"/>
+      <stop offset="1" stop-color="#176db5"/>
+    </radialGradient>
+    <clipPath id="roundClip">
+      <rect x="62" y="62" width="900" height="900" rx="172"/>
+    </clipPath>
+    <filter id="outerShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="26" stdDeviation="34" flood-color="#000000" flood-opacity="0.40"/>
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#FFFFFF" flood-opacity="0.14"/>
+    </filter>
+    <filter id="iconShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="20" stdDeviation="18" flood-color="#000000" flood-opacity="0.42"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="8" flood-color="#FFFFFF" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <rect x="62" y="62" width="900" height="900" rx="172" fill="url(#bg)" filter="url(#outerShadow)"/>
+  <g clip-path="url(#roundClip)">
+    <rect x="62" y="62" width="900" height="900" rx="172" fill="url(#topGlow)"/>
+    <rect x="62" y="62" width="900" height="900" rx="172" fill="url(#bottomGlow)"/>
+    <path d="M86 96 C260 34 423 72 565 118 C696 161 817 146 960 94 V344 C790 282 676 290 560 332 C410 386 242 362 86 300 Z" fill="#FFFFFF" opacity="0.18"/>
+    <path d="M72 790 C240 718 430 785 610 830 C752 866 860 850 962 795 V962 H62 V830 Z" fill="#000000" opacity="0.18"/>
+  </g>
+  <rect x="62" y="62" width="900" height="900" rx="172" fill="none" stroke="url(#border)" stroke-width="11"/>
+  <rect x="90" y="90" width="844" height="844" rx="148" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="4"/>
+
+  
+        <g>
+          <circle cx="465" cy="435" r="157" stroke="url(#iconStroke)" stroke-width="52" stroke-linecap="round" stroke-linejoin="round" fill="none" filter="url(#iconShadow)"/>
+          <circle cx="465" cy="435" r="105" fill="url(#iconFill)" opacity="0.32"/>
+          <path d="M580 552 L724 696" stroke="url(#iconStroke)" stroke-width="52" stroke-linecap="round" stroke-linejoin="round" fill="none" filter="url(#iconShadow)"/>
+          <path d="M363 337 C392 308 435 290 483 292" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round" opacity="0.72"/>
+        </g>
+</svg>

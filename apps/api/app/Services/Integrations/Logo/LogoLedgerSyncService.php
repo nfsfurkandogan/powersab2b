@@ -1,0 +1,665 @@
+<?php
+
+namespace App\Services\Integrations\Logo;
+
+use App\Models\Collection;
+use App\Models\Customer;
+use App\Models\Dealer;
+use App\Models\LedgerEntry;
+use App\Services\Integrations\IntegrationSyncStateService;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class LogoLedgerSyncService
+{
+    public function __construct(
+        private readonly IntegrationSyncStateService $syncState
+    ) {}
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @return array<string, int>
+     */
+    public function sync(array $payload): array
+    {
+        $defaultDealer = $this->resolveDealer(
+            $payload['dealer_id'] ?? null,
+            $payload['dealer_code'] ?? null,
+        );
+
+        $summary = [
+            'received' => count($payload['records'] ?? []),
+            'created' => 0,
+            'updated' => 0,
+            'skipped' => 0,
+            'balances_recalculated' => 0,
+        ];
+
+        DB::transaction(function () use ($payload, $defaultDealer, &$summary): void {
+            $affectedCustomerIds = [];
+
+            foreach ((array) ($payload['records'] ?? []) as $index => $record) {
+                $dealer = $this->resolveDealer(
+                    $record['dealer_id'] ?? null,
+                    $record['dealer_code'] ?? null,
+                    $defaultDealer,
+                );
+
+                if (! $dealer) {
+                    throw ValidationException::withMessages([
+                        "records.$index.dealer_id" => ['Cari hareket icin eslesen bayi bulunamadi.'],
+                    ]);
+                }
+
+                $customer = $this->resolveCustomer(
+                    $dealer,
+                    $record['customer_code'] ?? null,
+                    $record['customer_external_ref'] ?? null,
+                    $index,
+                );
+
+                $linkedB2bCollection = $this->resolveLinkedB2bCollection($customer, $record);
+                $entry = $this->findLedgerEntry(
+                    $customer,
+                    (string) $record['external_ref'],
+                );
+
+                if (! $entry && $linkedB2bCollection) {
+                    $entry = $this->findLedgerEntryForLinkedB2bCollection($customer, $linkedB2bCollection);
+                }
+
+                $debit = $this->normalizeMoney($record['debit'] ?? 0);
+                $credit = $this->normalizeMoney($record['credit'] ?? 0);
+                $legacyEntryType = $debit > 0 ? 'debit' : 'credit';
+                $legacyAmount = $debit > 0 ? $debit : $credit;
+                $providedBalance = array_key_exists('balance_after', $record) && is_numeric($record['balance_after'])
+                    ? $this->normalizeMoney($record['balance_after'])
+                    : null;
+
+                $preserveB2bCollectionLedgerType = $entry
+                    && $linkedB2bCollection
+                    && (int) $entry->collection_id === (int) $linkedB2bCollection->id
+                    && $entry->source_system === 'b2b';
+
+                $attributes = [
+                    'dealer_id' => $dealer->id,
+                    'customer_id' => $customer->id,
+                    'source_system' => 'logo',
+                    'source_reference' => (string) $record['external_ref'],
+                    'last_synced_at' => now(),
+                    'order_id' => null,
+                    'collection_id' => $linkedB2bCollection?->id,
+                    'date' => (string) $record['date'],
+                    'type' => $preserveB2bCollectionLedgerType ? ($entry->type ?: 'payment') : (string) $record['type'],
+                    'debit' => number_format($debit, 2, '.', ''),
+                    'credit' => number_format($credit, 2, '.', ''),
+                    'balance_after' => $providedBalance !== null
+                        ? number_format($providedBalance, 2, '.', '')
+                        : ($entry?->balance_after ?? 0),
+                    'entry_date' => (string) $record['date'],
+                    'entry_type' => $legacyEntryType,
+                    'amount' => number_format($legacyAmount, 2, '.', ''),
+                    'currency' => strtoupper((string) ($record['currency'] ?? 'TRY')),
+                    'reference_no' => $this->nullableString($record['reference_no'] ?? null),
+                    'description' => $preserveB2bCollectionLedgerType
+                        ? ($entry->description ?: $this->nullableString($record['description'] ?? null))
+                        : $this->nullableString($record['description'] ?? null),
+                    'created_by_user_id' => $preserveB2bCollectionLedgerType ? $entry->created_by_user_id : null,
+                    'meta' => $this->buildMeta($entry, $record),
+                ];
+
+                if ($entry) {
+                    $entry->fill($attributes)->save();
+                    $ledgerEntry = $entry;
+                    $summary['updated']++;
+                } else {
+                    $ledgerEntry = LedgerEntry::query()->create($attributes);
+                    $summary['created']++;
+                }
+
+                $this->syncState->record(
+                    system: 'logo',
+                    domain: 'ledger',
+                    direction: 'inbound',
+                    entity: $ledgerEntry,
+                    externalRef: (string) $record['external_ref'],
+                    status: 'synced',
+                    meta: [
+                        'operation' => $ledgerEntry->wasRecentlyCreated ? 'created' : 'updated',
+                        'type' => (string) ($record['type'] ?? ''),
+                    ],
+                    payload: $record,
+                );
+
+                $this->syncCollectionMirrorForRecord($dealer, $customer, $ledgerEntry, $record);
+                $affectedCustomerIds[$customer->id] = $customer->id;
+            }
+
+            $summary['balances_recalculated'] = $this->recalculateBalances(array_values($affectedCustomerIds));
+        });
+
+        return $summary;
+    }
+
+    /**
+     * @return array{scanned:int,created:int,updated:int,skipped:int}
+     */
+    public function backfillCollections(?int $customerId = null): array
+    {
+        $summary = [
+            'scanned' => 0,
+            'created' => 0,
+            'updated' => 0,
+            'skipped' => 0,
+        ];
+
+        LedgerEntry::query()
+            ->with([
+                'dealer:id',
+                'customer:id,dealer_id,source_system,source_reference,code,name',
+            ])
+            ->where('source_system', 'logo')
+            ->where('type', 'payment')
+            ->where('credit', '>', 0)
+            ->when($customerId !== null, fn ($query) => $query->where('customer_id', $customerId))
+            ->orderBy('id')
+            ->chunkById(200, function ($entries) use (&$summary): void {
+                foreach ($entries as $entry) {
+                    $summary['scanned']++;
+
+                    $dealer = $entry->dealer;
+                    $customer = $entry->customer;
+
+                    if (! $dealer || ! $customer) {
+                        $summary['skipped']++;
+
+                        continue;
+                    }
+
+                    $status = $this->syncCollectionMirrorForLedgerEntry($dealer, $customer, $entry);
+                    $summary[$status]++;
+                }
+            });
+
+        return $summary;
+    }
+
+    private function resolveDealer(
+        mixed $dealerId,
+        mixed $dealerCode,
+        ?Dealer $fallback = null,
+    ): ?Dealer {
+        if ($dealerId !== null && $dealerId !== '') {
+            return Dealer::query()->find((int) $dealerId);
+        }
+
+        $normalizedDealerCode = $this->nullableString($dealerCode);
+        if ($normalizedDealerCode !== null) {
+            return Dealer::query()
+                ->where('code', $normalizedDealerCode)
+                ->first();
+        }
+
+        return $fallback;
+    }
+
+    private function resolveCustomer(
+        Dealer $dealer,
+        mixed $customerCode,
+        mixed $customerExternalReference,
+        int $index,
+    ): Customer {
+        $normalizedExternalReference = $this->nullableString($customerExternalReference);
+        if ($normalizedExternalReference !== null) {
+            $customer = Customer::query()
+                ->where('dealer_id', $dealer->id)
+                ->where('source_system', 'logo')
+                ->where('source_reference', $normalizedExternalReference)
+                ->first();
+
+            if ($customer) {
+                return $customer;
+            }
+        }
+
+        $normalizedCustomerCode = $this->nullableString($customerCode);
+        if ($normalizedCustomerCode !== null) {
+            $customer = Customer::query()
+                ->where('dealer_id', $dealer->id)
+                ->where('code', $normalizedCustomerCode)
+                ->first();
+
+            if ($customer) {
+                return $customer;
+            }
+        }
+
+        throw ValidationException::withMessages([
+            "records.$index.customer_code" => ['Cari hareket icin eslesen musteri bulunamadi.'],
+        ]);
+    }
+
+    private function findLedgerEntry(Customer $customer, string $externalReference): ?LedgerEntry
+    {
+        return LedgerEntry::query()
+            ->where('customer_id', $customer->id)
+            ->where('source_system', 'logo')
+            ->where('source_reference', $externalReference)
+            ->first();
+    }
+
+    private function findLedgerEntryForLinkedB2bCollection(Customer $customer, Collection $collection): ?LedgerEntry
+    {
+        return LedgerEntry::query()
+            ->where('customer_id', $customer->id)
+            ->where('collection_id', $collection->id)
+            ->orderByRaw("CASE WHEN source_system = 'b2b' THEN 0 ELSE 1 END")
+            ->orderBy('id')
+            ->first();
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return 'created'|'updated'|'skipped'
+     */
+    private function syncCollectionMirrorForRecord(
+        Dealer $dealer,
+        Customer $customer,
+        LedgerEntry $ledgerEntry,
+        array $record,
+    ): string {
+        if (! $this->shouldMirrorCollection($record)) {
+            return 'skipped';
+        }
+
+        return $this->upsertCollectionMirror($dealer, $customer, $ledgerEntry, $record);
+    }
+
+    /**
+     * @return 'created'|'updated'|'skipped'
+     */
+    private function syncCollectionMirrorForLedgerEntry(
+        Dealer $dealer,
+        Customer $customer,
+        LedgerEntry $ledgerEntry,
+    ): string {
+        if (! $this->shouldMirrorLedgerEntry($ledgerEntry)) {
+            return 'skipped';
+        }
+
+        return $this->upsertCollectionMirror($dealer, $customer, $ledgerEntry, [
+            'external_ref' => $ledgerEntry->source_reference,
+            'date' => optional($ledgerEntry->date)->toDateString() ?? optional($ledgerEntry->entry_date)->toDateString(),
+            'type' => $ledgerEntry->type,
+            'debit' => $ledgerEntry->debit,
+            'credit' => $ledgerEntry->credit,
+            'currency' => $ledgerEntry->currency,
+            'reference_no' => $ledgerEntry->reference_no,
+            'description' => $ledgerEntry->description,
+            'meta' => is_array(data_get($ledgerEntry->meta, 'integrations.logo.payload'))
+                ? data_get($ledgerEntry->meta, 'integrations.logo.payload')
+                : null,
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return 'created'|'updated'|'skipped'
+     */
+    private function upsertCollectionMirror(
+        Dealer $dealer,
+        Customer $customer,
+        LedgerEntry $ledgerEntry,
+        array $record,
+    ): string {
+        $existingB2bCollection = $this->resolveLinkedB2bCollection($customer, $record);
+        if ($existingB2bCollection) {
+            if ($ledgerEntry->collection_id !== $existingB2bCollection->id) {
+                $ledgerEntry->forceFill([
+                    'collection_id' => $existingB2bCollection->id,
+                ])->save();
+            }
+
+            return 'updated';
+        }
+
+        $externalReference = $this->nullableString($record['external_ref'] ?? null);
+        if ($externalReference === null) {
+            return 'skipped';
+        }
+
+        $collection = Collection::query()->firstOrNew([
+            'customer_id' => $customer->id,
+            'source_system' => 'logo',
+            'source_reference' => $externalReference,
+        ]);
+
+        $wasRecentlyCreated = ! $collection->exists;
+        $method = $this->resolveCollectionMethod($record, $ledgerEntry);
+        $referenceFields = $this->buildCollectionReferenceFields($record, $method);
+        $payloadMeta = is_array($record['meta'] ?? null) ? $record['meta'] : [];
+        $meta = is_array($collection->meta) ? $collection->meta : [];
+
+        Arr::set($meta, 'source', 'logo_ledger_sync');
+        Arr::set($meta, 'reference_fields', $referenceFields);
+        Arr::set($meta, 'ledger_entry_id', $ledgerEntry->id);
+        Arr::set($meta, 'integrations.logo.synced_at', now()->toIso8601String());
+        Arr::set($meta, 'integrations.logo.external_ref', $externalReference);
+
+        if ($payloadMeta !== []) {
+            Arr::set($meta, 'integrations.logo.payload', $payloadMeta);
+        }
+
+        $collection->fill([
+            'dealer_id' => $dealer->id,
+            'customer_id' => $customer->id,
+            'source_system' => 'logo',
+            'source_reference' => $externalReference,
+            'sync_status' => 'synced',
+            'sync_error' => null,
+            'last_synced_at' => now(),
+            'collected_by_user_id' => null,
+            'created_by_user_id' => null,
+            'date' => (string) $record['date'],
+            'collection_date' => (string) $record['date'],
+            'method' => $method,
+            'amount' => number_format($this->normalizeMoney($record['credit'] ?? 0), 2, '.', ''),
+            'currency' => strtoupper((string) ($record['currency'] ?? 'TRY')),
+            'reference_no' => $this->nullableString($record['reference_no'] ?? null),
+            'reference_fields' => $referenceFields,
+            'note' => $this->nullableString($record['description'] ?? null),
+            'meta' => $meta,
+        ]);
+
+        $collection->save();
+
+        $this->syncState->record(
+            system: 'logo',
+            domain: 'collections',
+            direction: 'inbound',
+            entity: $collection,
+            externalRef: $externalReference,
+            status: 'synced',
+            meta: [
+                'operation' => $wasRecentlyCreated ? 'created' : 'updated',
+                'mirrored_from' => 'ledger',
+                'ledger_entry_id' => $ledgerEntry->id,
+            ],
+            payload: $record,
+        );
+
+        if ($ledgerEntry->collection_id !== $collection->id) {
+            $ledgerEntry->forceFill([
+                'collection_id' => $collection->id,
+            ])->save();
+        }
+
+        return $wasRecentlyCreated ? 'created' : 'updated';
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     */
+    private function resolveLinkedB2bCollection(Customer $customer, array $record): ?Collection
+    {
+        $raw = $this->extractRawMeta($record);
+        $candidateValues = [
+            $this->readRawValue($raw, ['SPECODE', 'specode']),
+            $this->readRawValue($raw, ['SOURCE_REFERENCE', 'source_reference']),
+            $this->readRawValue($raw, ['FICHENO', 'ficheno', 'DOCODE', 'docode', 'LINEEXP', 'lineexp']),
+            $record['reference_no'] ?? null,
+            $record['description'] ?? null,
+            $record['external_ref'] ?? null,
+        ];
+
+        $collectionId = null;
+        foreach ($candidateValues as $value) {
+            $candidate = $this->nullableString($value);
+
+            if ($candidate !== null && preg_match('/B2B-COL-(\d+)/i', $candidate, $matches)) {
+                $collectionId = (int) $matches[1];
+                break;
+            }
+        }
+
+        if ($collectionId === null) {
+            return null;
+        }
+
+        return Collection::query()
+            ->whereKey($collectionId)
+            ->where('customer_id', $customer->id)
+            ->where('source_system', 'b2b')
+            ->first();
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return array<string, mixed>
+     */
+    private function buildMeta(?LedgerEntry $entry, array $record): array
+    {
+        $meta = is_array($entry?->meta) ? $entry->meta : [];
+
+        Arr::set($meta, 'integrations.logo.synced_at', now()->toIso8601String());
+        Arr::set($meta, 'integrations.logo.external_ref', (string) $record['external_ref']);
+
+        if (! empty($record['meta']) && is_array($record['meta'])) {
+            Arr::set($meta, 'integrations.logo.payload', $record['meta']);
+        }
+
+        return $meta;
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     */
+    private function shouldMirrorCollection(array $record): bool
+    {
+        return ($record['type'] ?? null) === 'payment'
+            && $this->normalizeMoney($record['credit'] ?? 0) > 0;
+    }
+
+    private function shouldMirrorLedgerEntry(LedgerEntry $ledgerEntry): bool
+    {
+        return $ledgerEntry->source_system === 'logo'
+            && $ledgerEntry->type === 'payment'
+            && (float) $ledgerEntry->credit > 0;
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     */
+    private function resolveCollectionMethod(array $record, LedgerEntry $ledgerEntry): string
+    {
+        $raw = $this->extractRawMeta($record);
+        $trcode = $this->readRawValue($raw, ['TRCODE', 'trcode']);
+        $trcodeValue = is_numeric($trcode) ? (int) $trcode : null;
+
+        if ($trcodeValue === 21) {
+            return 'transfer';
+        }
+
+        if (in_array($trcodeValue, [61, 63], true)) {
+            return 'check';
+        }
+
+        if (in_array($trcodeValue, [71, 73], true)) {
+            return 'note';
+        }
+
+        $searchText = Str::of(implode(' ', array_filter([
+            (string) ($record['description'] ?? ''),
+            (string) ($record['reference_no'] ?? ''),
+            (string) data_get($record, 'meta.type', ''),
+            (string) data_get($ledgerEntry->meta, 'integrations.logo.payload.type', ''),
+            (string) $this->readRawValue($raw, ['LINEEXP', 'lineexp', 'TYPE', 'type', 'TRX_TYPE', 'trx_type']),
+        ])))
+            ->ascii()
+            ->lower()
+            ->value();
+
+        if (str_contains($searchText, 'havale') || str_contains($searchText, 'transfer') || str_contains($searchText, 'eft')) {
+            return 'transfer';
+        }
+
+        if (str_contains($searchText, 'cek') || str_contains($searchText, 'check')) {
+            return 'check';
+        }
+
+        if (str_contains($searchText, 'senet') || str_contains($searchText, 'note')) {
+            return 'note';
+        }
+
+        if (str_contains($searchText, 'kart') || str_contains($searchText, 'kredi kart') || str_contains($searchText, 'pos')) {
+            return 'cc';
+        }
+
+        return 'cash';
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return array<string, string>
+     */
+    private function buildCollectionReferenceFields(array $record, string $method): array
+    {
+        $raw = $this->extractRawMeta($record);
+        $referenceNo = $this->nullableString($record['reference_no'] ?? null);
+        $fields = [];
+
+        if ($method === 'transfer') {
+            $fields['bank_name'] = $this->nullableString($this->readRawValue($raw, ['BANK_NAME', 'BANKA', 'BANK', 'BANKNAME']));
+            $fields['transfer_no'] = $referenceNo;
+            $fields['iban'] = $this->nullableString($this->readRawValue($raw, ['IBAN', 'BANK_IBAN']));
+        }
+
+        if ($method === 'check') {
+            $fields['bank_name'] = $this->nullableString($this->readRawValue($raw, ['BANK_NAME', 'BANKA', 'BANK', 'BANKNAME']));
+            $fields['check_no'] = $referenceNo;
+            $fields['due_date'] = $this->normalizeOptionalDate(
+                $this->readRawValue($raw, ['DUE_DATE', 'DUEDATE', 'VADE', 'duedate'])
+            );
+        }
+
+        if ($method === 'note') {
+            $fields['note_no'] = $referenceNo;
+            $fields['due_date'] = $this->normalizeOptionalDate(
+                $this->readRawValue($raw, ['DUE_DATE', 'DUEDATE', 'VADE', 'duedate'])
+            );
+        }
+
+        if ($method === 'cc') {
+            $fields['auth_code'] = $referenceNo;
+            $fields['card_holder'] = $this->nullableString($this->readRawValue($raw, ['CARD_HOLDER', 'CARDHOLDER']));
+            $fields['masked_pan'] = $this->nullableString($this->readRawValue($raw, ['MASKED_PAN', 'MASKEDPAN', 'CARD_NO']));
+        }
+
+        return collect($fields)
+            ->filter(fn ($value) => $value !== null && $value !== '')
+            ->map(fn ($value) => (string) $value)
+            ->all();
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return array<string, mixed>
+     */
+    private function extractRawMeta(array $record): array
+    {
+        $meta = is_array($record['meta'] ?? null) ? $record['meta'] : [];
+
+        return is_array($meta['raw'] ?? null) ? $meta['raw'] : [];
+    }
+
+    /**
+     * @param  array<string, mixed>  $raw
+     */
+    private function readRawValue(array $raw, array $aliases): mixed
+    {
+        foreach ($aliases as $alias) {
+            foreach ($raw as $key => $value) {
+                if (strtoupper((string) $key) === strtoupper($alias)) {
+                    return $value;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  list<int>  $customerIds
+     */
+    private function recalculateBalances(array $customerIds): int
+    {
+        foreach ($customerIds as $customerId) {
+            $runningBalance = 0.0;
+
+            $entries = LedgerEntry::query()
+                ->effectiveForCustomerBalance()
+                ->where('customer_id', $customerId)
+                ->orderBy('date')
+                ->orderBy('id')
+                ->get([
+                    'id',
+                    'debit',
+                    'credit',
+                    'entry_type',
+                    'amount',
+                ]);
+
+            foreach ($entries as $entry) {
+                $debit = $entry->debit !== null
+                    ? (float) $entry->debit
+                    : ($entry->entry_type === 'debit' ? (float) $entry->amount : 0.0);
+                $credit = $entry->credit !== null
+                    ? (float) $entry->credit
+                    : ($entry->entry_type === 'credit' ? (float) $entry->amount : 0.0);
+
+                $runningBalance += $debit - $credit;
+
+                LedgerEntry::query()
+                    ->whereKey($entry->id)
+                    ->update([
+                        'balance_after' => number_format($runningBalance, 2, '.', ''),
+                    ]);
+            }
+        }
+
+        return count($customerIds);
+    }
+
+    private function nullableString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $normalized = trim((string) $value);
+
+        return $normalized === '' ? null : $normalized;
+    }
+
+    private function normalizeOptionalDate(mixed $value): ?string
+    {
+        $normalized = $this->nullableString($value);
+        if ($normalized === null) {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($normalized)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function normalizeMoney(mixed $value): float
+    {
+        return round((float) $value, 2);
+    }
+}

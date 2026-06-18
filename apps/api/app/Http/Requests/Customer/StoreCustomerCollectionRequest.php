@@ -1,0 +1,134 @@
+<?php
+
+namespace App\Http\Requests\Customer;
+
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
+
+class StoreCustomerCollectionRequest extends FormRequest
+{
+    protected function prepareForValidation(): void
+    {
+        $method = $this->input('method');
+
+        $this->merge([
+            'method' => is_string($method) ? strtolower($method) : $method,
+        ]);
+
+        if ($this->filled('collection_date') && ! $this->filled('date')) {
+            $this->merge(['date' => $this->input('collection_date')]);
+        }
+
+        if ($this->filled('meta') && ! $this->filled('reference_fields')) {
+            $this->merge(['reference_fields' => $this->input('meta')]);
+        }
+    }
+
+    public function authorize(): bool
+    {
+        return true;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function rules(): array
+    {
+        return [
+            'date' => ['nullable', 'date'],
+            'collection_date' => ['nullable', 'date'],
+            'method' => ['required', Rule::in(['cash', 'transfer', 'check', 'note', 'cc'])],
+            'amount' => ['required', 'numeric', 'gt:0'],
+            'currency' => ['nullable', 'string', 'size:3'],
+            'reference_no' => ['nullable', 'string', 'max:120'],
+            'note' => ['nullable', 'string', 'max:2000'],
+            'reference_fields' => ['nullable', 'array'],
+            'reference_fields.bank_name' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'check'),
+                'string',
+                'max:120',
+            ],
+            'reference_fields.transfer_no' => [
+                'nullable',
+                'string',
+                'max:120',
+            ],
+            'reference_fields.iban' => [
+                'nullable',
+                'string',
+                'max:64',
+            ],
+            'reference_fields.check_no' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'check'),
+                'string',
+                'max:64',
+            ],
+            'reference_fields.due_date' => [
+                Rule::requiredIf(fn () => in_array((string) $this->input('method'), ['check', 'note'], true)),
+                'date',
+            ],
+            'reference_fields.valor_days' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'check'),
+                'integer',
+                'min:0',
+            ],
+            'reference_fields.requires_manager_approval' => ['nullable'],
+            'reference_fields.manager_approval_reason' => ['nullable', 'string', 'max:120'],
+            'reference_fields.note_no' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'note'),
+                'string',
+                'max:64',
+            ],
+            'reference_fields.image_data' => ['nullable', 'string'],
+            'reference_fields.image_name' => ['nullable', 'string', 'max:180'],
+            'reference_fields.image_type' => ['nullable', 'string', 'max:80'],
+            'reference_fields.images_json' => ['nullable', 'string'],
+            'reference_fields.collection_channel' => [
+                'nullable',
+                Rule::in(['factory']),
+            ],
+            'reference_fields.factory_name' => [
+                'nullable',
+                'string',
+                'max:160',
+            ],
+            'reference_fields.pos_bank' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'cc'
+                    && (string) $this->input('reference_fields.collection_channel') !== 'factory'),
+                Rule::in(['yapi_kredi', 'ziraat_bankasi', 'georgia_bank', 'tbc_bank']),
+            ],
+            'reference_fields.factory_pos_account' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'cc'
+                    && (string) $this->input('reference_fields.collection_channel') === 'factory'),
+                Rule::in(['fabrika_1', 'fabrika_2']),
+            ],
+            'reference_fields.pos_payment_type' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'cc'),
+                Rule::in(['pesin', 'taksitli']),
+            ],
+            'reference_fields.card_holder' => [
+                'nullable',
+                'string',
+                'max:120',
+            ],
+            'reference_fields.masked_pan' => [
+                'nullable',
+                'string',
+                'max:32',
+            ],
+            'reference_fields.auth_code' => [
+                'nullable',
+                'string',
+                'max:64',
+            ],
+            'reference_fields.installment' => [
+                Rule::requiredIf(fn () => (string) $this->input('method') === 'cc'
+                    && (string) $this->input('reference_fields.pos_payment_type') === 'taksitli'),
+                'integer',
+                'min:1',
+                'max:6',
+            ],
+            'meta' => ['nullable', 'array'],
+        ];
+    }
+}

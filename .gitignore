@@ -1,0 +1,92 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+.zed/
+.fleet/
+*.swp
+*.swo
+
+# Environment and secret files
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!.env.local.example
+!**/.env.example
+!**/.env.local.example
+auth.json
+**/auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Dependency directories
+node_modules/
+**/node_modules/
+vendor/
+**/vendor/
+
+# Logs and local runtime state
+*.log
+logs/
+**/logs/
+*.pid
+*.seed
+*.pid.lock
+.phpunit.result.cache
+.phpunit.cache/
+
+# Laravel runtime artifacts
+apps/api/public/build/
+apps/api/public/hot
+apps/api/public/storage
+apps/api/storage/*.key
+apps/api/storage/pail/
+apps/api/storage/logs/*.log
+apps/api/bootstrap/cache/*.php
+!apps/api/bootstrap/cache/.gitignore
+
+# Next.js and frontend build artifacts
+.next/
+**/.next/
+out/
+**/out/
+build/
+**/build/
+dist/
+**/dist/
+coverage/
+**/coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+# Temporary and test artifacts
+tmp/
+test-results/
+playwright-report/
+.playwright/
+.nyc_output/
+.cache/
+**/.cache/
+
+# Archives and generated bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Local deployment and generated tool artifacts
+composer
+tools/*.zip
+tools/**/bin/
+tools/**/obj/
+*.publish/
+

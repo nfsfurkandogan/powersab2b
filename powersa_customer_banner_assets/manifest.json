@@ -1,0 +1,14 @@
+{
+  "usage": {
+    "customer-panel-banner-full.png": "Hero/banner alanı için tam görsel.",
+    "banner-main-warehouse-shelves.png": "Slider ana büyük görsel.",
+    "banner-delivery-truck.png": "Slider küçük kart 1 / sevkiyat.",
+    "banner-filter-product-hand.png": "Slider küçük kart 2 / ürün kalitesi.",
+    "banner-delivery-road.png": "Slider küçük kart 3 / dağıtım ağı.",
+    "banner-left-text-area-background.png": "Sol yazı alanı için karanlık arka plan."
+  },
+  "recommended_css": {
+    "banner_full": "border-radius: 28px; object-fit: cover;",
+    "slider_images": "border-radius: 22px; object-fit: cover;"
+  }
+}

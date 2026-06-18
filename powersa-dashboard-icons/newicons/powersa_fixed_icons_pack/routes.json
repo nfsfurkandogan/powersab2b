@@ -1,0 +1,15 @@
+{
+  "routes": {
+    "siparisler": "/orders",
+    "cari_hesap": "/ledger",
+    "tahsilat": "/collections",
+    "yeni_cari_kart": "/new-customer-card",
+    "iade_ariza": "/returns",
+    "raporlar": "/reports",
+    "hizli_satis_pos": "/pos",
+    "depo": "/warehouse",
+    "moderator": "/moderator",
+    "ekstra": "/extra"
+  },
+  "note": "PNG files are transparent and ready for website usage."
+}

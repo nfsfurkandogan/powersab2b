@@ -1,0 +1,107 @@
+[
+  {
+    "title": "Ana Sayfa",
+    "route": "/dashboard",
+    "png_512": "icons/png/512/kontrol-paneli.png",
+    "png_256": "icons/png/256/kontrol-paneli.png",
+    "webp_512": "icons/webp/512/kontrol-paneli.webp"
+  },
+  {
+    "title": "Ürün Arama",
+    "route": "/search",
+    "png_512": "icons/png/512/urun-arama.png",
+    "png_256": "icons/png/256/urun-arama.png",
+    "webp_512": "icons/webp/512/urun-arama.webp"
+  },
+  {
+    "title": "Moderatör",
+    "route": "/moderator",
+    "png_512": "icons/png/512/moderator.png",
+    "png_256": "icons/png/256/moderator.png",
+    "webp_512": "icons/webp/512/moderator.webp"
+  },
+  {
+    "title": "Kataloglar",
+    "route": "/catalogs",
+    "png_512": "icons/png/512/kataloglar.png",
+    "png_256": "icons/png/256/kataloglar.png",
+    "webp_512": "icons/webp/512/kataloglar.webp"
+  },
+  {
+    "title": "Sepet",
+    "route": "/cart",
+    "png_512": "icons/png/512/sepet.png",
+    "png_256": "icons/png/256/sepet.png",
+    "webp_512": "icons/webp/512/sepet.webp"
+  },
+  {
+    "title": "Müşteri",
+    "route": "/customers",
+    "png_512": "icons/png/512/musteri.png",
+    "png_256": "icons/png/256/musteri.png",
+    "webp_512": "icons/webp/512/musteri.webp"
+  },
+  {
+    "title": "Cari Hesap",
+    "route": "/ledger",
+    "png_512": "icons/png/512/cari-hesap.png",
+    "png_256": "icons/png/256/cari-hesap.png",
+    "webp_512": "icons/webp/512/cari-hesap.webp"
+  },
+  {
+    "title": "Tahsilat",
+    "route": "/collections",
+    "png_512": "icons/png/512/tahsilat.png",
+    "png_256": "icons/png/256/tahsilat.png",
+    "webp_512": "icons/webp/512/tahsilat.webp"
+  },
+  {
+    "title": "Raporlar",
+    "route": "/reports",
+    "png_512": "icons/png/512/raporlar.png",
+    "png_256": "icons/png/256/raporlar.png",
+    "webp_512": "icons/webp/512/raporlar.webp"
+  },
+  {
+    "title": "Ekstra",
+    "route": "/extra",
+    "png_512": "icons/png/512/ekstra.png",
+    "png_256": "icons/png/256/ekstra.png",
+    "webp_512": "icons/webp/512/ekstra.webp"
+  },
+  {
+    "title": "Yeni Cari Kart",
+    "route": "/new-customer-card",
+    "png_512": "icons/png/512/yeni-cari-kart.png",
+    "png_256": "icons/png/256/yeni-cari-kart.png",
+    "webp_512": "icons/webp/512/yeni-cari-kart.webp"
+  },
+  {
+    "title": "Sipariş",
+    "route": "/orders",
+    "png_512": "icons/png/512/siparis.png",
+    "png_256": "icons/png/256/siparis.png",
+    "webp_512": "icons/webp/512/siparis.webp"
+  },
+  {
+    "title": "Depo Siparişleri",
+    "route": "/warehouse",
+    "png_512": "icons/png/512/depo-siparisleri.png",
+    "png_256": "icons/png/256/depo-siparisleri.png",
+    "webp_512": "icons/webp/512/depo-siparisleri.webp"
+  },
+  {
+    "title": "İade / Arıza",
+    "route": "/returns",
+    "png_512": "icons/png/512/iade-ariza.png",
+    "png_256": "icons/png/256/iade-ariza.png",
+    "webp_512": "icons/webp/512/iade-ariza.webp"
+  },
+  {
+    "title": "POS",
+    "route": "/pos",
+    "png_512": "icons/png/512/pos.png",
+    "png_256": "icons/png/256/pos.png",
+    "webp_512": "icons/webp/512/pos.webp"
+  }
+]

@@ -1,0 +1,21 @@
+RewriteEngine On
+Options -Indexes
+ServerSignature Off
+
+<IfModule mod_headers.c>
+  <FilesMatch "\.(?:avif|css|gif|ico|jpe?g|js|png|svg|webp|woff2?)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+</IfModule>
+
+# Mount Laravel under /backend before handing the rest of the traffic to Passenger.
+RewriteRule ^backend(/.*)?$ /backend.php [L,QSA]
+
+PassengerAppRoot /home/u454992533/domains/powersab2b.com/web
+PassengerAppType node
+PassengerNodejs /opt/alt/alt-nodejs20/root/bin/node
+PassengerStartupFile server.cjs
+PassengerBaseURI /
+PassengerRestartDir /home/u454992533/domains/powersab2b.com/web/tmp
+
+RewriteRule ^\.builds - [F,L]
