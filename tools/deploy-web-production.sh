@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEB_DIR="$ROOT_DIR/apps/web"
 
-REMOTE_USER="${REMOTE_USER:-u454992533}"
-REMOTE_HOST="${REMOTE_HOST:-72.62.159.198}"
-REMOTE_PORT="${REMOTE_PORT:-65002}"
-REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/home/u454992533/domains/powersab2b.com/web}"
+REMOTE_USER="${REMOTE_USER:-root}"
+REMOTE_HOST="${REMOTE_HOST:-72.61.109.15}"
+REMOTE_PORT="${REMOTE_PORT:-22}"
+REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/powersab2b.com/web}"
 
 STAMP="${DEPLOY_STAMP:-web-$(date +%Y%m%d-%H%M%S)}"
 SSH=(ssh -o BatchMode=yes -p "$REMOTE_PORT")
