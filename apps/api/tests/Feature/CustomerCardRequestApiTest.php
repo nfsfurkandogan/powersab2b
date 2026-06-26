@@ -315,6 +315,70 @@ class CustomerCardRequestApiTest extends TestCase
         $this->assertSame(1, IntegrationSyncEvent::query()->count());
     }
 
+    public function test_dealer_admin_can_auto_create_customer_card_for_logo_write_queue(): void
+    {
+        $dealer = $this->createDealer('DLR-DEALER-AUTO');
+        $dealerAdmin = $this->createUserWithRole('dealer_admin', $dealer);
+        $salesperson = $this->createUserWithRole('salesperson', $dealer);
+        $dealerAdmin->forceFill([
+            'menu_permissions' => ['new-customer-card'],
+        ])->save();
+
+        $this->actingAs($dealerAdmin);
+
+        $response = $this->postJson('/api/customer-card-requests', [
+            'salesperson_user_id' => $salesperson->id,
+            'company_name' => 'Bayi Yeni Cari',
+            'contact_name' => 'Bayi Yeni Cari',
+            'phone' => '05321230001',
+            'email' => 'bayi-yeni-cari@example.test',
+            'customer_kind' => 'company',
+            'logo_authorization_code' => 'D',
+            'city' => 'Erzurum',
+            'district' => 'Palandöken',
+            'tax_office' => 'Palandöken',
+            'tax_number' => '1234567890',
+            'address' => 'Bayi yeni cari ekranından açıldı.',
+            'auto_convert' => true,
+        ]);
+
+        $response
+            ->assertCreated()
+            ->assertJsonPath('data.status', CustomerCardRequest::STATUS_APPROVED)
+            ->assertJsonPath('data.dealer.id', $dealer->id)
+            ->assertJsonPath('data.salesperson.id', $salesperson->id)
+            ->assertJsonPath('customer.code', '120-25-001')
+            ->assertJsonPath('customer.name', 'Bayi Yeni Cari')
+            ->assertJsonPath('customer.sync_status', 'pending')
+            ->assertJsonPath('customer.logo_queue_status', 'queued');
+
+        $customer = Customer::query()->where('code', '120-25-001')->firstOrFail();
+
+        $this->assertSame($dealer->id, $customer->dealer_id);
+        $this->assertSame($salesperson->id, $customer->salesperson_user_id);
+        $this->assertSame('b2b', $customer->source_system);
+        $this->assertSame('pending', $customer->sync_status);
+        $this->assertSame('F1', data_get($customer->meta, 'integrations.logo.payload.specode'));
+        $this->assertSame('D', data_get($customer->meta, 'integrations.logo.payload.cyphcode'));
+
+        $this->getJson('/api/customers?'.http_build_query([
+            'q' => 'Bayi Yeni Cari',
+            'limit' => 10,
+        ]))
+            ->assertOk()
+            ->assertJsonPath('data.0.code', '120-25-001')
+            ->assertJsonPath('data.0.title', 'Bayi Yeni Cari');
+
+        $this->assertDatabaseHas('integration_sync_events', [
+            'system' => 'logo',
+            'domain' => 'customers-write',
+            'direction' => 'outbound',
+            'entity_type' => Customer::class,
+            'entity_id' => $customer->id,
+            'status' => 'queued',
+        ]);
+    }
+
     public function test_request_must_be_approved_before_customer_conversion(): void
     {
         $dealer = $this->createDealer('DLR-LOCK-'.Str::upper(Str::random(4)));

@@ -18,6 +18,7 @@ class ListPosSalesRequest extends FormRequest
     public function rules(): array
     {
         return [
+            'q' => ['nullable', 'string', 'max:120'],
             'pos_session_id' => ['nullable', 'integer', 'exists:pos_sessions,id'],
             'cashbox_id' => ['nullable', 'integer', 'exists:cashboxes,id'],
             'status' => ['nullable', Rule::in(['paid', 'cancelled'])],

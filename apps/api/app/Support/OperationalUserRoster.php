@@ -29,12 +29,12 @@ final class OperationalUserRoster
             self::warehouse('warehouse', 'Depo Kullanıcısı', null, null),
             self::point('point', 'Point Bayi', null, null),
 
-            self::salesperson('ahmet.arac', 'AHMET ARAÇ', 'ERZURUM', 'Erzurum', 'A,D'),
-            self::salesperson('huseyin.ozguney', 'HÜSEYİN ÖZGÜNEY', 'ERZURUM', 'Erzurum'),
-            self::salesperson('mehmet.aksoy', 'MEHMET AKSOY', 'ERZURUM', 'Erzurum'),
-            self::salesperson('erzurum.merkez', 'ERZURUM MERKEZ', 'ERZURUM', 'Erzurum'),
+            self::salesperson('ahmet.arac', 'AHMET ARAÇ', 'ERZURUM', 'Erzurum', 'A'),
+            self::salesperson('huseyin.ozguney', 'HÜSEYİN ÖZGÜNEY', 'ERZURUM', 'Erzurum', 'B'),
+            self::salesperson('mehmet.aksoy', 'MEHMET AKSOY', 'ERZURUM', 'Erzurum', 'C'),
+            self::salesperson('erzurum.merkez', 'ERZURUM MERKEZ', 'ERZURUM', 'Erzurum', 'D'),
             self::salesperson('erz.merkez', 'ERZURUM MERKEZ', 'ERZURUM', 'Erzurum'),
-            self::admin('mudur.erzurum', 'Erzurum Müdür'),
+            self::admin('mudur.erzurum', 'Erzurum Müdür', 'A,B,C,D'),
             self::branchDealerAdmin('satinalma', 'SATINALMA', 'ERZURUM', 'Erzurum'),
             self::branchDealerAdmin('satis', 'SATIŞ', 'ERZURUM', 'Erzurum'),
 
@@ -47,7 +47,7 @@ final class OperationalUserRoster
             self::salesperson('samsun.merkez', 'SAMSUN MERKEZ', 'SAMSUN', 'Samsun'),
 
             self::point('erzurum.point', 'ERZURUM POINT HIZLI SATIŞ', 'ERZURUM', 'Erzurum'),
-            self::point('erzurum.hizlisatis', 'ERZURUM HIZLI SATIŞ', 'ERZURUM', 'Erzurum', 'dealer'),
+            self::point('erzurum.hizlisatis', 'ERZURUM HIZLI SATIŞ', 'ERZURUM', 'Erzurum', 'dealer', 'D'),
             self::point('trabzon.point', 'TRABZON POINT HIZLI SATIŞ', 'TRABZON', 'Trabzon'),
             self::point('samsun.point', 'SAMSUN POINT HIZLI SATIŞ', 'SAMSUN', 'Samsun'),
             self::b2bPoint('batum', 'BATUM B2B VE HIZLI SATIŞ', 'BATUM', 'Batum'),
@@ -58,7 +58,7 @@ final class OperationalUserRoster
             self::dealerAdmin('ornek.musteri', 'Ornek Musteri'),
             self::dealerAdmin('bayi.admin', 'Bayi Yöneticisi'),
             self::warehouse('depo', 'Depo Kullanıcısı', null, null),
-            self::warehouse('erz.depo', 'ERZURUM DEPO', 'ERZURUM', 'Erzurum'),
+            self::warehouse('erz.depo', 'ERZURUM DEPO', 'ERZURUM', 'Erzurum', 'dealer'),
             self::point('hizli.satis', 'Hızlı Satış', null, null),
             self::cashier('kasiyer', 'Kasiyer'),
             self::dealerAdmin('musteri.demo', 'Müşteri Demo'),
@@ -104,9 +104,18 @@ final class OperationalUserRoster
      *     logo_customer_specode4:?string
      * }
      */
-    private static function admin(string $username, string $name): array
+    private static function admin(string $username, string $name, ?string $logoCustomerSpecode4 = null): array
     {
-        return self::definition($username, $name, ['admin'], MenuPermissions::fromRoles(['admin']), null, null, null);
+        return self::definition(
+            $username,
+            $name,
+            ['admin'],
+            MenuPermissions::fromRoles(['admin']),
+            null,
+            null,
+            null,
+            $logoCustomerSpecode4
+        );
     }
 
     /**
@@ -117,7 +126,8 @@ final class OperationalUserRoster
         string $name,
         ?string $branchCode,
         ?string $branchName,
-        string $customerScope = 'branch'
+        string $customerScope = 'branch',
+        ?string $logoCustomerSpecode4 = null
     ): array {
         return self::definition(
             $username,
@@ -126,7 +136,8 @@ final class OperationalUserRoster
             MenuPermissions::fromRoles(['point']),
             $branchCode,
             $branchName,
-            $customerScope
+            $customerScope,
+            $logoCustomerSpecode4
         );
     }
 
@@ -206,9 +217,15 @@ final class OperationalUserRoster
     /**
      * @return array<string, mixed>
      */
-    private static function warehouse(string $username, string $name, ?string $branchCode, ?string $branchName): array
+    private static function warehouse(
+        string $username,
+        string $name,
+        ?string $branchCode,
+        ?string $branchName,
+        string $customerScope = 'branch'
+    ): array
     {
-        return self::definition($username, $name, ['warehouse'], MenuPermissions::fromRoles(['warehouse']), $branchCode, $branchName, 'branch');
+        return self::definition($username, $name, ['warehouse'], MenuPermissions::fromRoles(['warehouse']), $branchCode, $branchName, $customerScope);
     }
 
     /**

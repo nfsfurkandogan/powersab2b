@@ -148,6 +148,7 @@ class OrderController extends Controller
             'user.roles:id,slug,name',
             'items.product.brand',
             'items.product.stockSummary',
+            'items.product.codeAliases',
             'statusHistory.changedBy',
         ]);
 
@@ -451,6 +452,7 @@ class OrderController extends Controller
                 'user:id,name',
                 'items.product.brand',
                 'items.product.stockSummary',
+                'items.product.codeAliases',
                 'statusHistory.changedBy',
             ]);
         });
@@ -621,10 +623,14 @@ class OrderController extends Controller
                     'tax_rate' => $item->tax_rate,
                     'line_total' => $item->line_total,
                     'currency' => $item->currency,
+                    'barcode' => $this->resolveProductBarcode($item),
+                    'shelf_address' => $this->resolveProductLogoWarehouseShelfAddress($item, '1')
+                        ?? $this->resolveProductShelfAddress($item->product?->meta),
                     'logo_stock' => [
-                        'available_total' => (int) ($item->product?->stockSummary?->available_total ?? 0),
-                        'reserved_total' => (int) ($item->product?->stockSummary?->reserved_total ?? 0),
-                        'updated_at' => $item->product?->stockSummary?->updated_at?->toIso8601String(),
+                        'available_total' => $this->resolveProductLogoStockTotal($item),
+                        'erzurum_depo_available_total' => $this->resolveProductLogoWarehouseStockTotal($item, '1'),
+                        'reserved_total' => $this->resolveProductReservedStockTotal($item),
+                        'updated_at' => $this->resolveProductLogoStockUpdatedAt($item),
                     ],
                 ])->values(),
             ],
@@ -652,6 +658,386 @@ class OrderController extends Controller
 
             if ($note !== '') {
                 return $note;
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveProductBarcode($item): ?string
+    {
+        $product = $item?->product;
+        if (! $product) {
+            return null;
+        }
+
+        $aliases = $product->codeAliases ?? null;
+        if (! is_iterable($aliases)) {
+            return $this->nullableString($product->sku);
+        }
+
+        $firstAlias = null;
+        foreach ($aliases as $alias) {
+            if (! is_object($alias)) {
+                continue;
+            }
+
+            $code = $this->nullableString($alias->code ?? null);
+            if ($code === null) {
+                continue;
+            }
+
+            if ($firstAlias === null) {
+                $firstAlias = $code;
+            }
+
+            $source = $this->nullableString(is_array($alias->meta ?? null) ? data_get($alias->meta, 'source') : null);
+            if ($source === 'logo_unit_barcode') {
+                return $code;
+            }
+        }
+
+        return $firstAlias;
+    }
+
+    private function resolveProductShelfAddress(mixed $meta): ?string
+    {
+        if (! is_array($meta)) {
+            return null;
+        }
+
+        $shelfAddress = $this->firstMetaScalar($meta, [
+            'shelf_address',
+            'raf_address',
+            'raf_adresi',
+            'raf_bilgisi',
+            'raf_bilgileri',
+            'shelf',
+            'raf',
+            'location',
+            'location_code',
+            'integrations.logo.payload.shelf_address',
+            'integrations.logo.payload.shelfaddress',
+            'integrations.logo.payload.shelf_addr',
+            'integrations.logo.payload.raf_address',
+            'integrations.logo.payload.raf_adresi',
+            'integrations.logo.payload.rafadresi',
+            'integrations.logo.payload.raf_bilgisi',
+            'integrations.logo.payload.rafbilgisi',
+            'integrations.logo.payload.raf_bilgileri',
+            'integrations.logo.payload.rafbilgileri',
+            'integrations.logo.payload.shelf',
+            'integrations.logo.payload.raf',
+            'integrations.logo.payload.location',
+            'integrations.logo.payload.location_code',
+            'integrations.logo.payload.raw.SHELF_ADDRESS',
+            'integrations.logo.payload.raw.SHELFADDRESS',
+            'integrations.logo.payload.raw.SHELF_ADDR',
+            'integrations.logo.payload.raw.RAF_ADDRESS',
+            'integrations.logo.payload.raw.RAF_ADRESI',
+            'integrations.logo.payload.raw.RAFADRESI',
+            'integrations.logo.payload.raw.RAF_BILGISI',
+            'integrations.logo.payload.raw.RAFBILGISI',
+            'integrations.logo.payload.raw.RAF_BILGILERI',
+            'integrations.logo.payload.raw.RAFBILGILERI',
+            'integrations.logo.payload.raw.SHELF',
+            'integrations.logo.payload.raw.RAF',
+            'integrations.logo.payload.raw.LOCATION',
+            'integrations.logo.payload.raw.LOCATION_CODE',
+            'integrations.logo.payload.raw.LOCATIONCODE',
+        ]);
+
+        if ($shelfAddress !== null) {
+            return $shelfAddress;
+        }
+
+        $warehouses = data_get($meta, 'integrations.logo.payload.logo_stock.warehouses');
+        if (is_array($warehouses)) {
+            foreach ($warehouses as $warehouse) {
+                if (! is_array($warehouse)) {
+                    continue;
+                }
+
+                $warehouseCode = $this->firstArrayScalar($warehouse, [
+                    'warehouse_code',
+                    'branch_code',
+                    'code',
+                    'invenno',
+                    'warehouse_no',
+                ]);
+                $warehouseShelf = $this->resolveOrderShelfAddressFromWarehouse($meta, $warehouse, $warehouseCode);
+                if ($warehouseShelf !== null) {
+                    return $warehouseShelf;
+                }
+            }
+        }
+
+        $stockLocations = data_get($meta, 'integrations.logo.payload.stock_locations');
+        if (is_array($stockLocations)) {
+            foreach ($stockLocations as $location) {
+                if (! is_array($location)) {
+                    continue;
+                }
+
+                $locationShelf = $this->firstArrayScalar($location, [
+                    'shelf_address',
+                    'raf_address',
+                    'raf_adresi',
+                    'raf_bilgisi',
+                    'raf_bilgileri',
+                    'shelf',
+                    'raf',
+                    'location',
+                    'location_code',
+                ]);
+
+                if ($locationShelf !== null) {
+                    return $locationShelf;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $meta
+     * @param  array<string, mixed>  $warehouse
+     */
+    private function resolveOrderShelfAddressFromWarehouse(array $meta, array $warehouse, ?string $warehouseCode = null): ?string
+    {
+        $direct = $this->firstMetaScalar($warehouse, [
+            'shelf_address',
+            'raf_address',
+            'raf_adresi',
+            'raf_bilgisi',
+            'raf_bilgileri',
+            'shelf',
+            'raf',
+            'location',
+            'location_code',
+        ]);
+
+        if ($direct !== null) {
+            return $direct;
+        }
+
+        $raw = data_get($meta, 'integrations.logo.payload.raw', []);
+        if (! is_array($raw)) {
+            return null;
+        }
+
+        $keys = array_filter([
+            $warehouseCode,
+            $warehouse['shelf_key'] ?? null,
+            $warehouse['invenno'] ?? null,
+            $warehouse['warehouse_no'] ?? null,
+        ], static fn (mixed $value): bool => is_scalar($value) && trim((string) $value) !== '');
+
+        foreach ($keys as $key) {
+            $normalized = trim((string) $key);
+
+            foreach ([
+                "RAF{$normalized}",
+                "RAF_{$normalized}",
+                "raf{$normalized}",
+                "raf_{$normalized}",
+                "RAFADRESI{$normalized}",
+                "RAF_ADRESI_{$normalized}",
+                "RAF_BILGISI{$normalized}",
+                "RAF_BILGISI_{$normalized}",
+                "RAF_BILGILERI{$normalized}",
+                "RAF_BILGILERI_{$normalized}",
+                "SHELF_ADDRESS{$normalized}",
+                "LOCATION{$normalized}",
+                "LOCATION_CODE{$normalized}",
+            ] as $field) {
+                $candidate = $raw[$field] ?? null;
+                if (is_scalar($candidate)) {
+                    $normalizedCandidate = trim((string) $candidate);
+                    if ($normalizedCandidate !== '') {
+                        return $normalizedCandidate;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveProductLogoWarehouseShelfAddress($item, string $warehouseCode): ?string
+    {
+        $meta = is_array($item?->product?->meta) ? $item->product->meta : [];
+        $warehouses = data_get($meta, 'integrations.logo.payload.logo_stock.warehouses');
+
+        if (! is_array($warehouses)) {
+            return null;
+        }
+
+        foreach ($warehouses as $warehouse) {
+            if (! is_array($warehouse)) {
+                continue;
+            }
+
+            $code = $this->firstArrayScalar($warehouse, [
+                'warehouse_code',
+                'branch_code',
+                'code',
+                'invenno',
+                'warehouse_no',
+            ]);
+
+            if ($code !== $warehouseCode) {
+                continue;
+            }
+
+            return $this->resolveOrderShelfAddressFromWarehouse($meta, $warehouse, $code);
+        }
+
+        return null;
+    }
+
+    private function resolveProductLogoStockTotal($item): int
+    {
+        $summary = $item?->product?->stockSummary;
+        if ($summary !== null) {
+            return (int) ($summary->available_total ?? 0);
+        }
+
+        $meta = is_array($item?->product?->meta) ? $item->product->meta : [];
+        $payload = data_get($meta, 'integrations.logo.payload.logo_stock');
+
+        if (! is_array($payload)) {
+            return 0;
+        }
+
+        return $this->firstIntegerValue(
+            $payload,
+            ['available_total', 'available', 'stock', 'quantity', 'onhand_total', 'onhand']
+        );
+    }
+
+    private function resolveProductLogoWarehouseStockTotal($item, string $warehouseCode): int
+    {
+        $meta = is_array($item?->product?->meta) ? $item->product->meta : [];
+        $warehouses = data_get($meta, 'integrations.logo.payload.logo_stock.warehouses');
+
+        if (! is_array($warehouses)) {
+            return $this->resolveProductLogoStockTotal($item);
+        }
+
+        foreach ($warehouses as $warehouse) {
+            if (! is_array($warehouse)) {
+                continue;
+            }
+
+            $code = $this->firstArrayScalar($warehouse, [
+                'warehouse_code',
+                'branch_code',
+                'code',
+                'invenno',
+                'warehouse_no',
+            ]);
+
+            if ($code !== $warehouseCode) {
+                continue;
+            }
+
+            return $this->firstIntegerValue($warehouse, [
+                'available_total',
+                'available',
+                'onhand_total',
+                'onhand',
+                'stock',
+                'quantity',
+            ]);
+        }
+
+        return 0;
+    }
+
+    private function resolveProductReservedStockTotal($item): int
+    {
+        $summary = $item?->product?->stockSummary;
+        if ($summary !== null) {
+            return (int) ($summary->reserved_total ?? 0);
+        }
+
+        $meta = is_array($item?->product?->meta) ? $item->product->meta : [];
+        $payload = data_get($meta, 'integrations.logo.payload.logo_stock');
+
+        if (! is_array($payload)) {
+            return 0;
+        }
+
+        return $this->firstIntegerValue(
+            $payload,
+            ['reserved_total', 'reserved', 'stock_reserved', 'onhand_reserved']
+        );
+    }
+
+    private function resolveProductLogoStockUpdatedAt($item): ?string
+    {
+        $summary = $item?->product?->stockSummary;
+        if ($summary !== null) {
+            return $summary->updated_at?->toIso8601String();
+        }
+
+        $meta = is_array($item?->product?->meta) ? $item->product->meta : [];
+        $rawUpdatedAt = data_get($meta, 'integrations.logo.payload.logo_stock.updated_at');
+
+        return is_scalar($rawUpdatedAt) ? (string) $rawUpdatedAt : null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $meta
+     * @param  list<string>  $paths
+     */
+    private function firstMetaScalar(array $meta, array $paths): ?string
+    {
+        foreach ($paths as $path) {
+            $value = data_get($meta, $path);
+            if (is_scalar($value)) {
+                $normalized = trim((string) $value);
+                if ($normalized !== '') {
+                    return $normalized;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $source
+     * @param  list<string>  $keys
+     */
+    private function firstIntegerValue(array $source, array $keys): int
+    {
+        foreach ($keys as $key) {
+            $value = $source[$key] ?? null;
+            if (is_numeric($value)) {
+                return (int) $value;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * @param  array<string, mixed>  $source
+     * @param  list<string>  $keys
+     */
+    private function firstArrayScalar(array $source, array $keys): ?string
+    {
+        foreach ($keys as $key) {
+            $value = $source[$key] ?? null;
+
+            if (is_scalar($value)) {
+                $normalized = trim((string) $value);
+                if ($normalized !== '') {
+                    return $normalized;
+                }
             }
         }
 
@@ -828,6 +1214,7 @@ class OrderController extends Controller
             'user.roles:id,slug,name',
             'items.product.brand',
             'items.product.stockSummary',
+            'items.product.codeAliases',
             'statusHistory.changedBy',
         ]);
     }

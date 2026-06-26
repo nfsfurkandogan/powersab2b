@@ -23,6 +23,7 @@ const STATUS_OPTIONS = [
   { value: "pending", label: "Beklemede" },
   { value: "approved", label: "Onaylandı" },
   { value: "processing", label: "Hazırlanıyor" },
+  { value: "balance", label: "Bakiye" },
   { value: "picking", label: "Toplanıyor" },
   { value: "packed", label: "Hazırlandı" },
   { value: "shipped", label: "Sevk Edildi" },
@@ -57,6 +58,13 @@ function getStatusMeta(status: string): { label: string; className: string } {
     return {
       label: "Hazırlanıyor",
       className: "border-sky-300/35 bg-sky-300/10 text-sky-200",
+    };
+  }
+
+  if (normalized === "balance") {
+    return {
+      label: "Bakiye",
+      className: "border-yellow-300/40 bg-yellow-300/10 text-yellow-100",
     };
   }
 
@@ -174,6 +182,9 @@ type OrderRow = {
     title: string;
   };
   grand_total: string;
+  order_quantity?: number;
+  shipped_quantity?: number;
+  remaining_quantity?: number;
   currency: string;
   ordered_at: string;
   logo_sync_status?: string | null;
@@ -527,7 +538,14 @@ export function OrdersPage() {
                           {row.customer.code} - {row.customer.title}
                         </td>
                         <td className="py-3">
-                          <OrderStatusBadge status={row.status} />
+                          <div className="flex flex-wrap gap-1.5">
+                            <OrderStatusBadge status={row.status} />
+                            {(row.remaining_quantity ?? 0) > 0 ? (
+                              <Badge variant="outline" className="rounded-full border-yellow-300/40 bg-yellow-300/10 px-3 py-1 text-[12px] font-black text-yellow-100">
+                                Bakiye {row.remaining_quantity}
+                              </Badge>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="py-3 text-slate-400">{formatOrderDateTime(row.ordered_at)}</td>
                         <td className="py-3 text-right font-black text-white">{formatTry(row.grand_total, row.currency)}</td>

@@ -187,6 +187,91 @@ class ModeratorManagementApiTest extends TestCase
             ->assertJsonPath('data.menu_permissions', ['dashboard', 'search']);
     }
 
+    public function test_moderator_can_update_user_password_from_edit_payload_with_six_character_password(): void
+    {
+        $this->seed(RoleSeeder::class);
+
+        $dealer = $this->createDealer('DLR-MOD-EDIT-PASS');
+        $moderator = $this->createUserWithRole('moderator');
+        $pointUser = $this->createUserWithRole('point', $dealer, [
+            'username' => 'edit.pass.point',
+            'password' => 'old-pass',
+            'menu_permissions' => ['dashboard', 'search'],
+        ]);
+
+        $this->actingAs($moderator);
+
+        $this->patchJson("/api/moderator/users/{$pointUser->id}", [
+            'dealer_id' => $dealer->id,
+            'customer_scope' => 'dealer',
+            'name' => $pointUser->name,
+            'username' => $pointUser->username,
+            'password' => 'abc123',
+            'role_slugs' => ['point'],
+            'menu_permissions' => ['dashboard', 'search'],
+            'is_active' => true,
+        ])->assertOk();
+
+        $this->assertTrue(Hash::check('abc123', $pointUser->fresh()->password));
+    }
+
+    public function test_moderator_can_reset_user_password_with_six_character_password(): void
+    {
+        $this->seed(RoleSeeder::class);
+
+        $dealer = $this->createDealer('DLR-MOD-RESET-PASS');
+        $moderator = $this->createUserWithRole('moderator');
+        $pointUser = $this->createUserWithRole('point', $dealer, [
+            'username' => 'reset.pass.point',
+            'password' => 'old-pass',
+            'menu_permissions' => ['dashboard', 'search'],
+        ]);
+
+        $this->actingAs($moderator);
+
+        $this->postJson("/api/moderator/users/{$pointUser->id}/reset-password", [
+            'password' => '123456',
+        ])->assertOk();
+
+        $this->assertTrue(Hash::check('123456', $pointUser->fresh()->password));
+    }
+
+    public function test_moderator_overview_can_skip_or_limit_customer_payload_without_changing_summary(): void
+    {
+        $this->seed(RoleSeeder::class);
+
+        $dealer = $this->createDealer('DLR-MOD-LIMIT');
+        $moderator = $this->createUserWithRole('moderator');
+
+        $this->createCustomer($dealer, 'MOD-LIMIT-001', 'Birinci Cari');
+        $this->createCustomer($dealer, 'MOD-LIMIT-002', 'Ikinci Cari');
+        $this->createCustomer($dealer, 'MOD-LIMIT-003', 'Ucuncu Cari', null, [
+            'is_active' => false,
+        ]);
+
+        $this->actingAs($moderator);
+
+        $this->getJson('/api/moderator/overview?include_customers=0')
+            ->assertOk()
+            ->assertJsonCount(0, 'customers')
+            ->assertJsonPath('summary.customers_total', 3)
+            ->assertJsonPath('summary.active_customers_total', 2)
+            ->assertJsonPath('summary.unassigned_customers_total', 3);
+
+        $this->getJson('/api/moderator/overview?customer_limit=2')
+            ->assertOk()
+            ->assertJsonCount(2, 'customers')
+            ->assertJsonPath('summary.customers_total', 3)
+            ->assertJsonPath('summary.active_customers_total', 2)
+            ->assertJsonPath('summary.unassigned_customers_total', 3);
+
+        $this->getJson('/api/moderator/overview?customer_q=Ucuncu')
+            ->assertOk()
+            ->assertJsonCount(1, 'customers')
+            ->assertJsonPath('customers.0.code', 'MOD-LIMIT-003')
+            ->assertJsonPath('summary.customers_total', 3);
+    }
+
     public function test_salesperson_sees_only_assigned_customers(): void
     {
         $this->seed(RoleSeeder::class);

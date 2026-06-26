@@ -2135,15 +2135,18 @@ html[data-ui-theme="dark"] .app-shell-root.dashboard-shell {
     max-width: 100%;
     padding: 0.25rem 0.55rem;
     color: var(--brand-primary-strong);
+    justify-content: center;
   }
 
   .header-market-rates > div {
     overflow: hidden;
+    justify-content: center;
   }
 
   .header-rate-chip {
     display: inline-flex;
     align-items: baseline;
+    justify-content: center;
     gap: 0.32rem;
     border-radius: 999px;
     padding: 0.2rem 0.35rem;
@@ -2159,6 +2162,7 @@ html[data-ui-theme="dark"] .app-shell-root.dashboard-shell {
   }
 
   .header-rate-chip strong {
+    font-variant-numeric: tabular-nums;
     font-size: 0.82rem;
   }
 

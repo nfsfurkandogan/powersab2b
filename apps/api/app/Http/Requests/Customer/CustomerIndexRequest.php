@@ -23,6 +23,7 @@ class CustomerIndexRequest extends FormRequest
             'has_order_balance' => ['nullable', 'boolean'],
             'has_balance_due' => ['nullable', 'boolean'],
             'source_system' => ['nullable', 'string', 'in:logo,b2b'],
+            'specode4' => ['nullable', 'string', 'max:120'],
             'selection_mode' => ['nullable', 'boolean'],
             'fast' => ['nullable', 'boolean'],
             'summary' => ['nullable', 'string', 'in:count'],

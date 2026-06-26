@@ -199,7 +199,11 @@ class LogoDocumentExportApiTest extends TestCase
             ->assertJsonPath('received', 1)
             ->assertJsonPath('records.0.shipment_id', $shipment->id)
             ->assertJsonPath('records.0.warehouse_code', '01')
-            ->assertJsonPath('records.0.items.0.shipped_qty', 2);
+            ->assertJsonPath('records.0.items.0.shipped_qty', 2)
+            ->assertJsonPath('records.0.logo.document_type', 'wholesale_sales_invoice')
+            ->assertJsonPath('records.0.logo.invoice_trcode', 8)
+            ->assertJsonPath('records.0.logo.ledger_trcode', 38)
+            ->assertJsonPath('records.0.logo.target_tables', ['INVOICE', 'STFICHE', 'STLINE', 'CLFLINE']);
 
         $this
             ->withHeader('X-Integration-Key', 'doc-sync-key')

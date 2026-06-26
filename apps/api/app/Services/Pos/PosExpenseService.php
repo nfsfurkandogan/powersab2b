@@ -13,7 +13,8 @@ use Illuminate\Validation\ValidationException;
 
 class PosExpenseService
 {
-    private const POINT_CURRENCY = 'GEL';
+    private const POINT_CURRENCY = 'TRY';
+    private const BATUM_POINT_CURRENCY = 'GEL';
 
     public function __construct(
         private readonly IntegrationSyncStateService $syncState
@@ -37,6 +38,7 @@ class PosExpenseService
             }
 
             $this->assertCanOperateSession($user, $session);
+            $pointCurrency = $this->pointCurrency($session, $user);
 
             $expense = PosExpense::query()->create([
                 'pos_session_id' => $session->id,
@@ -44,7 +46,7 @@ class PosExpenseService
                 'expense_date' => $payload['expense_date'] ?? now()->toDateString(),
                 'category' => trim((string) $payload['category']),
                 'amount' => number_format((float) $payload['amount'], 2, '.', ''),
-                'currency' => self::POINT_CURRENCY,
+                'currency' => $pointCurrency,
                 'note' => filled($payload['note'] ?? null) ? trim((string) $payload['note']) : null,
                 'created_by_user_id' => $user->id,
                 'meta' => $payload['meta'] ?? null,
@@ -122,6 +124,42 @@ class PosExpenseService
 
         return $user->hasAnyRole(['cashier', 'point'])
             || in_array('pos', MenuPermissions::forUser($user), true);
+    }
+
+    private function pointCurrency(PosSession $session, User $user): string
+    {
+        $session->loadMissing('cashbox', 'openedBy');
+
+        $batumSignals = [
+            $user->branch_code,
+            $user->region_code,
+            $session->openedBy?->branch_code,
+            $session->openedBy?->region_code,
+            $session->cashbox?->code,
+            $session->cashbox?->name,
+        ];
+
+        foreach ($batumSignals as $value) {
+            if ($this->isBatumPointSignal($value)) {
+                return self::BATUM_POINT_CURRENCY;
+            }
+        }
+
+        return self::POINT_CURRENCY;
+    }
+
+    private function isBatumPointSignal(mixed $value): bool
+    {
+        $normalized = $this->normalizePointCurrencySignal($value);
+        $batumCashboxCode = $this->normalizePointCurrencySignal(config('integrations.pos.batum_point_cashbox_code'));
+
+        return str_contains($normalized, 'BATUM')
+            || ($batumCashboxCode !== '' && $normalized === $batumCashboxCode);
+    }
+
+    private function normalizePointCurrencySignal(mixed $value): string
+    {
+        return mb_strtoupper(trim((string) $value), 'UTF-8');
     }
 
     private function queueExpenseForLogoExport(PosExpense $expense): void

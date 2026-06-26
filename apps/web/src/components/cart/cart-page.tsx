@@ -132,6 +132,24 @@ function formatStock(value: number): string {
   return value.toLocaleString("tr-TR");
 }
 
+function formatCartDateTime(value?: string | null): string {
+  if (!value) {
+    return "henüz yok";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString("tr-TR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function includesBatum(value?: string | number | null): boolean {
   return String(value ?? "").trim().toLocaleUpperCase("tr-TR").includes("BATUM");
 }
@@ -217,6 +235,11 @@ export function CartPage() {
   const subtotal = toAmount(cartData?.totals.subtotal ?? "0.00");
   const vatTotal = toAmount(cartData?.totals.vat_total ?? "0.00");
   const grandTotal = toAmount(cartData?.totals.grand_total ?? "0.00");
+  const logoIntegration = cartData?.logo_integration;
+  const logoIntegrationReady = logoIntegration?.order_will_queue === true;
+  const logoIntegrationText = logoIntegration
+    ? `${logoIntegration.items_ready}/${logoIntegration.items_total} ürün hazır · son stok sync ${formatCartDateTime(logoIntegration.latest_product_synced_at)}`
+    : "Logo durumu yükleniyor";
   const selectedPayment = PAYMENT_METHODS.find((method) => method.key === selectedPaymentMethod) ?? PAYMENT_METHODS[0];
   const selectedCombinedPayment = COMBINED_PAYMENT_OPTIONS.find((method) => method.key === selectedCombinedPaymentMethod) ?? COMBINED_PAYMENT_OPTIONS[0];
   const defaultWarehouseKey = useMemo(() => {
@@ -806,6 +829,20 @@ export function CartPage() {
 	                  <span className="font-black text-[var(--foreground)]">Genel Toplam</span>
                   <span className="h-px bg-[var(--brand-border)]" />
                   <strong className="text-2xl text-emerald-300 2xl:text-3xl">{formatTryAmount(selectedPayableTotal, currency)}</strong>
+                </div>
+                <div
+                  className={cn(
+                    "rounded-[16px] border px-3 py-2 text-sm font-bold",
+                    logoIntegrationReady
+                      ? "border-emerald-300/35 bg-emerald-500/10 text-emerald-100"
+                      : "border-amber-300/35 bg-amber-500/10 text-amber-100"
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    <ShieldCheck className="h-4 w-4 shrink-0" />
+                    <span className="font-black">{logoIntegrationReady ? "Logo Hazır" : "Logo Kontrol"}</span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 opacity-85">{logoIntegrationText}</p>
                 </div>
               </div>
             </div>

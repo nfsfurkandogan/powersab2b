@@ -141,6 +141,44 @@ class LogoShipmentExportService
     }
 
     /**
+     * @return array<string, mixed>|null
+     */
+    public function recordForShipment(Shipment $shipment): ?array
+    {
+        $state = IntegrationSyncState::query()
+            ->where('system', 'logo')
+            ->where('domain', 'warehouse-shipments')
+            ->where('direction', 'outbound')
+            ->where('entity_type', Shipment::class)
+            ->where('entity_id', (int) $shipment->getKey())
+            ->first();
+
+        if (! $state instanceof IntegrationSyncState) {
+            return null;
+        }
+
+        $model = Shipment::query()
+            ->with([
+                'order.dealer:id,code,name',
+                'order.customer:id,dealer_id,source_system,source_reference,code,name,city,district,phone,tax_office,tax_number,meta',
+                'order.cart:id,shipping_method,note,order_note',
+                'warehouse:id,code,name',
+                'createdBy:id,name',
+                'items.orderItem:id,order_id,quantity,unit_net_price,discount_rate,tax_rate,line_total,currency',
+                'items.product:id,sku,oem_code,name,unit,vat_rate,meta',
+            ])
+            ->whereKey($shipment->getKey())
+            ->whereIn('status', ['shipped', 'partially_shipped'])
+            ->first();
+
+        if (! $model instanceof Shipment) {
+            return null;
+        }
+
+        return $this->transformShipment($model, $state);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function transformShipment(Shipment $shipment, IntegrationSyncState $state): array
@@ -149,6 +187,17 @@ class LogoShipmentExportService
         $customer = $order?->customer;
         $customerMeta = is_array($customer?->meta) ? $customer->meta : [];
         $totals = $this->shipmentTotals($shipment->items);
+        $logoDocument = [
+            'document_type' => 'wholesale_sales_invoice',
+            'document_label' => '(08) Toptan Satış Faturası',
+            'invoice_trcode' => 8,
+            'stock_trcode' => 8,
+            'stock_iocode' => 4,
+            'ledger_modulenr' => 4,
+            'ledger_trcode' => 38,
+            'target_tables' => ['INVOICE', 'STFICHE', 'STLINE', 'CLFLINE'],
+            'order_export_key' => $order ? 'B2B-ORDER-'.$order->id : null,
+        ];
 
         return [
             'shipment_id' => $shipment->id,
@@ -187,15 +236,12 @@ class LogoShipmentExportService
                 'address' => data_get($customerMeta, 'address') ?? data_get($customerMeta, 'full_address'),
                 'logo' => data_get($customerMeta, 'integrations.logo.payload'),
             ],
+            'logo' => $logoDocument,
             'meta' => [
                 'created_at' => optional($shipment->created_at)?->toIso8601String(),
                 'updated_at' => optional($shipment->updated_at)?->toIso8601String(),
                 'logo_external_ref' => $state->external_ref,
-                'logo' => [
-                    'document_type' => 'shipment',
-                    'target_tables' => ['STFICHE', 'STLINE', 'INVOICE'],
-                    'order_export_key' => $order ? 'B2B-ORDER-'.$order->id : null,
-                ],
+                'logo' => $logoDocument,
             ],
         ];
     }

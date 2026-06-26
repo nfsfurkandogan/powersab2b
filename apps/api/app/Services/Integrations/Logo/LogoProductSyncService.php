@@ -5,6 +5,7 @@ namespace App\Services\Integrations\Logo;
 use App\Models\BasePrice;
 use App\Models\Brand;
 use App\Models\Category;
+use App\Models\IntegrationSyncState;
 use App\Models\PriceList;
 use App\Models\Product;
 use App\Models\ProductCodeAlias;
@@ -36,6 +37,8 @@ class LogoProductSyncService
         'meta.raw.BARCODE',
         'meta.raw.BARCODE1',
         'meta.raw.EAN13',
+        'meta.raw.NAME3',
+        'meta.raw.NAME4',
     ];
 
     public function __construct(
@@ -60,6 +63,7 @@ class LogoProductSyncService
             'categories_updated' => 0,
             'stock_synced' => 0,
             'prices_synced' => 0,
+            'images_synced' => 0,
             'code_aliases_synced' => 0,
         ];
 
@@ -72,15 +76,22 @@ class LogoProductSyncService
             return $this->syncStockOnly($payload, $summary);
         }
 
+        if ($this->isImagesOnlyPayload($payload)) {
+            return $this->syncImagesOnly($payload, $summary);
+        }
+
+        $records = (array) ($payload['records'] ?? []);
+        $productLookup = $this->buildProductLookup($records);
         $indexedProductIds = [];
 
-        DB::transaction(function () use ($payload, $defaultPriceList, &$summary, &$indexedProductIds): void {
-            foreach ((array) ($payload['records'] ?? []) as $index => $record) {
+        DB::transaction(function () use ($records, $productLookup, $defaultPriceList, &$summary, &$indexedProductIds): void {
+            foreach ($records as $index => $record) {
                 $brand = $this->resolveBrand($record, $summary);
                 $category = $this->resolveCategory($record, $summary);
 
                 $externalReference = $this->nullableString($record['external_ref'] ?? null);
-                $product = $this->findProduct((string) $record['sku'], $externalReference);
+                $product = $this->findProductFromLookup($productLookup, (string) $record['sku'], $externalReference)
+                    ?? $this->findProduct((string) $record['sku'], $externalReference);
 
                 $attributes = [
                     'brand_id' => $brand?->id,
@@ -159,15 +170,104 @@ class LogoProductSyncService
 
     /**
      * @param  array<string, mixed>  $payload
+     */
+    private function isImagesOnlyPayload(array $payload): bool
+    {
+        return ($payload['mode'] ?? null) === 'images_only'
+            || filter_var($payload['images_only'] ?? false, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @param  array<string, int>  $summary
+     * @return array<string, int>
+     */
+    private function syncImagesOnly(array $payload, array $summary): array
+    {
+        $records = (array) ($payload['records'] ?? []);
+        $productLookup = $this->buildProductLookup($records);
+        $indexedProductIds = [];
+
+        DB::transaction(function () use ($records, $productLookup, &$summary, &$indexedProductIds): void {
+            foreach ($records as $record) {
+                if (! is_array($record)) {
+                    $summary['skipped']++;
+
+                    continue;
+                }
+
+                $imagePayload = $this->extractImagePayload($record);
+                if ($imagePayload === []) {
+                    $summary['skipped']++;
+
+                    continue;
+                }
+
+                $externalReference = $this->nullableString($record['external_ref'] ?? null);
+                $sku = $this->nullableString($record['sku'] ?? null);
+
+                if ($externalReference === null && $sku === null) {
+                    $summary['skipped']++;
+
+                    continue;
+                }
+
+                $product = $this->findProductFromLookup($productLookup, $sku ?? '', $externalReference)
+                    ?? $this->findProduct($sku ?? '', $externalReference);
+                if (! $product) {
+                    $summary['skipped']++;
+
+                    continue;
+                }
+
+                $product = Product::withoutEvents(function () use ($product, $record, $externalReference, $imagePayload): Product {
+                    $product->forceFill([
+                        'meta' => $this->buildImagesOnlyMeta($product, $record, $externalReference, $imagePayload),
+                    ])->save();
+
+                    return $product;
+                });
+
+                $summary['updated']++;
+                $summary['images_synced']++;
+                $indexedProductIds[(int) $product->id] = true;
+
+                $this->syncState->record(
+                    system: 'logo',
+                    domain: 'products',
+                    direction: 'inbound',
+                    entity: $product,
+                    externalRef: $externalReference,
+                    status: 'synced',
+                    meta: [
+                        'operation' => 'images_only',
+                        'image_synced' => true,
+                        'stock_synced' => false,
+                        'price_synced' => false,
+                    ],
+                    payload: $record,
+                );
+            }
+        });
+
+        $this->reindexProducts(array_keys($indexedProductIds));
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
      * @param  array<string, int>  $summary
      * @return array<string, int>
      */
     private function syncStockOnly(array $payload, array $summary): array
     {
+        $records = (array) ($payload['records'] ?? []);
+        $productLookup = $this->buildProductLookup($records);
         $indexedProductIds = [];
 
-        DB::transaction(function () use ($payload, &$summary, &$indexedProductIds): void {
-            foreach ((array) ($payload['records'] ?? []) as $record) {
+        DB::transaction(function () use ($records, $productLookup, &$summary, &$indexedProductIds): void {
+            foreach ($records as $record) {
                 if (! is_array($record)) {
                     $summary['skipped']++;
 
@@ -183,7 +283,8 @@ class LogoProductSyncService
                     continue;
                 }
 
-                $product = $this->findProduct($sku ?? '', $externalReference);
+                $product = $this->findProductFromLookup($productLookup, $sku ?? '', $externalReference)
+                    ?? $this->findProduct($sku ?? '', $externalReference);
                 if (! $product) {
                     $summary['skipped']++;
 
@@ -353,6 +454,96 @@ class LogoProductSyncService
     }
 
     /**
+     * @param  array<int, mixed>  $records
+     * @return array{by_external_ref: array<string, Product>, by_sku: array<string, Product>}
+     */
+    private function buildProductLookup(array $records): array
+    {
+        $externalReferences = [];
+        $skus = [];
+
+        foreach ($records as $record) {
+            if (! is_array($record)) {
+                continue;
+            }
+
+            $externalReference = $this->nullableString($record['external_ref'] ?? null);
+            if ($externalReference !== null) {
+                $externalReferences[$externalReference] = true;
+            }
+
+            $sku = $this->nullableString($record['sku'] ?? null);
+            if ($sku !== null) {
+                $skus[$sku] = true;
+            }
+        }
+
+        $bySku = [];
+        if ($skus !== []) {
+            Product::query()
+                ->whereIn('sku', array_keys($skus))
+                ->get()
+                ->each(function (Product $product) use (&$bySku): void {
+                    $bySku[(string) $product->sku] = $product;
+                });
+        }
+
+        $byExternalReference = [];
+        if ($externalReferences !== []) {
+            $states = IntegrationSyncState::query()
+                ->where('system', 'logo')
+                ->where('domain', 'products')
+                ->where('direction', 'inbound')
+                ->where('entity_type', Product::class)
+                ->whereIn('external_ref', array_keys($externalReferences))
+                ->get(['external_ref', 'entity_id']);
+
+            $productIds = $states
+                ->pluck('entity_id')
+                ->filter()
+                ->unique()
+                ->values()
+                ->all();
+
+            if ($productIds !== []) {
+                $productsById = Product::query()
+                    ->whereIn('id', $productIds)
+                    ->get()
+                    ->keyBy('id');
+
+                foreach ($states as $state) {
+                    $externalReference = $this->nullableString($state->external_ref);
+                    if ($externalReference === null) {
+                        continue;
+                    }
+
+                    $product = $productsById->get((int) $state->entity_id);
+                    if ($product instanceof Product) {
+                        $byExternalReference[$externalReference] = $product;
+                    }
+                }
+            }
+        }
+
+        return [
+            'by_external_ref' => $byExternalReference,
+            'by_sku' => $bySku,
+        ];
+    }
+
+    /**
+     * @param  array{by_external_ref: array<string, Product>, by_sku: array<string, Product>}  $lookup
+     */
+    private function findProductFromLookup(array $lookup, string $sku, ?string $externalReference): ?Product
+    {
+        if ($externalReference !== null && isset($lookup['by_external_ref'][$externalReference])) {
+            return $lookup['by_external_ref'][$externalReference];
+        }
+
+        return $lookup['by_sku'][$sku] ?? null;
+    }
+
+    /**
      * @param  array<string, mixed>  $record
      */
     private function syncStockSummary(Product $product, array $record): bool
@@ -368,10 +559,10 @@ class LogoProductSyncService
 
         $stockSummary = StockSummary::query()->find($product->id);
         $availableTotal = array_key_exists('available_total', $record)
-            ? (int) ($record['available_total'] ?? 0)
+            ? $this->resolveLogoStockTotal($record, ['available_total', 'available', 'onhand_total', 'onhand', 'stock', 'quantity'], (int) ($record['available_total'] ?? 0))
             : ($stockSummary?->available_total ?? 0);
         $reservedTotal = array_key_exists('reserved_total', $record)
-            ? max(0, (int) ($record['reserved_total'] ?? 0))
+            ? max(0, $this->resolveLogoStockTotal($record, ['reserved_total', 'reserved'], (int) ($record['reserved_total'] ?? 0)))
             : ($stockSummary?->reserved_total ?? 0);
 
         $attributes = [
@@ -392,6 +583,44 @@ class LogoProductSyncService
         ]);
 
         return true;
+    }
+
+    /**
+     * @param  list<string>  $keys
+     */
+    private function resolveLogoStockTotal(array $record, array $keys, int $fallback): int
+    {
+        if ($fallback !== 0) {
+            return $fallback;
+        }
+
+        $warehouses = data_get($record, 'meta.logo_stock.warehouses');
+        if (! is_array($warehouses) || $warehouses === []) {
+            return $fallback;
+        }
+
+        $total = 0;
+        $found = false;
+
+        foreach ($warehouses as $warehouse) {
+            if (! is_array($warehouse)) {
+                continue;
+            }
+
+            foreach ($keys as $key) {
+                $value = $warehouse[$key] ?? null;
+                if (! is_numeric($value)) {
+                    continue;
+                }
+
+                $total += (int) $value;
+                $found = true;
+
+                break;
+            }
+        }
+
+        return $found ? $total : $fallback;
     }
 
     /**
@@ -645,10 +874,151 @@ class LogoProductSyncService
 
         $logoStock = data_get($record, 'meta.logo_stock');
         if (is_array($logoStock)) {
-            Arr::set($meta, 'integrations.logo.payload.logo_stock', $logoStock);
+            Arr::set($meta, 'integrations.logo.payload.logo_stock', $this->mergeStockOnlyLogoStock($meta, $logoStock));
         }
 
         return $meta;
+    }
+
+    /**
+     * Stock-only syncs are allowed to refresh quantities, but they should not erase
+     * shelf metadata that only arrives during full catalog/raf syncs.
+     *
+     * @param  array<string, mixed>  $currentMeta
+     * @param  array<string, mixed>  $incomingLogoStock
+     * @return array<string, mixed>
+     */
+    private function mergeStockOnlyLogoStock(array $currentMeta, array $incomingLogoStock): array
+    {
+        $currentWarehouses = data_get($currentMeta, 'integrations.logo.payload.logo_stock.warehouses');
+        if (! is_array($currentWarehouses) || $currentWarehouses === []) {
+            return $incomingLogoStock;
+        }
+
+        $incomingWarehouses = $incomingLogoStock['warehouses'] ?? null;
+        if (! is_array($incomingWarehouses) || $incomingWarehouses === []) {
+            $incomingLogoStock['warehouses'] = $currentWarehouses;
+
+            return $incomingLogoStock;
+        }
+
+        $currentByWarehouseKey = [];
+        foreach ($currentWarehouses as $warehouse) {
+            if (! is_array($warehouse)) {
+                continue;
+            }
+
+            foreach ($this->warehouseIdentityKeys($warehouse) as $key) {
+                $currentByWarehouseKey[$key] = $warehouse;
+            }
+        }
+
+        if ($currentByWarehouseKey === []) {
+            return $incomingLogoStock;
+        }
+
+        $incomingLogoStock['warehouses'] = array_map(function ($warehouse) use ($currentByWarehouseKey): mixed {
+            if (! is_array($warehouse)) {
+                return $warehouse;
+            }
+
+            $existingWarehouse = null;
+            foreach ($this->warehouseIdentityKeys($warehouse) as $key) {
+                if (isset($currentByWarehouseKey[$key])) {
+                    $existingWarehouse = $currentByWarehouseKey[$key];
+
+                    break;
+                }
+            }
+
+            if (! is_array($existingWarehouse)) {
+                return $warehouse;
+            }
+
+            if ($this->nullableString($warehouse['shelf_address'] ?? null) === null) {
+                $existingShelfAddress = $this->nullableString($existingWarehouse['shelf_address'] ?? null);
+                if ($existingShelfAddress !== null) {
+                    $warehouse['shelf_address'] = $existingShelfAddress;
+                }
+            }
+
+            if ($this->nullableString($warehouse['shelf_key'] ?? null) === null) {
+                $existingShelfKey = $this->nullableString($existingWarehouse['shelf_key'] ?? null);
+                if ($existingShelfKey !== null) {
+                    $warehouse['shelf_key'] = $existingShelfKey;
+                }
+            }
+
+            return $warehouse;
+        }, $incomingWarehouses);
+
+        return $incomingLogoStock;
+    }
+
+    /**
+     * @param  array<string, mixed>  $warehouse
+     * @return list<string>
+     */
+    private function warehouseIdentityKeys(array $warehouse): array
+    {
+        $keys = [];
+
+        foreach (['warehouse_code', 'invenno', 'warehouse_no', 'code', 'branch_code'] as $field) {
+            $value = $this->nullableString($warehouse[$field] ?? null);
+            if ($value !== null) {
+                $keys[] = mb_strtolower($value, 'UTF-8');
+            }
+        }
+
+        return array_values(array_unique($keys));
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @param  array<string, string>  $imagePayload
+     * @return array<string, mixed>
+     */
+    private function buildImagesOnlyMeta(Product $product, array $record, ?string $externalReference, array $imagePayload): array
+    {
+        $meta = is_array($product->meta) ? $product->meta : [];
+
+        Arr::set($meta, 'integrations.logo.synced_at', now()->toIso8601String());
+
+        if ($externalReference !== null) {
+            Arr::set($meta, 'integrations.logo.external_ref', $externalReference);
+        }
+
+        foreach ($imagePayload as $key => $value) {
+            Arr::set($meta, "integrations.logo.payload.raw.{$key}", $value);
+        }
+
+        return $meta;
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return array<string, string>
+     */
+    private function extractImagePayload(array $record): array
+    {
+        $payload = [];
+
+        foreach ([
+            'IMAGE' => ['meta.raw.IMAGE', 'meta.IMAGE', 'image'],
+            'IMAGE_URL' => ['meta.raw.IMAGE_URL', 'meta.IMAGE_URL', 'image_url'],
+            'IMAGE_PATH' => ['meta.raw.IMAGE_PATH', 'meta.IMAGE_PATH', 'image_path'],
+        ] as $key => $paths) {
+            foreach ($paths as $path) {
+                $value = $this->nullableString(data_get($record, $path));
+                if ($value !== null) {
+                    $payload[$key] = $value;
+
+                    break;
+                }
+            }
+        }
+
+        return $payload;
     }
 
     private function resolvePriceList(

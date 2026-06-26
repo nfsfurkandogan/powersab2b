@@ -111,7 +111,10 @@ export default function RootLayout({
         <link rel="apple-touch-icon" href="/pwa/apple-touch-icon.png" />
         <script dangerouslySetInnerHTML={{ __html: uiThemeScript }} />
       </head>
-      <body className={`${publicSans.variable} ${inter.variable} ${robotoCondensed.variable} font-sans antialiased`}>
+      <body
+        suppressHydrationWarning
+        className={`${publicSans.variable} ${inter.variable} ${robotoCondensed.variable} font-sans antialiased`}
+      >
         <ReactQueryProvider>
           <AppProvider>{children}</AppProvider>
           <Toaster richColors position="top-right" closeButton />

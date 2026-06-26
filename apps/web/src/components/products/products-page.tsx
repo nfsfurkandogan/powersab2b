@@ -6,7 +6,6 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import {
   Calculator,
-  Car,
   ImageIcon,
   Loader2,
   Minus,
@@ -47,7 +46,7 @@ const MIN_SEARCH_LENGTH = 2;
 const PRODUCT_PREVIEW_IMAGE_WIDTH = 960;
 const ALL_FILTER_VALUE = "__all";
 const PRODUCT_TABLE_GRID =
-  "grid min-w-[1100px] w-full grid-cols-[40px_minmax(84px,0.64fr)_minmax(64px,0.42fr)_minmax(250px,1.55fr)_minmax(62px,0.36fr)_48px_78px_minmax(200px,0.94fr)_112px_58px] items-stretch gap-0";
+  "grid w-full items-stretch gap-0";
 const PRODUCT_FILTER_TRIGGER_CLASS =
   "admin-dashboard-ghost h-12 w-full rounded-xl bg-[var(--surface-soft)] px-4 text-left text-sm font-extrabold shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-colors hover:border-[var(--brand-primary)]/55 hover:bg-[color-mix(in_oklab,var(--brand-primary)_10%,var(--surface))] focus-visible:ring-2 focus-visible:ring-[var(--brand-primary)]/45";
 const PRODUCT_FILTER_CONTENT_CLASS =
@@ -65,6 +64,18 @@ type ProductSearchPageParam = {
   cursor: string | null;
   page: number;
 };
+
+function productTableGridStyle(stockColumnCount: number): CSSProperties {
+  const normalizedStockColumnCount = Math.max(stockColumnCount, 1);
+  const stockColumnWidth = Math.min(210, Math.max(88, normalizedStockColumnCount * 58));
+  const minWidth = 925 + stockColumnWidth;
+  const stockColumnFlex = normalizedStockColumnCount >= 5 ? 0.94 : normalizedStockColumnCount === 2 ? 0.58 : 0.42;
+
+  return {
+    minWidth,
+    gridTemplateColumns: `40px minmax(84px,0.64fr) minmax(64px,0.42fr) minmax(250px,1.55fr) minmax(62px,0.36fr) 48px 78px minmax(${stockColumnWidth}px,${stockColumnFlex}fr) 154px 58px`,
+  };
+}
 
 const PRODUCT_SORT_OPTIONS: Array<{ value: ProductSort; label: string }> = [
   { value: "recommended", label: "Önerilen" },
@@ -166,6 +177,24 @@ function formatProductDate(value: string | null | undefined): string {
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
+  }).format(date);
+}
+
+function formatProductDateTime(value: string | null | undefined): string {
+  if (!value) {
+    return "-";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("tr-TR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
   }).format(date);
 }
 
@@ -367,7 +396,30 @@ function branchStockRows(product: ProductSearchItem, columns: readonly BranchSto
   });
 }
 
-function visibleBranchStockColumns(featurePermissionSet: Set<string>, roleSlugs: string[]): readonly BranchStockColumn[] {
+function userSpecificBranchStockColumns(username: string | null | undefined): readonly BranchStockColumn[] | null {
+  const normalizedUsername = normalizeBranchText(username);
+  const allowedKeys = (() => {
+    switch (normalizedUsername) {
+      case "erzurum hizlisatis":
+        return new Set(["erz-point", "erz-depo"]);
+      case "ahmet arac":
+      case "huseyin ozguney":
+      case "mehmet aksoy":
+        return new Set(["erz-depo"]);
+      default:
+        return null;
+    }
+  })();
+
+  return allowedKeys ? BRANCH_STOCK_COLUMNS.filter((column) => allowedKeys.has(column.key)) : null;
+}
+
+function visibleBranchStockColumns(featurePermissionSet: Set<string>, roleSlugs: string[], username: string | null | undefined): readonly BranchStockColumn[] {
+  const userSpecificColumns = userSpecificBranchStockColumns(username);
+  if (userSpecificColumns !== null) {
+    return userSpecificColumns;
+  }
+
   if (roleSlugs.includes("admin") || roleSlugs.includes("moderator")) {
     return BRANCH_STOCK_COLUMNS;
   }
@@ -428,6 +480,7 @@ type ProductRowProps = {
   canViewStock: boolean;
   visibleStockColumns: readonly BranchStockColumn[];
   showRetailPriceHint: boolean;
+  tableGridStyle: CSSProperties;
   style?: CSSProperties;
   onOpenCartModal: (product: ProductSearchItem, currentQty: number) => void;
   onPreviewImage: (preview: ProductImagePreview) => void;
@@ -657,6 +710,7 @@ const ProductRow = memo(function ProductRow({
   canViewStock,
   visibleStockColumns,
   showRetailPriceHint,
+  tableGridStyle,
   style,
   onOpenCartModal,
   onPreviewImage,
@@ -680,7 +734,10 @@ const ProductRow = memo(function ProductRow({
       role="row"
       className="admin-product-row w-full"
     >
-      <div className={cn("admin-product-row-grid group min-h-[50px] border-b border-l-4 border-[var(--brand-border)] border-l-transparent bg-[var(--surface)] transition-[background-color,border-color,box-shadow] duration-150 hover:border-l-[#8bd19f] hover:bg-[#1d3024] hover:shadow-[inset_0_0_0_9999px_rgba(139,209,159,0.08)]", PRODUCT_TABLE_GRID)}>
+      <div
+        className={cn("admin-product-row-grid group min-h-[50px] border-b border-l-4 border-[var(--brand-border)] border-l-transparent bg-[var(--surface)] transition-[background-color,border-color,box-shadow] duration-150 hover:border-l-[#8bd19f] hover:bg-[#1d3024] hover:shadow-[inset_0_0_0_9999px_rgba(139,209,159,0.08)]", PRODUCT_TABLE_GRID)}
+        style={tableGridStyle}
+      >
         <div role="cell" className="flex items-center justify-center px-1.5 py-1">
           <ProductImageCell product={product} onPreviewImage={onPreviewImage} />
         </div>
@@ -747,11 +804,11 @@ const ProductRow = memo(function ProductRow({
               type="button"
               onClick={() => competitorCodes.length > 0 && onShowCompetitorCodes({ sku: product.sku, name: product.name, codes: competitorCodes })}
               disabled={competitorCodes.length === 0}
-              className="flex h-8 min-w-0 items-center justify-center gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-center text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70"
+              className="flex h-7 min-w-0 items-center justify-between gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70"
               title="Rakip kodları"
             >
-              <span className="text-[8px] uppercase tracking-[0.02em]">Rakip</span>
-              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[10px] text-[var(--primary-foreground)]">
+              <span className="truncate text-[8px] uppercase tracking-[0.02em]">Rakip</span>
+              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[9px] text-[var(--primary-foreground)]">
                 {competitorCodes.length}
               </span>
             </button>
@@ -759,11 +816,11 @@ const ProductRow = memo(function ProductRow({
               type="button"
               onClick={() => product.oem && onShowOemCode({ sku: product.sku, name: product.name, oem: product.oem })}
               disabled={!product.oem}
-              className="flex h-8 min-w-0 items-center justify-center gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-center text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70"
+              className="flex h-7 min-w-0 items-center justify-between gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70"
               title="OEM kodları"
             >
-              <span className="text-[8px] uppercase tracking-[0.02em]">OEM</span>
-              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[10px] text-[var(--primary-foreground)]">
+              <span className="truncate text-[8px] uppercase tracking-[0.02em]">OEM</span>
+              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[9px] text-[var(--primary-foreground)]">
                 {product.oem ? 1 : 0}
               </span>
             </button>
@@ -771,14 +828,13 @@ const ProductRow = memo(function ProductRow({
               type="button"
               onClick={() => vehicleFitments.length > 0 && onShowVehicleFitments({ sku: product.sku, name: product.name, fitments: vehicleFitments })}
               disabled={vehicleFitments.length === 0}
-              className="flex h-8 min-w-0 items-center justify-center gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-center text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70"
+              className="flex h-7 min-w-0 items-center justify-between gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70"
               title="Araç uyumluluğu"
             >
-              <span className="flex items-center gap-0.5 text-[8px] uppercase tracking-[0.02em]">
-                <Car className="h-2.5 w-2.5" />
+              <span className="truncate text-[8px] uppercase tracking-[0.02em]">
                 Araç
               </span>
-              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[10px] text-[var(--primary-foreground)]">
+              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[9px] text-[var(--primary-foreground)]">
                 {vehicleFitments.length}
               </span>
             </button>
@@ -787,7 +843,7 @@ const ProductRow = memo(function ProductRow({
               onClick={() => previousPurchase && onShowPreviousPurchase({ sku: product.sku, name: product.name, previousPurchase })}
               disabled={!previousPurchase}
               className={cn(
-                "relative flex h-8 min-w-0 items-center justify-center gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-center text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70",
+                "relative flex h-7 min-w-0 items-center justify-between gap-1 rounded-lg border border-[var(--brand-border)] bg-[var(--surface-soft)] px-1 text-[var(--foreground)] transition-colors hover:border-[#8bd19f]/60 hover:bg-[#213b31] disabled:cursor-default disabled:opacity-70",
                 previousPurchase && "border-emerald-300/60 bg-emerald-300/10 shadow-[0_0_18px_-8px_rgba(52,211,153,0.95)]"
               )}
               title="Önceki alım"
@@ -801,8 +857,8 @@ const ProductRow = memo(function ProductRow({
                     : "bg-slate-600"
                 )}
               />
-              <span className="text-[8px] uppercase tracking-[0.02em]">Önceki</span>
-              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[10px] text-[var(--primary-foreground)]">
+              <span className="truncate text-[8px] uppercase tracking-[0.02em]">Önceki</span>
+              <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--brand-primary)] px-1 text-[9px] text-[var(--primary-foreground)]">
                 {previousPurchase ? 1 : 0}
               </span>
             </button>
@@ -858,6 +914,7 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
     };
   }, [resetFiltersAfterReload, searchParamsKey]);
   const previousQuerySearchRef = useRef(querySeed.q);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const cartQuantityInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -884,8 +941,12 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
   const canViewSearchStock = !isCustomerUser || featurePermissionSet.has("search.stock");
   const canUseSearchCart = !isCustomerUser || featurePermissionSet.has("search.add_to_cart");
   const visibleStockColumns = useMemo(
-    () => visibleBranchStockColumns(featurePermissionSet, roleSlugs),
-    [featurePermissionSet, roleSlugs]
+    () => visibleBranchStockColumns(featurePermissionSet, roleSlugs, user?.username),
+    [featurePermissionSet, roleSlugs, user?.username]
+  );
+  const tableGridStyle = useMemo(
+    () => productTableGridStyle(visibleStockColumns.length),
+    [visibleStockColumns.length]
   );
 
   const [search, setSearch] = useState(querySeed.q);
@@ -914,6 +975,19 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
     () => normalizeCompetitorCodeRows(competitorCodesPreview?.codes ?? []),
     [competitorCodesPreview],
   );
+
+  useEffect(() => {
+    if (compact || !selectedCustomer?.id) {
+      return;
+    }
+
+    const focusTimer = window.setTimeout(() => {
+      searchInputRef.current?.focus({ preventScroll: true });
+      searchInputRef.current?.select();
+    }, 80);
+
+    return () => window.clearTimeout(focusTimer);
+  }, [compact, selectedCustomer?.id]);
 
   useEffect(() => {
     if (!cartModalProduct) {
@@ -1055,10 +1129,11 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
     refetchOnMount: false,
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
-    retry: 1,
+    retry: 0,
     staleTime: 5 * 60_000,
     gcTime: 15 * 60_000,
     enabled: shouldFetchProducts,
+    placeholderData: (previousData) => previousData,
   });
 
   const products = useMemo(() => {
@@ -1066,7 +1141,17 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
       return [];
     }
 
-    const items = (productsQuery.data?.pages.flatMap((pageData) => pageData.data) ?? []).map((product, index) => ({ product, index }));
+    const seenProductIds = new Set<number>();
+    const items = (productsQuery.data?.pages.flatMap((pageData) => pageData.data) ?? [])
+      .map((product, index) => ({ product, index }))
+      .filter(({ product }) => {
+        if (seenProductIds.has(product.id)) {
+          return false;
+        }
+
+        seenProductIds.add(product.id);
+        return true;
+      });
     const normalizedQuery = normalizeSearchValue(normalizedSearch);
 
     if (!normalizedQuery || sort !== "recommended") {
@@ -1093,8 +1178,34 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
 
   const hasExactTotal = shouldFetchProducts && typeof productsQuery.data?.pages[0]?.total_count === "number";
   const totalProducts = productsQuery.data?.pages[0]?.total_count ?? products.length;
+  const latestLogoSyncedAt = useMemo(() => {
+    let latestTimestamp = 0;
+    let latestValue: string | null = null;
+
+    for (const product of products) {
+      const value = product.logo_synced_at;
+      if (!value) {
+        continue;
+      }
+
+      const timestamp = new Date(value).getTime();
+      if (!Number.isNaN(timestamp) && timestamp > latestTimestamp) {
+        latestTimestamp = timestamp;
+        latestValue = value;
+      }
+    }
+
+    return latestValue;
+  }, [products]);
   const productListScrollRef = useRef<HTMLDivElement | null>(null);
   const infiniteScrollMarkerRef = useRef<HTMLDivElement | null>(null);
+  const nextProductsPageInFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (!productsQuery.isFetchingNextPage) {
+      nextProductsPageInFlightRef.current = false;
+    }
+  }, [productsQuery.isFetchingNextPage]);
 
   useEffect(() => {
     if (!shouldFetchProducts || !productsQuery.hasNextPage || productsQuery.isFetchingNextPage) {
@@ -1108,8 +1219,16 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
 
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry?.isIntersecting && productsQuery.hasNextPage && !productsQuery.isFetchingNextPage) {
-          void productsQuery.fetchNextPage();
+        if (
+          entry?.isIntersecting &&
+          productsQuery.hasNextPage &&
+          !productsQuery.isFetchingNextPage &&
+          !nextProductsPageInFlightRef.current
+        ) {
+          nextProductsPageInFlightRef.current = true;
+          void productsQuery.fetchNextPage().finally(() => {
+            nextProductsPageInFlightRef.current = false;
+          });
         }
       },
       {
@@ -1333,6 +1452,7 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
             <div className="relative">
               <Search className="pointer-events-none absolute left-5 top-1/2 h-6 w-6 -translate-y-1/2 text-[var(--muted-foreground)]" />
               <Input
+                ref={searchInputRef}
                 value={search}
                 onChange={(event) => {
                   setSearch(event.target.value);
@@ -1480,6 +1600,7 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
                 <div
                   key={`product-skeleton-${index}`}
                   className={cn(PRODUCT_TABLE_GRID, "rounded-md bg-[var(--surface)] px-3 py-3")}
+                  style={tableGridStyle}
                 >
                   <Skeleton className="h-16 w-16 rounded-lg" />
                   <Skeleton className="h-4 w-28" />
@@ -1536,6 +1657,7 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
                       PRODUCT_TABLE_GRID,
                       "sticky top-0 z-30 border border-emerald-300/35 bg-[radial-gradient(circle_at_8%_16%,rgba(34,197,94,0.42)_0%,transparent_34%),linear-gradient(135deg,rgba(15,118,54,0.96)_0%,rgba(3,48,31,0.98)_100%)] text-[11px] font-black uppercase tracking-[0.1em] text-emerald-50 shadow-[inset_0_1px_0_rgba(255,255,255,0.12),inset_0_-1px_0_rgba(34,197,94,0.12),0_16px_34px_-30px_rgba(34,197,94,0.84)]"
                     )}
+                    style={tableGridStyle}
                   >
                     <span role="columnheader" className="flex items-center justify-center px-2 py-3 text-center drop-shadow-[0_1px_1px_rgba(0,0,0,0.44)]">Resim</span>
                     <span role="columnheader" className="flex items-center border-l border-white/10 px-2 py-3 drop-shadow-[0_1px_1px_rgba(0,0,0,0.44)]">Stok Kodu</span>
@@ -1582,6 +1704,7 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
                         canViewStock={canViewSearchStock}
                         visibleStockColumns={visibleStockColumns}
                         showRetailPriceHint={isPointPanel}
+                        tableGridStyle={tableGridStyle}
                         onOpenCartModal={handleOpenCartModal}
 	                        onPreviewImage={setImagePreview}
 	                        onShowCompetitorCodes={setCompetitorCodesPreview}
@@ -1597,6 +1720,7 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
                       PRODUCT_TABLE_GRID,
                       "min-h-16 border-b border-l-4 border-[var(--brand-border)] border-l-transparent bg-[var(--surface)]"
                     )}
+                    style={tableGridStyle}
                   >
                     <div className="col-span-10 flex items-center justify-center px-4 py-4 text-sm font-extrabold text-[var(--muted-foreground)]">
                       {productsQuery.isFetchingNextPage ? (
@@ -1615,10 +1739,16 @@ export function ProductsPage({ compact = false }: { compact?: boolean }) {
               </div>
 
               <div className="mt-4 flex items-center justify-between rounded-xl border border-[var(--brand-border)] bg-[var(--surface)] px-4 py-3">
-                <p className="text-sm font-semibold text-[var(--foreground)]">
-                  {hasExactTotal ? `${totalProducts.toLocaleString("tr-TR")} ürün içinde ` : ""}
-                  {products.length.toLocaleString("tr-TR")} ürün gösteriliyor
-                </p>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-[var(--foreground)]">
+                    {hasExactTotal ? `${totalProducts.toLocaleString("tr-TR")} ürün içinde ` : ""}
+                    {products.length.toLocaleString("tr-TR")} ürün gösteriliyor
+                  </p>
+                  <p className="mt-1 text-xs font-bold text-[var(--muted-foreground)]">
+                    Logo: {latestLogoSyncedAt ? formatProductDateTime(latestLogoSyncedAt) : "ürün sync bekleniyor"}
+                    {productsQuery.data?.pages[0]?.search_backend ? ` · ${productsQuery.data.pages[0].search_backend}` : ""}
+                  </p>
+                </div>
                 {productsQuery.isFetching && !productsQuery.isFetchingNextPage ? (
                   <span className="inline-flex items-center gap-2 text-xs font-black uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />

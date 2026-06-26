@@ -49,6 +49,9 @@ async function main() {
       console.log(
         `[logo-sync] delta cursor last_modified_at=${syncPlan.cursor.last_modified_at} last_logicalref=${syncPlan.cursor.last_logicalref}`
       );
+      if (config.sync.lookbackSeconds > 0) {
+        console.log(`[logo-sync] delta lookback seconds=${config.sync.lookbackSeconds}`);
+      }
     }
 
     const rows = await fetchCustomers(pool, config, schema, syncPlan);
@@ -144,6 +147,7 @@ function buildConfig() {
       dealerId,
       dealerCode: nullable(process.env.POWERSA_DEALER_CODE),
       forceFull: parseBoolean(process.env.SYNC_FORCE_FULL, false),
+      lookbackSeconds: parseInteger(process.env.SYNC_CUSTOMERS_LOOKBACK_SECONDS, 300),
       stateFile: path.resolve(scriptDir, process.env.SYNC_STATE_FILE ?? ".sync-state.json"),
     },
   };
@@ -172,6 +176,10 @@ function validateConfig(currentConfig) {
 
   if (currentConfig.sync.batchSize < 1 || currentConfig.sync.batchSize > 1000) {
     throw new Error("SYNC_BATCH_SIZE must be between 1 and 1000");
+  }
+
+  if (currentConfig.sync.lookbackSeconds < 0 || currentConfig.sync.lookbackSeconds > 86400) {
+    throw new Error("SYNC_CUSTOMERS_LOOKBACK_SECONDS must be between 0 and 86400");
   }
 
   if (currentConfig.logo.port !== undefined) {
@@ -256,13 +264,16 @@ async function fetchCustomers(pool, currentConfig, schema, syncPlan) {
   `;
 
   if (syncPlan.mode === "delta") {
-    request.input("lastModifiedAt", sql.DateTime2, new Date(syncPlan.cursor.last_modified_at));
+    const lastModifiedAt = new Date(syncPlan.cursor.last_modified_at);
+    const lookbackStart = subtractSeconds(lastModifiedAt, currentConfig.sync.lookbackSeconds);
+
+    request.input("lookbackStart", sql.DateTime2, lookbackStart);
     request.input("lastLogicalRef", sql.Int, syncPlan.cursor.last_logicalref);
     query += `
       AND CAPIBLOCK_MODIFIEDDATE IS NOT NULL
       AND (
-        CAPIBLOCK_MODIFIEDDATE > @lastModifiedAt
-        OR (CAPIBLOCK_MODIFIEDDATE = @lastModifiedAt AND LOGICALREF > @lastLogicalRef)
+        CAPIBLOCK_MODIFIEDDATE >= @lookbackStart
+        OR (CAPIBLOCK_MODIFIEDDATE = @lookbackStart AND LOGICALREF > @lastLogicalRef)
       )
       ORDER BY CAPIBLOCK_MODIFIEDDATE ASC, LOGICALREF ASC
     `;
@@ -559,6 +570,15 @@ function chunk(items, size) {
   }
 
   return result;
+}
+
+function subtractSeconds(value, seconds) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime()) || seconds <= 0) {
+    return date;
+  }
+
+  return new Date(date.getTime() - seconds * 1000);
 }
 
 function normalizeString(value) {

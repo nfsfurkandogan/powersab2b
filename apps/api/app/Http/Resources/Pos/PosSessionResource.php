@@ -29,6 +29,11 @@ class PosSessionResource extends JsonResource
             'opened_by' => [
                 'id' => $this->openedBy?->id,
                 'name' => $this->openedBy?->name,
+                'dealer_id' => $this->openedBy?->dealer_id,
+                'branch_code' => $this->openedBy?->branch_code,
+                'branch_name' => $this->openedBy?->branch_name,
+                'region_code' => $this->openedBy?->region_code,
+                'region_name' => $this->openedBy?->region_name,
             ],
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,

@@ -65,7 +65,7 @@ class DayEndReportService
                 ->keyBy('method');
 
             $recentPaidSaleModels = (clone $paidSalesQuery)
-                ->with(['customer:id,code,name', 'payments:id,pos_sale_id,method,amount', 'createdBy.roles:id,slug'])
+                ->with(['customer:id,code,name', 'payments:id,pos_sale_id,method,amount', 'createdBy.roles:id,slug', 'posSession.cashbox:id,code,name'])
                 ->latest('id')
                 ->limit(80)
                 ->get();
@@ -74,13 +74,21 @@ class DayEndReportService
                     $primaryPayment = $sale->payments
                         ->sortByDesc(fn (PosPayment $payment): float => (float) $payment->amount)
                         ->first();
-                    $paymentMethod = $primaryPayment?->method ?? $sale->sale_type;
+                    $paymentMethod = in_array((string) $sale->sale_type, ['cash', 'card', 'transfer'], true)
+                        ? (string) $sale->sale_type
+                        : (string) ($primaryPayment?->method ?? 'cash');
                     $createdByRoleSlugs = $sale->createdBy?->roles
                         ->pluck('slug')
                         ->map(fn ($slug): string => (string) $slug)
                         ->values()
                         ->all() ?? [];
                     $isWarehouseSale = in_array('warehouse', $createdByRoleSlugs, true);
+                    $dayEndBucket = $this->resolveSaleReportBucket(
+                        sale: $sale,
+                        paymentMethod: $paymentMethod,
+                        createdByRoleSlugs: $createdByRoleSlugs,
+                        isWarehouseSale: $isWarehouseSale
+                    );
 
                     return [
                         'id' => $sale->id,
@@ -90,6 +98,7 @@ class DayEndReportService
                         'sale_type' => $sale->sale_type,
                         'document_type' => $sale->document_type,
                         'payment_method' => $paymentMethod,
+                        'day_end_bucket' => $dayEndBucket,
                         'is_warehouse_sale' => $isWarehouseSale,
                         'grand_total' => number_format((float) $sale->grand_total, 2, '.', ''),
                         'created_at' => $sale->created_at?->toIso8601String(),
@@ -98,20 +107,17 @@ class DayEndReportService
                 ->values();
             $normalSaleRows = $saleRows
                 ->filter(
-                    fn (array $row): bool => (bool) ($row['is_warehouse_sale'] ?? false)
-                        || ! in_array((string) ($row['payment_method'] ?? ''), ['cash', 'card'], true)
+                    fn (array $row): bool => (string) ($row['day_end_bucket'] ?? 'normal') === 'normal'
                 )
                 ->values();
             $cashSaleRows = $saleRows
                 ->filter(
-                    fn (array $row): bool => ! (bool) ($row['is_warehouse_sale'] ?? false)
-                        && (string) ($row['payment_method'] ?? '') === 'cash'
+                    fn (array $row): bool => (string) ($row['day_end_bucket'] ?? '') === 'cash'
                 )
                 ->values();
             $cardSaleRows = $saleRows
                 ->filter(
-                    fn (array $row): bool => ! (bool) ($row['is_warehouse_sale'] ?? false)
-                        && (string) ($row['payment_method'] ?? '') === 'card'
+                    fn (array $row): bool => (string) ($row['day_end_bucket'] ?? '') === 'card'
                 )
                 ->values();
 
@@ -302,6 +308,95 @@ class DayEndReportService
     }
 
     /**
+     * @param  list<string>  $createdByRoleSlugs
+     */
+    private function resolveSaleReportBucket(
+        PosSale $sale,
+        string $paymentMethod,
+        array $createdByRoleSlugs,
+        bool $isWarehouseSale
+    ): string {
+        if ($isWarehouseSale) {
+            return 'normal';
+        }
+
+        $pointDefaultBucket = $this->pointDefaultCustomerBucket(
+            $sale->customer?->code,
+            $sale->customer?->name
+        );
+
+        if ($pointDefaultBucket !== null) {
+            return $pointDefaultBucket;
+        }
+
+        if ($this->isPointSaleContext($sale, $createdByRoleSlugs)) {
+            return 'normal';
+        }
+
+        return in_array($paymentMethod, ['cash', 'card'], true) ? $paymentMethod : 'normal';
+    }
+
+    /**
+     * @param  list<string>  $createdByRoleSlugs
+     */
+    private function isPointSaleContext(PosSale $sale, array $createdByRoleSlugs): bool
+    {
+        if (in_array('point', $createdByRoleSlugs, true)) {
+            return true;
+        }
+
+        $cashboxText = $this->normalizeReportText(
+            ($sale->posSession?->cashbox?->code ?? '').' '.($sale->posSession?->cashbox?->name ?? '')
+        );
+
+        return str_contains($cashboxText, 'POINT')
+            || str_contains($cashboxText, 'BATUM')
+            || str_contains($cashboxText, 'ERZURUM');
+    }
+
+    private function pointDefaultCustomerBucket(?string $customerCode, ?string $customerName): ?string
+    {
+        $text = $this->normalizeReportText(($customerCode ?? '').' '.($customerName ?? ''));
+
+        if ($text === '') {
+            return null;
+        }
+
+        $looksLikePointDefault = str_contains($text, 'POINT')
+            || str_contains($text, 'PERAKENDE')
+            || str_contains($text, 'BATUM')
+            || str_contains($text, 'ERZURUM');
+
+        if (! $looksLikePointDefault || ! str_contains($text, 'SATIS')) {
+            return null;
+        }
+
+        if (str_contains($text, 'KREDI') && str_contains($text, 'KART')) {
+            return 'card';
+        }
+
+        if (str_contains($text, 'NAKIT')) {
+            return 'cash';
+        }
+
+        return null;
+    }
+
+    private function normalizeReportText(string $value): string
+    {
+        $normalized = mb_strtoupper(trim($value), 'UTF-8');
+
+        return strtr($normalized, [
+            'Ç' => 'C',
+            'Ğ' => 'G',
+            'İ' => 'I',
+            'Ö' => 'O',
+            'Ş' => 'S',
+            'Ü' => 'U',
+        ]);
+    }
+
+    /**
      * @param  Builder<PosSale>  $query
      * @param  array<string, mixed>  $filters
      * @return Builder<PosSale>
@@ -349,15 +444,20 @@ class DayEndReportService
         $dateColumn = 'COALESCE(`date`, collection_date)';
 
         $query->where(function (Builder $scope) use ($filters): void {
-            $scope->whereRaw("json_extract(meta, '$.source') = ?", ['point_collection']);
+            $scope->where('meta->source', 'point_collection');
 
             if (! empty($filters['pos_session_id'])) {
-                $scope->orWhereRaw("json_extract(meta, '$.pos_session_id') = ?", [(int) $filters['pos_session_id']]);
+                $scope->orWhere('meta->pos_session_id', (int) $filters['pos_session_id']);
             }
 
             if (! empty($filters['cashbox_id'])) {
-                $scope->orWhereRaw("json_extract(meta, '$.cashbox_id') = ?", [(int) $filters['cashbox_id']]);
+                $scope->orWhere('meta->cashbox_id', (int) $filters['cashbox_id']);
             }
+        });
+        $query->where(function (Builder $scope): void {
+            $scope
+                ->whereNull('meta->source')
+                ->orWhere('meta->source', '!=', 'pos_sale');
         });
 
         if (! $user->hasRole('admin')) {
@@ -369,11 +469,11 @@ class DayEndReportService
         }
 
         if (! empty($filters['pos_session_id'])) {
-            $query->whereRaw("json_extract(meta, '$.pos_session_id') = ?", [(int) $filters['pos_session_id']]);
+            $query->where('meta->pos_session_id', (int) $filters['pos_session_id']);
         }
 
         if (! empty($filters['cashbox_id'])) {
-            $query->whereRaw("json_extract(meta, '$.cashbox_id') = ?", [(int) $filters['cashbox_id']]);
+            $query->where('meta->cashbox_id', (int) $filters['cashbox_id']);
         }
 
         if (! empty($filters['date'])) {

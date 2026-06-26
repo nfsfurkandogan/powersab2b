@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useInfiniteQuery, useMutation } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Check,
@@ -160,11 +160,39 @@ export function CustomerSelectionPage() {
         fast: !hasCart && !hasOrderBalance ? true : undefined,
         cursor: pageParam ?? undefined,
         limit: PAGE_LIMIT,
-        cache_bust: Date.now(),
       }),
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
+    staleTime: 15_000,
+  });
+
+  const customerCountQuery = useQuery({
+    queryKey: [
+      "customers",
+      "count",
+      {
+        userId: user?.id ?? null,
+        selectionMode: isSalespersonSelectionMode,
+        q: submittedQuery,
+        hasCart,
+        hasOrderBalance,
+      },
+    ],
+    enabled: typeof user?.id === "number",
+    queryFn: () =>
+      listCustomers({
+        q: submittedQuery || undefined,
+        has_cart: hasCart ? true : undefined,
+        has_order_balance: hasOrderBalance ? true : undefined,
+        source_system: "logo",
+        selection_mode: isSalesperson ? true : undefined,
+        summary: "count",
+        limit: 1,
+      }),
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    staleTime: 30_000,
   });
 
   const customers = useMemo(
@@ -174,6 +202,7 @@ export function CustomerSelectionPage() {
   const hasActiveFilters = Boolean(submittedQuery) || hasCart || hasOrderBalance;
   const displayCustomers = customers;
   const loadedCustomerCount = displayCustomers.length;
+  const totalCustomerCount = customerCountQuery.data?.total_count ?? customersQuery.data?.pages[0]?.total_count ?? null;
   const { fetchNextPage, hasNextPage, isFetchingNextPage } = customersQuery;
   const activeFilterCount =
     Number(Boolean(submittedQuery)) +
@@ -660,7 +689,9 @@ export function CustomerSelectionPage() {
               )}
             >
               <p className="text-base text-[var(--muted-foreground)]">
-                {loadedCustomerCount} kayıt yüklendi · Limit {PAGE_LIMIT}
+                {totalCustomerCount === null
+                  ? `${loadedCustomerCount} kayıt yüklendi · Limit ${PAGE_LIMIT}`
+                  : `${loadedCustomerCount} / ${totalCustomerCount} kayıt yüklendi · Limit ${PAGE_LIMIT}`}
               </p>
               <div className="flex items-center gap-2">
                 {isLoadingMoreCustomers ? (

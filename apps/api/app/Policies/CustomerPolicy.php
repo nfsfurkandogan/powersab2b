@@ -11,7 +11,7 @@ class CustomerPolicy
 {
     public function before(User $user, string $ability): ?bool
     {
-        if ($user->hasAnyRole(['admin', 'moderator'])) {
+        if (app(CustomerAccessScopeService::class)->hasUnrestrictedCustomerAccess($user)) {
             return true;
         }
 

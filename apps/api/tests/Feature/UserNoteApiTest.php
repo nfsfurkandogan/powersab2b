@@ -97,6 +97,55 @@ class UserNoteApiTest extends TestCase
             ->assertOk();
     }
 
+    public function test_erzurum_quick_sale_notes_are_private_from_admin_notes(): void
+    {
+        $admin = User::factory()->create([
+            'is_active' => true,
+            'menu_permissions' => ['notes'],
+        ]);
+        $quickSaleUser = User::factory()->create([
+            'username' => 'erzurum.hizlisatis',
+            'is_active' => true,
+            'menu_permissions' => ['notes'],
+        ]);
+
+        $adminNote = UserNote::query()->create([
+            'user_id' => $admin->id,
+            'title' => 'Admin notu',
+            'status' => 'open',
+            'priority' => 'normal',
+        ]);
+        $quickSaleNote = UserNote::query()->create([
+            'user_id' => $quickSaleUser->id,
+            'title' => 'Erzurum hizli satis notu',
+            'status' => 'open',
+            'priority' => 'normal',
+        ]);
+
+        $this->actingAs($quickSaleUser);
+
+        $this->getJson('/api/notes')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $quickSaleNote->id)
+            ->assertJsonPath('summary.open', 1);
+
+        $this->patchJson("/api/notes/{$adminNote->id}", [
+            'status' => 'done',
+        ])->assertNotFound();
+
+        $this->actingAs($admin);
+
+        $this->getJson('/api/notes')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $adminNote->id)
+            ->assertJsonPath('summary.open', 1);
+
+        $this->deleteJson("/api/notes/{$quickSaleNote->id}")
+            ->assertNotFound();
+    }
+
     public function test_user_without_notes_permission_cannot_access_panel_notes(): void
     {
         $user = User::factory()->create([

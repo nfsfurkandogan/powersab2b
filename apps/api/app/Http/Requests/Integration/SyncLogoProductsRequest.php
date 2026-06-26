@@ -22,7 +22,7 @@ class SyncLogoProductsRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'mode' => ['nullable', Rule::in(['catalog', 'stock_only'])],
+            'mode' => ['nullable', Rule::in(['catalog', 'stock_only', 'images_only'])],
             'stock_only' => ['nullable', 'boolean'],
             'price_list_id' => ['nullable', 'integer', 'exists:price_lists,id'],
             'price_list_code' => ['nullable', 'string', 'max:8', Rule::exists('price_lists', 'code')],
@@ -30,7 +30,7 @@ class SyncLogoProductsRequest extends FormRequest
             'records.*.external_ref' => ['nullable', 'string', 'max:128'],
             'records.*.sku' => ['required', 'string', 'max:128'],
             'records.*.oem_code' => ['nullable', 'string', 'max:255'],
-            'records.*.name' => ['required_unless:mode,stock_only', 'string', 'max:255'],
+            'records.*.name' => ['required_unless:mode,stock_only,images_only', 'string', 'max:255'],
             'records.*.description' => ['nullable', 'string', 'max:10000'],
             'records.*.unit' => ['nullable', 'string', 'max:16'],
             'records.*.vat_rate' => ['nullable', 'numeric', 'min:0', 'max:999.99'],

@@ -15,6 +15,7 @@ use App\Models\StockSummary;
 use App\Models\User;
 use App\Models\Warehouse;
 use App\Services\Integrations\IntegrationSyncStateService;
+use App\Services\Integrations\Logo\LogoShipmentImmediateExportService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -23,7 +24,8 @@ use Symfony\Component\HttpFoundation\Response;
 class WarehouseShipmentService
 {
     public function __construct(
-        private readonly IntegrationSyncStateService $syncState
+        private readonly IntegrationSyncStateService $syncState,
+        private readonly LogoShipmentImmediateExportService $logoShipmentImmediateExport,
     ) {}
 
     public function createShipment(
@@ -70,6 +72,8 @@ class WarehouseShipmentService
                 ->first();
 
             if ($activeShipment instanceof Shipment) {
+                $this->syncOpenShipmentItemsFromOrder($activeShipment, $order);
+
                 return $activeShipment->fresh([
                     'order.customer',
                     'warehouse',
@@ -106,6 +110,81 @@ class WarehouseShipmentService
                 'scans.scannedBy',
             ]);
         });
+    }
+
+    private function syncOpenShipmentItemsFromOrder(Shipment $shipment, Order $order): void
+    {
+        if (! in_array($shipment->status, ['draft', 'picking', 'packed'], true)) {
+            return;
+        }
+
+        $order->loadMissing('items');
+
+        $shipmentItems = ShipmentItem::query()
+            ->where('shipment_id', $shipment->id)
+            ->lockForUpdate()
+            ->get()
+            ->keyBy('order_item_id');
+
+        $orderItemIds = [];
+
+        foreach ($order->items as $orderItem) {
+            $orderItemIds[] = (int) $orderItem->id;
+            $shipmentItem = $shipmentItems->get($orderItem->id);
+
+            if (! $shipmentItem instanceof ShipmentItem) {
+                ShipmentItem::create([
+                    'shipment_id' => $shipment->id,
+                    'order_item_id' => $orderItem->id,
+                    'product_id' => $orderItem->product_id,
+                    'ordered_qty' => (int) $orderItem->quantity,
+                    'shipped_qty' => 0,
+                    'unit_price' => number_format((float) $orderItem->unit_net_price, 2, '.', ''),
+                    'vat_rate' => number_format((float) $orderItem->tax_rate, 2, '.', ''),
+                    'line_total_shipped' => 0,
+                ]);
+
+                continue;
+            }
+
+            if ((int) $shipmentItem->shipped_qty > 0) {
+                continue;
+            }
+
+            $shipmentItem->forceFill([
+                'product_id' => $orderItem->product_id,
+                'ordered_qty' => (int) $orderItem->quantity,
+                'unit_price' => number_format((float) $orderItem->unit_net_price, 2, '.', ''),
+                'vat_rate' => number_format((float) $orderItem->tax_rate, 2, '.', ''),
+                'line_total_shipped' => 0,
+            ])->save();
+        }
+
+        foreach ($shipmentItems as $shipmentItem) {
+            if (in_array((int) $shipmentItem->order_item_id, $orderItemIds, true)) {
+                continue;
+            }
+
+            if ((int) $shipmentItem->shipped_qty > 0) {
+                continue;
+            }
+
+            $shipmentItem->delete();
+        }
+
+        $hasShipped = ShipmentItem::query()
+            ->where('shipment_id', $shipment->id)
+            ->where('shipped_qty', '>', 0)
+            ->exists();
+        $hasRemaining = ShipmentItem::query()
+            ->where('shipment_id', $shipment->id)
+            ->whereColumn('shipped_qty', '<', 'ordered_qty')
+            ->exists();
+
+        $nextStatus = ! $hasShipped ? 'draft' : ($hasRemaining ? 'picking' : 'packed');
+        if ($shipment->status !== $nextStatus) {
+            $shipment->forceFill(['status' => $nextStatus])->save();
+        }
     }
 
     private function resolveWarehouse(?int $warehouseId, ?string $warehouseCode, ?string $warehouseName): Warehouse
@@ -176,7 +255,7 @@ class WarehouseShipmentService
                 ->with([
                     'order.items',
                     'items.orderItem',
-                    'items.product',
+                    'items.product.stockSummary',
                     'warehouse',
                 ])
                 ->lockForUpdate()
@@ -218,12 +297,25 @@ class WarehouseShipmentService
                 ]);
             }
 
-            $nextShippedQty = (int) $shipmentItem->shipped_qty + $qty;
+            $currentShippedQty = (int) $shipmentItem->shipped_qty;
+            $nextShippedQty = $currentShippedQty + $qty;
             if ($nextShippedQty > (int) $shipmentItem->ordered_qty) {
                 throw ValidationException::withMessages([
                     'qty' => ['Fazla okutma yapilamaz. Siparis miktari asildi.'],
                 ]);
             }
+
+            $availableTotal = $this->resolveProductWarehouseAvailableTotal($product, $model->warehouse?->code);
+            $availableForShipment = max(0, $availableTotal - $currentShippedQty);
+            $effectiveQty = min($qty, $availableForShipment);
+
+            if ($effectiveQty <= 0) {
+                throw ValidationException::withMessages([
+                    'qty' => ['Bu urun icin sevk edilebilir mevcut stok yok.'],
+                ]);
+            }
+
+            $nextShippedQty = $currentShippedQty + $effectiveQty;
 
             $shipmentItem->shipped_qty = $nextShippedQty;
             $shipmentItem->line_total_shipped = number_format(
@@ -238,7 +330,7 @@ class WarehouseShipmentService
                 'shipment_id' => $model->id,
                 'product_id' => $product->id,
                 'barcode' => $barcode,
-                'qty' => $qty,
+                'qty' => $effectiveQty,
                 'scanned_by' => $user->id,
                 'scanned_at' => now(),
             ]);
@@ -381,6 +473,303 @@ class WarehouseShipmentService
     /**
      * @return array<string, mixed>
      */
+    public function returnAllShipmentItems(User $user, Shipment $shipment): array
+    {
+        return DB::transaction(function () use ($user, $shipment): array {
+            $model = Shipment::query()
+                ->with([
+                    'order.items',
+                    'items.orderItem',
+                    'items.product',
+                    'warehouse',
+                ])
+                ->lockForUpdate()
+                ->find($shipment->id);
+
+            if (! $model instanceof Shipment) {
+                throw ValidationException::withMessages([
+                    'shipment' => ['Sevkiyat bulunamadi.'],
+                ]);
+            }
+
+            $this->ensureShipmentScope($user, $model);
+
+            if (in_array($model->status, ['cancelled', 'shipped', 'partially_shipped'], true)) {
+                throw ValidationException::withMessages([
+                    'shipment' => ['Bu sevkiyat geri almaya kapali.'],
+                ]);
+            }
+
+            $returnableItems = ShipmentItem::query()
+                ->where('shipment_id', $model->id)
+                ->where('shipped_qty', '>', 0)
+                ->lockForUpdate()
+                ->get();
+
+            if ($returnableItems->isEmpty()) {
+                throw ValidationException::withMessages([
+                    'shipment' => ['Geri alinacak sevk satiri bulunamadi.'],
+                ]);
+            }
+
+            foreach ($returnableItems as $shipmentItem) {
+                $qty = (int) $shipmentItem->shipped_qty;
+                if ($qty <= 0) {
+                    continue;
+                }
+
+                $shipmentItem->shipped_qty = 0;
+                $shipmentItem->line_total_shipped = number_format(0, 2, '.', '');
+                $shipmentItem->save();
+
+                $orderItem = OrderItem::query()
+                    ->lockForUpdate()
+                    ->find((int) $shipmentItem->order_item_id);
+
+                if ($orderItem instanceof OrderItem) {
+                    $orderItem->shipped_qty = max(0, (int) $orderItem->shipped_qty - $qty);
+                    $orderItem->save();
+                }
+            }
+
+            $hasShipped = ShipmentItem::query()
+                ->where('shipment_id', $model->id)
+                ->where('shipped_qty', '>', 0)
+                ->exists();
+            $hasRemaining = ShipmentItem::query()
+                ->where('shipment_id', $model->id)
+                ->whereColumn('shipped_qty', '<', 'ordered_qty')
+                ->exists();
+
+            $newShipmentStatus = ! $hasShipped ? 'draft' : ($hasRemaining ? 'picking' : 'packed');
+            if ($model->status !== $newShipmentStatus) {
+                $model->status = $newShipmentStatus;
+                $model->save();
+            }
+
+            if (! $hasShipped && $model->order->status !== 'approved') {
+                $this->updateOrderStatus($model->order, 'approved', $user, 'Tüm sevk satırları siparişe geri alındı.');
+            } elseif ($hasShipped && $hasRemaining && $model->order->status !== 'picking') {
+                $this->updateOrderStatus($model->order, 'picking', $user, 'Sevk edilen satırlar geri alındı.');
+            } elseif ($hasShipped && ! $hasRemaining && $model->order->status !== 'packed') {
+                $this->updateOrderStatus($model->order, 'packed', $user, 'Tüm kalemler okundu ve paketlendi.');
+            }
+
+            $state = $this->shipmentState($user, $model->fresh([
+                'order.customer',
+                'warehouse',
+                'items.product',
+                'scans.scannedBy',
+            ]));
+
+            return [
+                ...$state,
+                'message' => 'Tüm sevk satırları sipariş listesine geri alındı.',
+                'gonderilen_tutar' => $state['totals']['gonderilen_tutar'],
+            ];
+        });
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @return array<string, mixed>
+     */
+    public function addShipmentItem(User $user, Shipment $shipment, array $payload): array
+    {
+        return DB::transaction(function () use ($user, $shipment, $payload): array {
+            $model = Shipment::query()
+                ->with([
+                    'order.dealer',
+                    'order.items',
+                    'items.orderItem',
+                    'items.product',
+                    'warehouse',
+                ])
+                ->lockForUpdate()
+                ->find($shipment->id);
+
+            if (! $model instanceof Shipment) {
+                throw ValidationException::withMessages([
+                    'shipment' => ['Sevkiyat bulunamadi.'],
+                ]);
+            }
+
+            $this->ensureEditableShipment($user, $model, 'Bu sevkiyat ürün eklemeye kapalı.');
+
+            $product = Product::query()
+                ->where('is_active', true)
+                ->find((int) $payload['product_id']);
+
+            if (! $product instanceof Product) {
+                throw ValidationException::withMessages([
+                    'product_id' => ['Aktif ürün bulunamadı.'],
+                ]);
+            }
+
+            $quantity = max(1, (int) $payload['quantity']);
+            $unitNetPrice = $this->resolveUnitNetPrice($model->order, $product, $payload['unit_net_price'] ?? null);
+            $taxRate = $payload['tax_rate'] ?? null;
+            $taxRate = $taxRate !== null ? (float) $taxRate : (float) $product->vat_rate;
+
+            $orderItem = OrderItem::query()
+                ->where('order_id', $model->order_id)
+                ->where('product_id', $product->id)
+                ->lockForUpdate()
+                ->first();
+
+            if ($orderItem instanceof OrderItem) {
+                $orderItem->forceFill([
+                    'quantity' => (int) $orderItem->quantity + $quantity,
+                    'unit_net_price' => number_format($unitNetPrice, 2, '.', ''),
+                    'tax_rate' => number_format($taxRate, 2, '.', ''),
+                    'line_total' => number_format(((int) $orderItem->quantity + $quantity) * $unitNetPrice, 2, '.', ''),
+                ])->save();
+            } else {
+                $orderItem = OrderItem::query()->create([
+                    'order_id' => $model->order_id,
+                    'product_id' => $product->id,
+                    'quantity' => $quantity,
+                    'shipped_qty' => 0,
+                    'unit_net_price' => number_format($unitNetPrice, 2, '.', ''),
+                    'discount_rate' => 0,
+                    'tax_rate' => number_format($taxRate, 2, '.', ''),
+                    'line_total' => number_format($quantity * $unitNetPrice, 2, '.', ''),
+                    'currency' => $model->order?->currency ?: 'TRY',
+                ]);
+            }
+
+            $shipmentItem = ShipmentItem::query()
+                ->where('shipment_id', $model->id)
+                ->where('order_item_id', $orderItem->id)
+                ->lockForUpdate()
+                ->first();
+
+            if ($shipmentItem instanceof ShipmentItem) {
+                $shipmentItem->forceFill([
+                    'product_id' => $product->id,
+                    'ordered_qty' => (int) $orderItem->quantity,
+                    'unit_price' => number_format($unitNetPrice, 2, '.', ''),
+                    'vat_rate' => number_format($taxRate, 2, '.', ''),
+                    'line_total_shipped' => number_format(((float) $shipmentItem->shipped_qty) * $unitNetPrice, 2, '.', ''),
+                ])->save();
+            } else {
+                ShipmentItem::query()->create([
+                    'shipment_id' => $model->id,
+                    'order_item_id' => $orderItem->id,
+                    'product_id' => $product->id,
+                    'ordered_qty' => (int) $orderItem->quantity,
+                    'shipped_qty' => 0,
+                    'unit_price' => number_format($unitNetPrice, 2, '.', ''),
+                    'vat_rate' => number_format($taxRate, 2, '.', ''),
+                    'line_total_shipped' => 0,
+                ]);
+            }
+
+            $this->recalculateOrderTotals($model->order);
+            $this->refreshOpenShipmentStatus($model);
+
+            $state = $this->shipmentState($user, $model->fresh([
+                'order.customer',
+                'warehouse',
+                'items.product',
+                'scans.scannedBy',
+            ]));
+
+            return [
+                ...$state,
+                'message' => 'Ürün siparişe eklendi.',
+                'gonderilen_tutar' => $state['totals']['gonderilen_tutar'],
+            ];
+        });
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function updateShipmentItemQuantity(User $user, Shipment $shipment, int $itemId, int $quantity): array
+    {
+        return DB::transaction(function () use ($user, $shipment, $itemId, $quantity): array {
+            $model = Shipment::query()
+                ->with([
+                    'order.items',
+                    'items.orderItem',
+                    'items.product',
+                    'warehouse',
+                ])
+                ->lockForUpdate()
+                ->find($shipment->id);
+
+            if (! $model instanceof Shipment) {
+                throw ValidationException::withMessages([
+                    'shipment' => ['Sevkiyat bulunamadi.'],
+                ]);
+            }
+
+            $this->ensureEditableShipment($user, $model, 'Bu sevkiyat miktar düzenlemeye kapalı.');
+
+            $shipmentItem = ShipmentItem::query()
+                ->where('shipment_id', $model->id)
+                ->where('id', $itemId)
+                ->lockForUpdate()
+                ->first();
+
+            if (! $shipmentItem instanceof ShipmentItem) {
+                throw ValidationException::withMessages([
+                    'item_id' => ['Sevkiyat kalemi bulunamadi.'],
+                ]);
+            }
+
+            $safeQuantity = max(1, $quantity);
+            if ($safeQuantity < (int) $shipmentItem->shipped_qty) {
+                throw ValidationException::withMessages([
+                    'quantity' => ['Sipariş miktarı sevk edilen adedin altına indirilemez.'],
+                ]);
+            }
+
+            $orderItem = OrderItem::query()
+                ->where('order_id', $model->order_id)
+                ->where('id', (int) $shipmentItem->order_item_id)
+                ->lockForUpdate()
+                ->first();
+
+            if (! $orderItem instanceof OrderItem) {
+                throw ValidationException::withMessages([
+                    'order_item_id' => ['Sipariş kalemi bulunamadi.'],
+                ]);
+            }
+
+            $unitPrice = (float) $shipmentItem->unit_price;
+            $orderItem->forceFill([
+                'quantity' => $safeQuantity,
+                'line_total' => number_format($safeQuantity * (float) $orderItem->unit_net_price, 2, '.', ''),
+            ])->save();
+
+            $shipmentItem->forceFill([
+                'ordered_qty' => $safeQuantity,
+                'line_total_shipped' => number_format(((int) $shipmentItem->shipped_qty) * $unitPrice, 2, '.', ''),
+            ])->save();
+
+            $this->recalculateOrderTotals($model->order);
+            $this->refreshOpenShipmentStatus($model);
+
+            $state = $this->shipmentState($user, $model->fresh([
+                'order.customer',
+                'warehouse',
+                'items.product',
+                'scans.scannedBy',
+            ]));
+
+            return [
+                ...$state,
+                'message' => 'Sipariş miktarı güncellendi.',
+                'gonderilen_tutar' => $state['totals']['gonderilen_tutar'],
+            ];
+        });
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
     public function deleteShipmentItem(User $user, Shipment $shipment, int $itemId): array
     {
         return DB::transaction(function () use ($user, $shipment, $itemId): array {
@@ -482,7 +871,7 @@ class WarehouseShipmentService
      */
     public function finalizeShipment(User $user, Shipment $shipment, array $payload): array
     {
-        return DB::transaction(function () use ($user, $shipment, $payload): array {
+        $state = DB::transaction(function () use ($user, $shipment, $payload): array {
             $model = Shipment::query()
                 ->with([
                     'order.items',
@@ -530,15 +919,15 @@ class WarehouseShipmentService
                     ]);
                 }
 
-                if ((int) $stock->available_total < $qty) {
-                    throw ValidationException::withMessages([
-                        'stock' => ["Yetersiz available stok (product_id={$item->product_id})."],
-                    ]);
-                }
-
                 if ((int) $stock->reserved_total < $qty) {
                     throw ValidationException::withMessages([
                         'stock' => ["Yetersiz reserved stok (product_id={$item->product_id})."],
+                    ]);
+                }
+
+                if ((int) $stock->available_total < $qty) {
+                    throw ValidationException::withMessages([
+                        'stock' => ["Yetersiz available stok (product_id={$item->product_id})."],
                     ]);
                 }
 
@@ -623,6 +1012,33 @@ class WarehouseShipmentService
                 'gonderilen_tutar' => $state['totals']['gonderilen_tutar'],
             ];
         });
+
+        $shipmentId = (int) data_get($state, 'shipment.id');
+        if ($shipmentId <= 0) {
+            return $state;
+        }
+
+        $freshShipment = Shipment::query()->find($shipmentId);
+        if (! $freshShipment instanceof Shipment) {
+            return $state;
+        }
+
+        if ($this->logoShipmentImmediateExport->export($freshShipment) instanceof IntegrationSyncState) {
+            $freshState = $this->shipmentState($user, $freshShipment->fresh([
+                'order.customer',
+                'warehouse',
+                'items.product',
+                'scans.scannedBy',
+            ]));
+
+            return [
+                ...$freshState,
+                'message' => 'Sevkiyat finalize edildi ve Logo faturasi aktarildi.',
+                'gonderilen_tutar' => $freshState['totals']['gonderilen_tutar'],
+            ];
+        }
+
+        return $state;
     }
 
     /**
@@ -723,6 +1139,83 @@ class WarehouseShipmentService
         });
     }
 
+    private function ensureEditableShipment(User $user, Shipment $shipment, string $message): void
+    {
+        $this->ensureShipmentScope($user, $shipment);
+
+        if (in_array($shipment->status, ['cancelled', 'shipped', 'partially_shipped'], true)) {
+            throw ValidationException::withMessages([
+                'shipment' => [$message],
+            ]);
+        }
+    }
+
+    private function resolveUnitNetPrice(Order $order, Product $product, mixed $payloadValue): float
+    {
+        $order->loadMissing('dealer');
+        $priceListId = $order->dealer?->price_list_id;
+        if ($priceListId !== null) {
+            $basePrice = DB::table('base_prices')
+                ->where('price_list_id', (int) $priceListId)
+                ->where('product_id', $product->id)
+                ->value('list_price');
+
+            if ($basePrice !== null && is_numeric($basePrice)) {
+                return max(0.0, round((float) $basePrice, 2));
+            }
+        }
+
+        if ($payloadValue !== null && is_numeric($payloadValue)) {
+            return max(0.0, round((float) $payloadValue, 2));
+        }
+
+        return 0.0;
+    }
+
+    private function recalculateOrderTotals(Order $order): void
+    {
+        $items = OrderItem::query()
+            ->where('order_id', $order->id)
+            ->lockForUpdate()
+            ->get();
+
+        $subtotal = 0.0;
+        $taxTotal = 0.0;
+
+        foreach ($items as $item) {
+            $lineTotal = (float) $item->line_total;
+            $subtotal += $lineTotal;
+            $taxTotal += $lineTotal * ((float) $item->tax_rate / 100);
+        }
+
+        $order->forceFill([
+            'subtotal' => number_format($subtotal, 2, '.', ''),
+            'tax_total' => number_format($taxTotal, 2, '.', ''),
+            'grand_total' => number_format($subtotal + $taxTotal, 2, '.', ''),
+        ])->save();
+    }
+
+    private function refreshOpenShipmentStatus(Shipment $shipment): void
+    {
+        if (! in_array($shipment->status, ['draft', 'picking', 'packed'], true)) {
+            return;
+        }
+
+        $hasShipped = ShipmentItem::query()
+            ->where('shipment_id', $shipment->id)
+            ->where('shipped_qty', '>', 0)
+            ->exists();
+        $hasRemaining = ShipmentItem::query()
+            ->where('shipment_id', $shipment->id)
+            ->whereColumn('shipped_qty', '<', 'ordered_qty')
+            ->exists();
+
+        $nextStatus = ! $hasShipped ? 'draft' : ($hasRemaining ? 'picking' : 'packed');
+        if ($shipment->status !== $nextStatus) {
+            $shipment->forceFill(['status' => $nextStatus])->save();
+        }
+    }
+
     /**
      * @return array<string, mixed>
      */
@@ -752,6 +1245,8 @@ class WarehouseShipmentService
             $shippedQty = (int) $item->shipped_qty;
             $remainingQty = max(0, $orderedQty - $shippedQty);
             $lineTotalShipped = (float) $item->line_total_shipped;
+            $productMeta = is_array($item->product?->meta) ? $item->product->meta : [];
+            $availableTotal = $this->resolveProductWarehouseAvailableTotal($item->product, $shipment->warehouse?->code);
 
             $orderedQtyTotal += $orderedQty;
             $shippedQtyTotal += $shippedQty;
@@ -764,7 +1259,7 @@ class WarehouseShipmentService
                 'sku' => $item->product?->sku,
                 'oem' => $item->product?->oem_code,
                 'name' => $item->product?->name,
-                'shelf_address' => $this->resolveShelfAddress((array) ($item->product?->meta ?? [])),
+                'shelf_address' => $this->resolveShelfAddress($productMeta),
                 'ordered_qty' => $orderedQty,
                 'shipped_qty' => $shippedQty,
                 'remaining_qty' => $remainingQty,
@@ -772,7 +1267,7 @@ class WarehouseShipmentService
                 'vat_rate' => number_format((float) $item->vat_rate, 2, '.', ''),
                 'line_total_shipped' => number_format($lineTotalShipped, 2, '.', ''),
                 'logo_stock' => [
-                    'available_total' => (int) ($item->product?->stockSummary?->available_total ?? 0),
+                    'available_total' => $availableTotal,
                     'reserved_total' => (int) ($item->product?->stockSummary?->reserved_total ?? 0),
                     'updated_at' => $item->product?->stockSummary?->updated_at?->toIso8601String(),
                 ],
@@ -782,7 +1277,7 @@ class WarehouseShipmentService
                 $remainingItems[] = $payload;
             }
 
-            if ($shippedQty > 0) {
+            if ($shippedQty > 0 && ! in_array($shipment->status, ['shipped', 'partially_shipped', 'cancelled'], true)) {
                 $shippedItems[] = $payload;
             }
         }
@@ -810,6 +1305,8 @@ class WarehouseShipmentService
                     'id' => $shipment->order?->id,
                     'order_no' => $shipment->order?->order_no,
                     'status' => $shipment->order?->status,
+                    'currency' => $shipment->order?->currency,
+                    'grand_total' => number_format((float) ($shipment->order?->grand_total ?? 0), 2, '.', ''),
                     'customer' => [
                         'id' => $customer?->id,
                         'code' => $customer?->code,
@@ -1107,6 +1604,83 @@ class WarehouseShipmentService
         }
 
         return null;
+    }
+
+    private function resolveProductWarehouseAvailableTotal(?Product $product, ?string $warehouseCode): int
+    {
+        $meta = is_array($product?->meta) ? $product->meta : [];
+        $warehouses = data_get($meta, 'integrations.logo.payload.logo_stock.warehouses');
+        $normalizedWarehouseCode = trim((string) $warehouseCode);
+
+        if (is_array($warehouses) && $normalizedWarehouseCode !== '') {
+            foreach ($warehouses as $warehouse) {
+                if (! is_array($warehouse)) {
+                    continue;
+                }
+
+                $code = $this->firstArrayScalar($warehouse, [
+                    'warehouse_code',
+                    'branch_code',
+                    'code',
+                    'invenno',
+                    'warehouse_no',
+                ]);
+
+                if ($code !== $normalizedWarehouseCode) {
+                    continue;
+                }
+
+                return $this->firstIntegerValue($warehouse, [
+                    'available_total',
+                    'available',
+                    'onhand_total',
+                    'onhand',
+                    'stock',
+                    'quantity',
+                ]);
+            }
+        }
+
+        return (int) ($product?->stockSummary?->available_total ?? 0);
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @param  list<string>  $keys
+     */
+    private function firstArrayScalar(array $payload, array $keys): ?string
+    {
+        foreach ($keys as $key) {
+            $candidate = $payload[$key] ?? null;
+
+            if (! is_scalar($candidate)) {
+                continue;
+            }
+
+            $normalized = trim((string) $candidate);
+            if ($normalized !== '') {
+                return $normalized;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @param  list<string>  $keys
+     */
+    private function firstIntegerValue(array $payload, array $keys): int
+    {
+        foreach ($keys as $key) {
+            $candidate = $payload[$key] ?? null;
+
+            if (is_numeric($candidate)) {
+                return max(0, (int) $candidate);
+            }
+        }
+
+        return 0;
     }
 
     private function generateShipmentNo(): string

@@ -21,6 +21,7 @@ class QuickSearchPosProductsRequest extends FormRequest
             'limit' => ['nullable', 'integer', 'min:1', 'max:20'],
             'dealer_id' => ['nullable', 'integer', 'exists:dealers,id'],
             'in_stock' => ['nullable', 'boolean'],
+            'code_only' => ['nullable', 'boolean'],
         ];
     }
 }

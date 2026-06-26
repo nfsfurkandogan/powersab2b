@@ -24,6 +24,7 @@ import {
   updateUserNote,
   type UserNote,
   type UserNotePriority,
+  type UserNoteStatus,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -42,6 +43,7 @@ const PRIORITIES: Array<{ key: UserNotePriority; label: string }> = [
 ];
 
 const EMPTY_NOTES: UserNote[] = [];
+const FALLBACK_NOTE_OWNER = "Powersa";
 
 const priorityClassNames: Record<UserNotePriority, string> = {
   high: "border-red-300/35 bg-red-400/12 text-red-100",
@@ -66,7 +68,35 @@ function formatDate(value: string | null) {
 }
 
 function noteOwner(note: UserNote) {
-  return note.created_by.name || note.created_by.username || "Powersa";
+  return note.created_by?.name || note.created_by?.username || FALLBACK_NOTE_OWNER;
+}
+
+function normalizeCount(value: unknown) {
+  const count = Number(value);
+
+  return Number.isFinite(count) ? count : 0;
+}
+
+function isUserNotePriority(value: unknown): value is UserNotePriority {
+  return value === "low" || value === "normal" || value === "high";
+}
+
+function notePriority(note: UserNote): UserNotePriority {
+  return isUserNotePriority(note.priority) ? note.priority : "normal";
+}
+
+function noteStatus(note: UserNote): UserNoteStatus {
+  return note.status === "done" ? "done" : "open";
+}
+
+function isRenderableNote(note: unknown): note is UserNote {
+  if (!note || typeof note !== "object") {
+    return false;
+  }
+
+  const candidate = note as Partial<UserNote>;
+
+  return typeof candidate.id === "number" && typeof candidate.title === "string";
 }
 
 export function NotesPage() {
@@ -126,10 +156,14 @@ export function NotesPage() {
     },
   });
 
-  const notes = notesQuery.data?.data ?? EMPTY_NOTES;
-  const summary = notesQuery.data?.summary ?? { open: 0, done: 0 };
+  const notes = Array.isArray(notesQuery.data?.data) ? notesQuery.data.data.filter(isRenderableNote) : EMPTY_NOTES;
+  const rawSummary = notesQuery.data?.summary;
+  const summary = {
+    open: normalizeCount(rawSummary?.open),
+    done: normalizeCount(rawSummary?.done),
+  };
   const canCreate = title.trim() !== "" && !createMutation.isPending;
-  const pinnedCount = useMemo(() => notes.filter((note) => note.is_pinned).length, [notes]);
+  const pinnedCount = useMemo(() => notes.filter((note) => Boolean(note.is_pinned)).length, [notes]);
 
   const handleCreate = () => {
     if (!canCreate) {
@@ -266,6 +300,22 @@ export function NotesPage() {
             <Loader2 className="mr-2 h-5 w-5 animate-spin" />
             Notlar yükleniyor...
           </div>
+        ) : notesQuery.isError ? (
+          <div className="flex min-h-[280px] flex-col items-center justify-center text-center">
+            <NotebookPen className="h-10 w-10 text-red-200/80" />
+            <p className="mt-3 text-lg font-black text-white">Notlar yüklenemedi</p>
+            <p className="mt-1 max-w-md text-sm font-semibold text-slate-500">
+              {notesQuery.error instanceof Error ? notesQuery.error.message : "Lütfen tekrar deneyin."}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              className="mt-4 rounded-xl border-white/10 bg-white/[0.04] font-bold text-slate-100 hover:bg-white/[0.08]"
+              onClick={() => notesQuery.refetch()}
+            >
+              Tekrar Dene
+            </Button>
+          </div>
         ) : notes.length === 0 ? (
           <div className="flex min-h-[280px] flex-col items-center justify-center text-center">
             <NotebookPen className="h-10 w-10 text-slate-500" />
@@ -276,7 +326,8 @@ export function NotesPage() {
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {notes.map((note) => {
               const due = formatDate(note.due_date);
-              const done = note.status === "done";
+              const done = noteStatus(note) === "done";
+              const priorityKey = notePriority(note);
 
               return (
                 <article
@@ -330,8 +381,8 @@ export function NotesPage() {
                   ) : null}
 
                   <div className="mt-auto flex flex-wrap items-center gap-2 pt-4">
-                    <span className={cn("rounded-full border px-3 py-1 text-xs font-black", priorityClassNames[note.priority])}>
-                      {PRIORITIES.find((item) => item.key === note.priority)?.label ?? note.priority}
+                    <span className={cn("rounded-full border px-3 py-1 text-xs font-black", priorityClassNames[priorityKey])}>
+                      {PRIORITIES.find((item) => item.key === priorityKey)?.label ?? priorityKey}
                     </span>
                     {due ? (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.045] px-3 py-1 text-xs font-black text-slate-300">

@@ -18,6 +18,7 @@ class CustomerBalanceReportRequest extends FormRequest
     {
         return [
             'dealer_id' => ['nullable', 'integer', 'exists:dealers,id'],
+            'customer_id' => ['nullable', 'integer', 'exists:customers,id'],
             'q' => ['nullable', 'string', 'max:120'],
             'date_to' => ['nullable', 'date'],
             'has_balance' => ['nullable', 'boolean'],

@@ -27,6 +27,11 @@ class ModeratorManagementController extends Controller
     {
         $user = $request->user();
         $this->ensureModeratorRole($user);
+        $includeCustomers = $request->boolean('include_customers', true);
+        $customerLimit = $request->has('customer_limit')
+            ? min(max($request->integer('customer_limit'), 0), 200)
+            : null;
+        $customerSearch = trim((string) $request->query('customer_q', ''));
 
         $dealers = Dealer::query()
             ->select(['id', 'code', 'name', 'email', 'phone', 'is_active'])
@@ -82,41 +87,64 @@ class ModeratorManagementController extends Controller
             ->orderBy('name')
             ->get();
 
-        $customers = Customer::query()
-            ->select([
-                'id',
-                'dealer_id',
-                'salesperson_user_id',
-                'region_code',
-                'region_name',
-                'branch_code',
-                'branch_name',
-                'source_system',
-                'source_reference',
-                'sync_status',
-                'sync_error',
-                'code',
-                'name',
-                'contact_name',
-                'email',
-                'phone',
-                'city',
-                'district',
-                'tax_office',
-                'tax_number',
-                'credit_limit',
-                'is_active',
-                'meta',
-                'last_synced_at',
-                'created_at',
-            ])
-            ->where('source_system', 'logo')
-            ->with([
-                'dealer:id,code,name',
-                'salesperson:id,dealer_id,name,email,phone',
-            ])
-            ->orderBy('name')
-            ->get();
+        $customerSummaryQuery = Customer::query()->where('source_system', 'logo');
+        $customers = Collection::empty();
+
+        if ($includeCustomers) {
+            $customerListQuery = Customer::query()
+                ->select([
+                    'id',
+                    'dealer_id',
+                    'salesperson_user_id',
+                    'region_code',
+                    'region_name',
+                    'branch_code',
+                    'branch_name',
+                    'source_system',
+                    'source_reference',
+                    'sync_status',
+                    'sync_error',
+                    'code',
+                    'name',
+                    'contact_name',
+                    'email',
+                    'phone',
+                    'city',
+                    'district',
+                    'tax_office',
+                    'tax_number',
+                    'credit_limit',
+                    'is_active',
+                    'meta',
+                    'last_synced_at',
+                    'created_at',
+                ])
+                ->where('source_system', 'logo')
+                ->when($customerSearch !== '', function ($query) use ($customerSearch): void {
+                    $like = '%'.str_replace(['%', '_'], ['\\%', '\\_'], $customerSearch).'%';
+
+                    $query->where(function ($searchQuery) use ($like): void {
+                        $searchQuery
+                            ->where('code', 'like', $like)
+                            ->orWhere('name', 'like', $like)
+                            ->orWhere('contact_name', 'like', $like)
+                            ->orWhere('phone', 'like', $like)
+                            ->orWhere('city', 'like', $like)
+                            ->orWhere('district', 'like', $like);
+                    });
+                })
+                ->with([
+                    'dealer:id,code,name',
+                    'salesperson:id,dealer_id,name,email,phone',
+                ])
+                ->orderBy('name');
+
+            if ($customerLimit !== null) {
+                $customerListQuery->limit($customerLimit);
+            }
+
+            $customers = $customerListQuery->get();
+        }
 
         $salespeople = $users
             ->filter(fn (User $listedUser) => $listedUser->roles->contains('slug', 'salesperson'))
@@ -126,11 +154,11 @@ class ModeratorManagementController extends Controller
             'summary' => [
                 'users_total' => $users->count(),
                 'active_users_total' => $users->where('is_active', true)->count(),
-                'customers_total' => $customers->count(),
-                'active_customers_total' => $customers->where('is_active', true)->count(),
+                'customers_total' => (clone $customerSummaryQuery)->count(),
+                'active_customers_total' => (clone $customerSummaryQuery)->where('is_active', true)->count(),
                 'salespeople_total' => $salespeople->count(),
-                'assigned_customers_total' => $customers->whereNotNull('salesperson_user_id')->count(),
-                'unassigned_customers_total' => $customers->whereNull('salesperson_user_id')->count(),
+                'assigned_customers_total' => (clone $customerSummaryQuery)->whereNotNull('salesperson_user_id')->count(),
+                'unassigned_customers_total' => (clone $customerSummaryQuery)->whereNull('salesperson_user_id')->count(),
             ],
             'roles' => $roles,
             'menu_permissions' => MenuPermissions::definitions(),
@@ -170,7 +198,7 @@ class ModeratorManagementController extends Controller
             'username' => ['required', 'string', 'max:64', 'regex:/^[a-z0-9._-]+$/', 'unique:users,username'],
             'email' => ['nullable', 'email', 'max:255', 'unique:users,email'],
             'phone' => ['nullable', 'string', 'max:32'],
-            'password' => ['required', 'string', 'max:255', Password::min(12)->mixedCase()->numbers()->symbols()],
+            'password' => $this->moderatorPasswordRules(required: true),
             'is_active' => ['sometimes', 'boolean'],
             'role_slugs' => ['nullable', 'array', 'min:1'],
             'role_slugs.*' => ['string'],
@@ -252,7 +280,7 @@ class ModeratorManagementController extends Controller
             'username' => ['sometimes', 'string', 'max:64', 'regex:/^[a-z0-9._-]+$/', Rule::unique('users', 'username')->ignore($user->id)],
             'email' => ['nullable', 'email', 'max:255', Rule::unique('users', 'email')->ignore($user->id)],
             'phone' => ['nullable', 'string', 'max:32'],
-            'password' => ['nullable', 'string', 'max:255', Password::min(12)->mixedCase()->numbers()->symbols()],
+            'password' => $this->moderatorPasswordRules(required: false),
             'is_active' => ['sometimes', 'boolean'],
             'role_slugs' => ['nullable', 'array', 'min:1'],
             'role_slugs.*' => ['string'],
@@ -379,7 +407,7 @@ class ModeratorManagementController extends Controller
         $this->ensureCanManageUser($actor, $user);
 
         $validated = $request->validate([
-            'password' => ['required', 'string', 'max:255', Password::min(12)->mixedCase()->numbers()->symbols()],
+            'password' => $this->moderatorPasswordRules(required: true),
         ]);
 
         $user->forceFill([
@@ -963,6 +991,20 @@ class ModeratorManagementController extends Controller
             ->replaceMatches('/[.]{2,}/', '.')
             ->trim('.-_')
             ->toString();
+    }
+
+    /**
+     * Moderator-created operational users use the same minimum accepted by login
+     * and customer-user management screens.
+     */
+    private function moderatorPasswordRules(bool $required): array
+    {
+        return [
+            $required ? 'required' : 'nullable',
+            'string',
+            'max:255',
+            Password::min(6),
+        ];
     }
 
     /**

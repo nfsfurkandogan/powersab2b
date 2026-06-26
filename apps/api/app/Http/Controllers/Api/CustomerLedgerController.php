@@ -7,6 +7,8 @@ use App\Http\Requests\Customer\CustomerLedgerIndexRequest;
 use App\Http\Resources\LedgerEntryResource;
 use App\Models\Customer;
 use App\Models\LedgerEntry;
+use App\Models\User;
+use App\Support\Pricing\DisplayCurrency;
 use Illuminate\Support\Collection;
 
 class CustomerLedgerController extends Controller
@@ -32,7 +34,7 @@ class CustomerLedgerController extends Controller
             collectionMethod: $validated['collection_method'] ?? null,
             excludedTypes: $excludedTypes
         );
-        $summary = $this->ledgerSummary(clone $baseQuery);
+        $summary = $this->ledgerSummary(clone $baseQuery, $request->user());
 
         $entries = (clone $baseQuery)
             ->orderByDesc('date')
@@ -115,7 +117,7 @@ class CustomerLedgerController extends Controller
     /**
      * @return array{total_debit: string, total_credit: string, balance: string, total_count: int, currency: string}
      */
-    private function ledgerSummary($query): array
+    private function ledgerSummary($query, ?User $user): array
     {
         $summary = (clone $query)
             ->selectRaw('COUNT(*) as total_count')
@@ -123,10 +125,10 @@ class CustomerLedgerController extends Controller
             ->selectRaw("COALESCE(SUM(COALESCE(credit, CASE WHEN entry_type = 'credit' THEN amount ELSE 0 END)), 0) as total_credit")
             ->first();
 
-        $currency = (string) ((clone $query)
+        $currency = $this->displayCurrency((string) ((clone $query)
             ->orderByDesc('date')
             ->orderByDesc('id')
-            ->value('currency') ?? 'TRY');
+            ->value('currency') ?? 'TRY'), $user);
         $totalDebit = (float) ($summary?->total_debit ?? 0);
         $totalCredit = (float) ($summary?->total_credit ?? 0);
 
@@ -190,5 +192,16 @@ class CustomerLedgerController extends Controller
                 "COALESCE(SUM(COALESCE(debit, CASE WHEN entry_type = 'debit' THEN amount ELSE 0 END) - COALESCE(credit, CASE WHEN entry_type = 'credit' THEN amount ELSE 0 END)), 0) as balance"
             )
             ->value('balance') ?? 0);
+    }
+
+    private function displayCurrency(string $currency, ?User $user): string
+    {
+        $normalized = strtoupper(trim($currency));
+
+        if ($normalized === 'GEL' && ! DisplayCurrency::usesLariPricing($user)) {
+            return 'TRY';
+        }
+
+        return DisplayCurrency::normalize($normalized, $user);
     }
 }

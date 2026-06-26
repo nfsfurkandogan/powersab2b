@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useDeferredValue, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Edit3, FileText, Loader2, Printer, Search, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
@@ -33,6 +33,7 @@ import {
   type PosSaleListItemDto,
   updatePosSale,
 } from "@/lib/api";
+import { LogoSyncBadge, LogoSyncInline } from "@/components/integrations/logo-sync-badge";
 
 type EditLine = {
   id: number;
@@ -111,11 +112,14 @@ export function DeliveryNotesPage() {
   const [editMode, setEditMode] = useState(false);
   const [editReceiptNo, setEditReceiptNo] = useState("");
   const [editLines, setEditLines] = useState<EditLine[]>([]);
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const searchQuery = deferredSearchTerm.trim();
 
   const deliveryNotesQuery = useQuery({
-    queryKey: ["delivery-notes", dateFrom, dateTo, cursor],
+    queryKey: ["delivery-notes", searchQuery, dateFrom, dateTo, cursor],
     queryFn: () =>
       listPosSales({
+        q: searchQuery || undefined,
         document_type: "delivery",
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
@@ -126,21 +130,7 @@ export function DeliveryNotesPage() {
   });
 
   const rows = deliveryNotesQuery.data?.data ?? EMPTY_DELIVERY_NOTES;
-  const filteredRows = useMemo(() => {
-    const needle = searchTerm.trim().toLocaleLowerCase("tr-TR");
-
-    if (!needle) {
-      return rows;
-    }
-
-    return rows.filter((row) =>
-      [
-        row.receipt_no,
-        row.customer.code,
-        row.customer.title,
-      ].some((value) => (value ?? "").toLocaleLowerCase("tr-TR").includes(needle))
-    );
-  }, [rows, searchTerm]);
+  const filteredRows = rows;
   const selectedSaleQuery = useQuery({
     queryKey: ["delivery-notes", "detail", selectedSaleId],
     queryFn: () => {
@@ -217,6 +207,11 @@ export function DeliveryNotesPage() {
   const updateDateTo = (value: string) => {
     setCursor(null);
     setDateTo(value);
+  };
+
+  const updateSearchTerm = (value: string) => {
+    setCursor(null);
+    setSearchTerm(value);
   };
 
   const closeDetail = () => {
@@ -320,7 +315,7 @@ export function DeliveryNotesPage() {
                 <Input
                   className="h-11 pl-10"
                   value={searchTerm}
-                  onChange={(event) => setSearchTerm(event.target.value)}
+                  onChange={(event) => updateSearchTerm(event.target.value)}
                   placeholder="Belge no, cari kodu veya cari adı ara"
                 />
               </span>
@@ -360,6 +355,7 @@ export function DeliveryNotesPage() {
                 <TableHead className="border-r border-[var(--brand-border)]">Cari</TableHead>
                 <TableHead className="border-r border-[var(--brand-border)]">Tarih</TableHead>
                 <TableHead className="border-r border-[var(--brand-border)]">Ödeme</TableHead>
+                <TableHead className="border-r border-[var(--brand-border)]">Logo</TableHead>
                 <TableHead className="border-r border-[var(--brand-border)] text-right">Tutar</TableHead>
                 <TableHead className="w-[190px] text-center">Aksiyon</TableHead>
               </TableRow>
@@ -372,13 +368,14 @@ export function DeliveryNotesPage() {
                     <TableCell className="border-r border-[var(--brand-border)]"><Skeleton className="h-4 w-44" /></TableCell>
                     <TableCell className="border-r border-[var(--brand-border)]"><Skeleton className="h-4 w-32" /></TableCell>
                     <TableCell className="border-r border-[var(--brand-border)]"><Skeleton className="h-4 w-16" /></TableCell>
+                    <TableCell className="border-r border-[var(--brand-border)]"><Skeleton className="h-6 w-24 rounded-full" /></TableCell>
                     <TableCell className="border-r border-[var(--brand-border)]"><Skeleton className="ml-auto h-4 w-24" /></TableCell>
                     <TableCell><Skeleton className="mx-auto h-9 w-36 rounded-xl" /></TableCell>
                   </TableRow>
                 ))
               ) : deliveryNotesQuery.isError ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-10 text-center text-sm font-semibold text-red-600">
+                  <TableCell colSpan={7} className="py-10 text-center text-sm font-semibold text-red-600">
                     {(deliveryNotesQuery.error as Error)?.message ?? "İrsaliye kayıtları alınamadı."}
                   </TableCell>
                 </TableRow>
@@ -399,6 +396,9 @@ export function DeliveryNotesPage() {
                     </TableCell>
                     <TableCell className="border-r border-[var(--brand-border)]">{formatDateTime(row.created_at)}</TableCell>
                     <TableCell className="border-r border-[var(--brand-border)]">{methodLabel(row.sale_type)}</TableCell>
+                    <TableCell className="border-r border-[var(--brand-border)]">
+                      <LogoSyncBadge status={row.logo_sync_status} />
+                    </TableCell>
                     <TableCell className="border-r border-[var(--brand-border)] text-right font-black text-[var(--brand-primary-strong)]">{formatMoney(row.grand_total)}</TableCell>
                     <TableCell>
                       <div className="flex items-center justify-center gap-2">
@@ -432,7 +432,7 @@ export function DeliveryNotesPage() {
                 ))
               ) : (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-10 text-center text-sm font-semibold text-[var(--muted-foreground)]">
+                  <TableCell colSpan={7} className="py-10 text-center text-sm font-semibold text-[var(--muted-foreground)]">
                     {searchTerm.trim() ? "Arama kriterine uygun irsaliye kaydı bulunamadı." : "İrsaliye kaydı bulunamadı."}
                   </TableCell>
                 </TableRow>
@@ -510,6 +510,14 @@ export function DeliveryNotesPage() {
                     </p>
                   </div>
                 </div>
+                <LogoSyncInline
+                  className="mt-4 border-t border-[var(--brand-border)] pt-3"
+                  label="Logo irsaliye aktarımı"
+                  status={selectedSale.logo_sync_status}
+                  error={selectedSale.logo_sync_error}
+                  externalRef={selectedSale.logo_external_ref}
+                  lastSyncedAt={selectedSale.logo_last_synced_at}
+                />
               </div>
 
               <div className="overflow-hidden rounded-xl border border-[var(--brand-border)] bg-[var(--surface)]">

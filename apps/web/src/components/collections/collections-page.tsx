@@ -243,6 +243,24 @@ function formatLedgerDate(value: string): string {
   });
 }
 
+function formatCollectionDateTime(value?: string | null): string {
+  if (!value) {
+    return "henüz yok";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString("tr-TR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function formatAmount(value: string | number, currency: string): string {
   const amount = toApiAmount(value);
   const normalizedCurrency = currency.toUpperCase();
@@ -870,6 +888,10 @@ export function CollectionsPage() {
         : "border-emerald-300/35 bg-emerald-500/10 text-emerald-200";
   const collectionSummaryCurrency = displayRows[0]?.currency ?? customerDebtCurrency;
   const balanceSourceLabel = selectedCustomer?.balance_source === "logo" ? "Logo bakiyesi" : "B2B bakiyesi";
+  const logoSyncSummary = payload?.logo_sync;
+  const logoSyncStatusText = logoSyncSummary
+    ? `${logoSyncSummary.pending} kuyrukta · ${logoSyncSummary.synced} gönderildi · son sync ${formatCollectionDateTime(logoSyncSummary.latest_synced_at)}`
+    : "Logo durumu yükleniyor";
   const canUseReceiptActions = displayRows.length > 0 && (receiptActionsUnlocked || sendableRows.length === 0);
   const hasQueuedCollectionRows = displayRows.some((row) => row.source_system === "b2b" && row.sync_status === "pending");
   const sendActionLabel = sendingCollections
@@ -2062,12 +2084,12 @@ export function CollectionsPage() {
                   </div>
 
                   <div className="rounded-[14px] border border-white/10 bg-white/[0.035] p-3">
-                    <p className="text-[10px] font-black uppercase tracking-[0.1em] text-slate-500">Gönderilebilir</p>
+                    <p className="text-[10px] font-black uppercase tracking-[0.1em] text-slate-500">Logo Durumu</p>
                     <p className="mt-2 text-xl font-black text-sky-100">
                       {formatAmount(sendableCollectionTotal, collectionSummaryCurrency)}
                     </p>
                     <p className="mt-1 text-xs font-bold text-[var(--muted-foreground)]">
-                      {sendableRows.length} kayıt Logo gönderimine hazır
+                      {sendableRows.length} hazır · {logoSyncStatusText}
                     </p>
                   </div>
 

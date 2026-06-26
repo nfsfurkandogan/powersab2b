@@ -14,6 +14,11 @@ import {
   logoPeriodCode,
   logoPeriodTable,
 } from "./logo-table-names.mjs";
+import {
+  hasProductTargetSelection,
+  parseProductTargetCodes,
+  parseProductTargetRefs,
+} from "./logo-product-target-selection.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(scriptDir, ".env");
@@ -23,7 +28,7 @@ if (fs.existsSync(envPath)) {
 }
 
 const config = buildConfig();
-const startedAt = Date.now();
+const runStartedAt = Date.now();
 
 main().catch((error) => {
   console.error("[logo-sync] failed:", error instanceof Error ? error.message : error);
@@ -33,124 +38,164 @@ main().catch((error) => {
 async function main() {
   validateConfig(config);
 
-  const imageMap = buildProductImageMap(
-    config.logo.productImageMapFile,
-    config.logo.productImageRoot
+  const logFile = resolveLogFilePath(config.sync.logDir);
+  const syncMode = resolveSyncMode(config);
+  const lockHandle = acquireSyncLock(config.sync.lockFile, config.sync.disableLock);
+  const stateFile = config.sync.stockFast ? config.sync.stockStateFile : config.sync.stateFile;
+  const useBatchResume = config.sync.resume && !config.sync.stockFast;
+
+  if (!lockHandle) {
+    return;
+  }
+
+  appendSyncLog(
+    logFile,
+    `[logo-sync] run start mode=${syncMode} resume=${config.sync.resume} batch_size=${config.sync.batchSize} retry_max=${config.sync.retryMax} retry_base_delay_ms=${config.sync.retryBaseDelayMs} continue_on_error=${config.sync.continueOnError}`
   );
-  if (imageMap) {
-    console.log(
-      `[logo-sync] loaded ${imageMap.entryCount} product image mapping(s) from ${imageMap.filePath}`
-    );
-  }
 
-  const imageFileIndex = buildProductImageFileIndex(config.logo.productImageFallbackDir);
-  if (imageFileIndex) {
-    console.log(
-      `[logo-sync] indexed ${imageFileIndex.fileCount} product image file(s) from ${imageFileIndex.root}`
-    );
-  }
-
-  const rafMap = buildProductRafMap(config.logo.productRafMapFile);
-  if (rafMap) {
-    console.log(`[logo-sync] loaded ${rafMap.entryCount} product raf mapping(s) from ${rafMap.filePath}`);
-  }
-
-  console.log(
-    `[logo-sync] connecting to ${config.logo.server}${config.logo.instanceName ? `\\${config.logo.instanceName}` : ""}/${config.logo.database}`
+  let stateSaved = false;
+  let syncState = buildInitialSyncState(
+    useBatchResume ? loadSyncState(stateFile) : null,
+    config,
+    syncMode
   );
+  if (config.sync.stockFast) {
+    syncState.last_run_started_at = new Date().toISOString();
+    syncState.lookback_minutes = config.sync.stockLookbackMinutes;
+  }
 
   const pool = new sql.ConnectionPool(config.logo.connection);
-  await pool.connect();
 
   try {
+    await pool.connect();
+
+    syncState.started_at = syncState.started_at || new Date().toISOString();
+    syncState.updated_at = new Date().toISOString();
+    saveSyncState(stateFile, syncState);
+    stateSaved = true;
+
+    const imageMap = buildProductImageMap(
+      config.logo.productImageMapFile,
+      config.logo.productImageRoot
+    );
+    if (imageMap) {
+      console.log(
+        `[logo-sync] loaded ${imageMap.entryCount} product image mapping(s) from ${imageMap.filePath}`
+      );
+    }
+
+    const imageFileIndex = buildProductImageFileIndex(config.logo.productImageFallbackDir);
+    if (imageFileIndex) {
+      console.log(
+        `[logo-sync] indexed ${imageFileIndex.fileCount} product image file(s) from ${imageFileIndex.root}`
+      );
+    }
+
+    const rafMap = config.sync.imagesOnly ? null : buildProductRafMap(config.logo.productRafMapFile);
+    if (rafMap) {
+      console.log(`[logo-sync] loaded ${rafMap.entryCount} product raf mapping(s) from ${rafMap.filePath}`);
+    }
+
+    console.log(
+      `[logo-sync] connecting to ${config.logo.server}${config.logo.instanceName ? `\\${config.logo.instanceName}` : ""}/${config.logo.database}`
+    );
+
     const productSchema = await inspectTable(pool, config.logo.productTable, "product", true);
     console.log(
       `[logo-sync] discovered ${productSchema.columns.length} column(s) on ${config.logo.productTable}`
     );
 
-    const stockSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "stockTable",
-      "stock",
-      derivePrimaryStockTableNames(config.logo.productTable)
-    );
+    const stockSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "stockTable",
+          "stock",
+          derivePrimaryStockTableNames(config.logo.productTable)
+        );
     if (stockSchema) {
       console.log(
         `[logo-sync] discovered ${stockSchema.columns.length} column(s) on ${stockSchema.qualifiedName}`
       );
-    } else {
-      console.warn(
-        "[logo-sync] stock table not configured or not found; stock sync will be skipped."
-      );
+    } else if (!config.sync.imagesOnly) {
+      console.warn("[logo-sync] stock table not configured or not found; stock sync will be skipped.");
     }
 
-    const warehouseInfoSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "warehouseInfoTable",
-      "warehouse info",
-      derivePrimaryWarehouseInfoTableNames(config.logo.productTable)
-    );
-    const warehouseInfoByNo = await fetchWarehouseInfo(
-      pool,
-      warehouseInfoSchema,
-      config.logo.warehouseNameMap
-    );
+    const warehouseInfoSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "warehouseInfoTable",
+          "warehouse info",
+          derivePrimaryWarehouseInfoTableNames(config.logo.productTable)
+        );
+    const warehouseInfoByNo = config.sync.imagesOnly
+      ? new Map(config.logo.warehouseNameMap)
+      : await fetchWarehouseInfo(pool, warehouseInfoSchema, config.logo.warehouseNameMap);
     if (warehouseInfoSchema) {
       console.log(
         `[logo-sync] discovered ${warehouseInfoSchema.columns.length} column(s) on ${warehouseInfoSchema.qualifiedName}; loaded ${warehouseInfoByNo.size} warehouse definition(s)`
       );
     }
 
-    const priceSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "priceTable",
-      "price",
-      derivePrimaryPriceTableNames(config.logo.productTable)
-    );
+    const priceSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "priceTable",
+          "price",
+          derivePrimaryPriceTableNames(config.logo.productTable)
+        );
     if (priceSchema) {
       console.log(
         `[logo-sync] discovered ${priceSchema.columns.length} column(s) on ${priceSchema.qualifiedName}`
       );
-    } else {
+    } else if (!config.sync.imagesOnly) {
       console.warn("[logo-sync] price table not configured or not found; price sync will be skipped.");
     }
 
-    const productUnitSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "productUnitTable",
-      "product unit assignment",
-      derivePrimaryProductUnitTableNames(config.logo.productTable)
-    );
+    const productUnitSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "productUnitTable",
+          "product unit assignment",
+          derivePrimaryProductUnitTableNames(config.logo.productTable)
+        );
     if (productUnitSchema) {
       console.log(
         `[logo-sync] discovered ${productUnitSchema.columns.length} column(s) on ${productUnitSchema.qualifiedName}`
       );
     }
 
-    const unitSetSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "unitSetTable",
-      "unit set",
-      derivePrimaryUnitSetTableNames(config.logo.productTable)
-    );
+    const unitSetSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "unitSetTable",
+          "unit set",
+          derivePrimaryUnitSetTableNames(config.logo.productTable)
+        );
     if (unitSetSchema) {
       console.log(
         `[logo-sync] discovered ${unitSetSchema.columns.length} column(s) on ${unitSetSchema.qualifiedName}`
       );
     }
 
-    const unitSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "unitTable",
-      "unit",
-      derivePrimaryUnitTableNames(config.logo.productTable)
-    );
+    const unitSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "unitTable",
+          "unit",
+          derivePrimaryUnitTableNames(config.logo.productTable)
+        );
     if (unitSchema) {
       console.log(
         `[logo-sync] discovered ${unitSchema.columns.length} column(s) on ${unitSchema.qualifiedName}`
@@ -167,58 +212,129 @@ async function main() {
         `[logo-sync] discovered ${imageSchema.columns.length} column(s) on ${imageSchema.qualifiedName}`
       );
     } else {
-      console.warn(
-        "[logo-sync] product image table not configured or not found; image sync will be skipped."
-      );
+      console.warn("[logo-sync] product image table not configured or not found; image sync will be skipped.");
     }
 
-    const oemSchema = await inspectTable(pool, config.logo.oemTable, "oem reference", false);
+    const oemSchema = config.sync.imagesOnly
+      ? null
+      : await inspectTable(pool, config.logo.oemTable, "oem reference", false);
     if (oemSchema) {
       console.log(
         `[logo-sync] discovered ${oemSchema.columns.length} column(s) on ${config.logo.oemTable}`
       );
     }
 
-    const competitorSchema = await inspectTable(
-      pool,
-      config.logo.competitorTable,
-      "competitor reference",
-      false
-    );
+    const competitorSchema = config.sync.imagesOnly
+      ? null
+      : await inspectTable(
+          pool,
+          config.logo.competitorTable,
+          "competitor reference",
+          false
+        );
     if (competitorSchema) {
       console.log(
         `[logo-sync] discovered ${competitorSchema.columns.length} column(s) on ${config.logo.competitorTable}`
       );
     }
 
-    const substituteSchema = await resolveOptionalTableSchema(
-      pool,
-      config,
-      "productSubstituteTable",
-      "product substitute",
-      derivePrimaryProductSubstituteTableNames(config.logo.productTable)
-    );
+    const substituteSchema = config.sync.imagesOnly
+      ? null
+      : await resolveOptionalTableSchema(
+          pool,
+          config,
+          "productSubstituteTable",
+          "product substitute",
+          derivePrimaryProductSubstituteTableNames(config.logo.productTable)
+        );
     if (substituteSchema) {
       console.log(
         `[logo-sync] discovered ${substituteSchema.columns.length} column(s) on ${substituteSchema.qualifiedName}`
       );
     }
 
-    const productRafSchema = await inspectTable(pool, config.logo.productRafTable, "product raf", false);
+    const productRafSchema = config.sync.imagesOnly
+      ? null
+      : await inspectTable(pool, config.logo.productRafTable, "product raf", false);
     if (productRafSchema) {
       console.log(
         `[logo-sync] discovered ${productRafSchema.columns.length} column(s) on ${productRafSchema.qualifiedName}`
       );
     }
 
-    const rows = await fetchProducts(pool, config, productSchema);
+    const productSelection = await fetchProductsForSync(pool, config, productSchema, productRafSchema);
+    const rows = productSelection.rows;
+    if (productSelection.targeted) {
+      syncState.target_refs = productSelection.targetRefs ?? [];
+      syncState.target_codes = productSelection.targetCodes ?? [];
+      syncState.target_table = productSelection.catalogTable ?? config.logo.productTable;
+    } else if (config.sync.stockFast) {
+      syncState.last_seen_stock_line_ref = productSelection.lastSeenStockLineRef ?? null;
+      syncState.incremental_since_at = productSelection.sinceAt ?? null;
+      syncState.stock_line_table = productSelection.stockLineTable ?? null;
+    } else if (config.sync.catalogIncremental) {
+      syncState.incremental_since_at = productSelection.sinceAt ?? null;
+      syncState.catalog_table = productSelection.catalogTable ?? config.logo.productTable;
+      syncState.catalog_raf_ref_count =
+        Array.isArray(productSelection.catalogRafRefs) ? productSelection.catalogRafRefs.length : 0;
+      syncState.catalog_raf_since_at = productSelection.sinceAt ?? null;
+      if (productSelection.catalogRolling) {
+        syncState.catalog_rolling_last_seen_logical_ref =
+          productSelection.catalogRolling.lastSeenLogicalRef ?? null;
+        syncState.catalog_rolling_next_logical_ref =
+          productSelection.catalogRolling.nextLogicalRef ?? null;
+        syncState.catalog_rolling_limit = productSelection.catalogRolling.limit ?? null;
+        syncState.catalog_rolling_selected_count =
+          productSelection.catalogRolling.refs?.length ?? 0;
+        syncState.catalog_rolling_wrapped =
+          productSelection.catalogRolling.wrapped ?? false;
+      }
+    }
     console.log(`[logo-sync] fetched ${rows.length} product row(s) from ${config.logo.productTable}`);
 
     const chunks = chunk(rows, config.sync.batchSize);
+    const totalBatches = chunks.length;
+
+    syncState.total_records = rows.length;
+    syncState.total_batches = totalBatches;
+    syncState.mode = syncMode;
+    syncState.batch_size = config.sync.batchSize;
+    syncState.product_table = config.logo.productTable;
+    syncState.updated_at = new Date().toISOString();
+
     let sent = 0;
     let skipped = 0;
+    const startBatchIndex = resolveResumeStartIndex(
+      syncState,
+      useBatchResume,
+      totalBatches
+    );
+    let pendingBatches = totalBatches - Math.max(startBatchIndex, 0);
 
-    for (let index = 0; index < chunks.length; index += 1) {
+    if (pendingBatches <= 0) {
+      console.log(
+        `[logo-sync] nothing to process; sync state already at or past the end (batch=${startBatchIndex + 1}).`
+      );
+      appendSyncLog(
+        logFile,
+        `[logo-sync] nothing to process; sync state already at or past the end (batch=${startBatchIndex + 1}).`
+      );
+      syncState.updated_at = new Date().toISOString();
+      updateFastStockState(syncState, sent, skipped);
+      saveSyncState(stateFile, syncState);
+      stateSaved = true;
+      return;
+    }
+
+    console.log(
+      `[logo-sync] starting batch loop from ${startBatchIndex + 1}/${totalBatches} with ${rows.length} total records`
+    );
+    appendSyncLog(
+      logFile,
+      `[logo-sync] starting batch loop from ${startBatchIndex + 1}/${totalBatches} with ${rows.length} total records`
+    );
+
+    for (let index = startBatchIndex; index < chunks.length; index += 1) {
       const currentChunk = chunks[index];
       if (currentChunk.length === 0) {
         continue;
@@ -228,13 +344,52 @@ async function main() {
         .map((row) => normalizeInteger(readFirst(row, ["LOGICALREF", "logicalref", "external_ref"])))
         .filter((value) => value !== null);
 
-      const stockByRef = await fetchStockSnapshot(pool, config, stockSchema, logicalRefs, warehouseInfoByNo);
+      const stockByRef = config.sync.imagesOnly
+        ? new Map()
+        : await fetchStockSnapshot(pool, config, stockSchema, logicalRefs, warehouseInfoByNo);
 
       const records = [];
 
-      if (config.sync.stockOnly) {
+      if (config.sync.imagesOnly) {
+        const productImagesByRef = await fetchProductImages(
+          pool,
+          config,
+          imageSchema,
+          currentChunk,
+          productSchema,
+          logicalRefs
+        );
+
         for (const row of currentChunk) {
-          const record = mapStockOnlyProductRow(row, productSchema, stockByRef);
+          const record = mapProductRow(
+            row,
+            config.logo.productTable,
+            productSchema,
+            stockByRef,
+            new Map(),
+            new Map(),
+            productImagesByRef,
+            new Map(),
+            new Map(),
+            imageMap,
+            imageFileIndex,
+            null
+          );
+
+          if (!record) {
+            skipped += 1;
+            const externalRef = normalizeString(readFirst(row, ["external_ref", "LOGICALREF"]));
+            if (!config.sync.imageSkippedRefs.has(externalRef)) {
+              config.sync.imageStats.skipped_no_image += 1;
+            }
+            continue;
+          }
+
+          records.push(record);
+        }
+      } else if (config.sync.stockOnly) {
+        for (const row of currentChunk) {
+          const record = mapStockOnlyProductRow(row, productSchema, stockByRef, config);
 
           if (!record) {
             skipped += 1;
@@ -245,7 +400,13 @@ async function main() {
         }
       } else {
         const priceByRef = await fetchPriceSnapshot(pool, config, priceSchema, logicalRefs);
-        const unitsByRef = await fetchProductUnits(pool, productUnitSchema, unitSchema, unitSetSchema, logicalRefs);
+        const unitsByRef = await fetchProductUnits(
+          pool,
+          productUnitSchema,
+          unitSchema,
+          unitSetSchema,
+          logicalRefs
+        );
         const productImagesByRef = await fetchProductImages(
           pool,
           config,
@@ -257,14 +418,14 @@ async function main() {
         const productRafByRef = await fetchProductRafAddresses(pool, productRafSchema, logicalRefs);
         const codeAliasesByRef = config.sync.skipAliases
           ? new Map()
-          : await fetchCodeAliases(pool, [
-              { schema: oemSchema, type: "oem", tableName: config.logo.oemTable },
-              {
-                schema: competitorSchema,
-                type: "competitor",
-                tableName: config.logo.competitorTable,
-              },
-            ], logicalRefs);
+          : await fetchCodeAliases(
+              pool,
+              [
+                { schema: oemSchema, type: "oem", tableName: config.logo.oemTable },
+                { schema: competitorSchema, type: "competitor", tableName: config.logo.competitorTable },
+              ],
+              logicalRefs
+            );
         if (!config.sync.skipAliases) {
           const substituteAliasesByRef = await fetchProductSubstitutes(
             pool,
@@ -305,18 +466,154 @@ async function main() {
         continue;
       }
 
-      console.log(
-        `[logo-sync] sending batch ${index + 1}/${chunks.length} with ${records.length} record(s)`
+      const offset = index * config.sync.batchSize;
+      const batchNumber = index + 1;
+      console.log(`[logo-sync] sending batch ${batchNumber}/${chunks.length} with ${records.length} record(s)`);
+      appendSyncLog(
+        logFile,
+        `[logo-sync] sending batch ${batchNumber}/${chunks.length} offset=${offset} count=${records.length}`
       );
 
-      await pushBatch(records, config);
-      sent += records.length;
+      const batchStart = Date.now();
+      try {
+        const result = await pushBatchWithRetry(records, config);
+        const elapsed = Date.now() - batchStart;
+
+        sent += records.length;
+        if (config.sync.imagesOnly) {
+          config.sync.imageStats.images_synced += records.length;
+        }
+        syncState.last_success_batch_index = index;
+        syncState.last_success_offset = offset;
+        syncState.last_success_count = records.length;
+        syncState.success_count += records.length;
+        syncState.updated_at = new Date().toISOString();
+        syncState.mode = syncMode;
+        syncState.batch_size = config.sync.batchSize;
+
+        updateFastStockState(syncState, sent, skipped);
+        saveSyncState(stateFile, syncState);
+        stateSaved = true;
+        appendSyncLog(
+          logFile,
+          `[logo-sync] batch ${batchNumber}/${chunks.length} done retry_count=${result.retryCount} status=${result.status} duration_s=${(
+            elapsed / 1000
+          ).toFixed(2)} response=${result.responsePreview ?? "ok"}`
+        );
+      } catch (error) {
+        const elapsed = Date.now() - batchStart;
+        const errorMessage =
+          error instanceof Error ? error.message : `error type ${Object.prototype.toString.call(error)}`;
+        const retryCount = Number.isInteger(error.retryCount) ? error.retryCount : 0;
+        syncState.failed_count += 1;
+        syncState.updated_at = new Date().toISOString();
+
+        appendFailedBatch(config.sync.failedFile, {
+          batch_index: index,
+          batch_number: batchNumber,
+          total_batches: chunks.length,
+          offset,
+          count: records.length,
+          http_status: error.httpStatus,
+          error_message: errorMessage,
+          response_preview: error.responsePreview,
+          product_refs: extractBatchProductRefs(records),
+        });
+
+        if (config.sync.imagesOnly && Number(error.httpStatus) === 413) {
+          for (const record of records) {
+            appendImageFailed(config, {
+              product_ref: normalizeString(record.external_ref),
+              sku: normalizeString(record.sku),
+              original_bytes: null,
+              optimized_bytes: null,
+              reason: "api_413_after_optimize",
+              table: config.logo.productImageTable,
+              ref_column: config.logo.productImageRefColumn,
+              data_column: config.logo.productImageDataColumn,
+            });
+          }
+        }
+
+        updateFastStockState(syncState, sent, skipped);
+        saveSyncState(stateFile, syncState);
+        stateSaved = true;
+        appendSyncLog(
+          logFile,
+          `[logo-sync] batch ${batchNumber}/${chunks.length} failed retry_count=${retryCount} duration_s=${(
+            elapsed / 1000
+          ).toFixed(2)} status=${error.httpStatus ?? "n/a"} error=${errorMessage}`
+        );
+
+        if (!config.sync.continueOnError) {
+          throw error;
+        }
+      }
     }
 
-    const durationMs = Date.now() - startedAt;
-    console.log(`[logo-sync] completed. sent=${sent} skipped=${skipped} duration=${durationMs}ms`);
+    const durationMs = Date.now() - runStartedAt;
+    console.log(
+      `[logo-sync] completed. sent=${sent} skipped=${skipped} failed=${syncState.failed_count} duration=${durationMs}ms`
+    );
+    appendSyncLog(
+      logFile,
+      `[logo-sync] completed. sent=${sent} skipped=${skipped} failed=${syncState.failed_count} duration_ms=${durationMs}`
+    );
+    if (config.sync.imagesOnly) {
+      const imageSummary = {
+        images_found: config.sync.imageStats.images_found,
+        originals_sent: config.sync.imageStats.originals_sent,
+        optimized_sent: config.sync.imageStats.optimized_sent,
+        optimized_failed: config.sync.imageStats.optimized_failed,
+        images_synced: config.sync.imageStats.images_synced,
+        skipped_no_image: config.sync.imageStats.skipped_no_image,
+        failed: syncState.failed_count,
+        duration_ms: durationMs,
+        total_original_bytes: config.sync.imageStats.total_original_bytes,
+        total_sent_bytes: config.sync.imageStats.total_sent_bytes,
+        saved_bytes: Math.max(
+          0,
+          config.sync.imageStats.total_original_bytes - config.sync.imageStats.total_sent_bytes
+        ),
+      };
+      const imageSummaryText = `[logo-sync] image summary ${Object.entries(imageSummary)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(" ")}`;
+      console.log(imageSummaryText);
+      appendSyncLog(logFile, imageSummaryText);
+    }
+    syncState.updated_at = new Date().toISOString();
+    updateFastStockState(syncState, sent, skipped, durationMs);
+    if (
+      config.sync.catalogIncremental &&
+      syncState.failed_count === 0 &&
+      productSelection.catalogRolling
+    ) {
+      saveCatalogRollingState(config, productSelection.catalogRolling);
+    }
+    if (chunks.length > 0) {
+      const lastChunkIndex = chunks.length - 1;
+      syncState.last_success_batch_index = lastChunkIndex;
+      syncState.last_success_offset = lastChunkIndex * config.sync.batchSize;
+      syncState.last_success_count = chunks[lastChunkIndex].length;
+    }
+    saveSyncState(stateFile, syncState);
+    stateSaved = true;
   } finally {
-    await pool.close();
+    if (pool) {
+      try {
+        await pool.close();
+      } catch (error) {
+        console.warn(
+          `[logo-sync] could not close SQL connection cleanly: ${error instanceof Error ? error.message : "unknown"}`
+        );
+      }
+    }
+    syncState.updated_at = new Date().toISOString();
+    if (!stateSaved) {
+      saveSyncState(stateFile, syncState);
+    }
+    releaseSyncLock(lockHandle);
   }
 }
 
@@ -391,6 +688,218 @@ function isUsableProductImageSchema(currentConfig, schema) {
   return Boolean(resolvedColumns.referenceColumn && (resolvedColumns.dataColumn || resolvedColumns.pathColumn));
 }
 
+function resolveSyncPath(value, fallback, _isFile = true) {
+  const rawPath = normalizeString(value) ?? normalizeString(fallback);
+  return path.resolve(scriptDir, rawPath ?? "logs");
+}
+
+function resolveSyncMode(currentConfig) {
+  if (currentConfig.sync.imagesOnly) {
+    return "images_only";
+  }
+
+  if (hasProductTargetSelection(currentConfig.sync)) {
+    return "products_target";
+  }
+
+  if (currentConfig.sync.stockFast) {
+    return "stock_fast";
+  }
+
+  if (currentConfig.sync.stockOnly) {
+    return "stock_only";
+  }
+
+  return currentConfig.sync.skipAliases ? "products_no_aliases" : "products";
+}
+
+function buildInitialSyncState(persistedSyncState, currentConfig, syncMode) {
+  const now = new Date().toISOString();
+  const base = {
+    started_at: now,
+    updated_at: now,
+    mode: syncMode,
+    total_records: 0,
+    total_batches: 0,
+    last_success_batch_index: -1,
+    last_success_offset: -1,
+    last_success_count: 0,
+    success_count: 0,
+    failed_count: 0,
+    batch_size: currentConfig.sync.batchSize,
+    product_table: currentConfig.logo.productTable,
+  };
+
+  if (!currentConfig.sync.resume || !isSyncStateCompatible(persistedSyncState, currentConfig, syncMode)) {
+    return base;
+  }
+
+  return {
+    ...base,
+    ...persistedSyncState,
+    started_at: normalizeString(persistedSyncState.started_at) ?? now,
+    mode: syncMode,
+    batch_size: normalizeInteger(persistedSyncState.batch_size) ?? currentConfig.sync.batchSize,
+    last_success_batch_index:
+      normalizeInteger(persistedSyncState.last_success_batch_index) ?? -1,
+    last_success_offset: normalizeInteger(persistedSyncState.last_success_offset) ?? -1,
+    last_success_count: normalizeInteger(persistedSyncState.last_success_count) ?? 0,
+    success_count: normalizeInteger(persistedSyncState.success_count) ?? 0,
+    failed_count: normalizeInteger(persistedSyncState.failed_count) ?? 0,
+  };
+}
+
+function isSyncStateCompatible(persistedSyncState, currentConfig, syncMode) {
+  return (
+    persistedSyncState &&
+    typeof persistedSyncState === "object" &&
+    persistedSyncState.mode === syncMode &&
+    persistedSyncState.product_table === currentConfig.logo.productTable &&
+    persistedSyncState.batch_size === currentConfig.sync.batchSize
+  );
+}
+
+function resolveResumeStartIndex(syncState, resumeEnabled, totalBatches) {
+  if (!resumeEnabled) {
+    return 0;
+  }
+
+  const lastSuccessBatch = Number.parseInt(syncState.last_success_batch_index, 10);
+  if (!Number.isFinite(lastSuccessBatch)) {
+    return 0;
+  }
+
+  const index = lastSuccessBatch + 1;
+  return Math.min(Math.max(index, 0), Math.max(totalBatches, 0));
+}
+
+function resolveLogFilePath(logDir) {
+  const today = new Date().toISOString().slice(0, 10);
+  const directory = resolveSyncPath(logDir, "logs", false);
+  fs.mkdirSync(directory, { recursive: true });
+  return path.join(directory, `products-sync-${today}.log`);
+}
+
+function appendSyncLog(logFile, message) {
+  const timestamp = new Date().toISOString();
+  try {
+    fs.appendFileSync(logFile, `[${timestamp}] ${message}\n`, "utf8");
+  } catch (error) {
+    console.warn(
+      `[logo-sync] could not write sync log to ${logFile}: ${error instanceof Error ? error.message : "unknown"}`
+    );
+  }
+}
+
+function appendFailedBatch(failedFile, payload) {
+  const directory = path.dirname(failedFile);
+  fs.mkdirSync(directory, { recursive: true });
+  const record = {
+    timestamp: new Date().toISOString(),
+    ...payload,
+  };
+  fs.appendFileSync(failedFile, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+function appendImageFailed(currentConfig, payload) {
+  const directory = path.dirname(currentConfig.sync.imageFailedFile);
+  fs.mkdirSync(directory, { recursive: true });
+  const record = {
+    timestamp: new Date().toISOString(),
+    ...payload,
+  };
+  fs.appendFileSync(currentConfig.sync.imageFailedFile, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+function extractBatchProductRefs(records) {
+  const refs = [];
+  for (const record of records) {
+    const rawRef = normalizeString(record.external_ref);
+    const sku = normalizeString(record.sku);
+    if (rawRef) {
+      refs.push(`external_ref:${rawRef}`);
+      continue;
+    }
+
+    if (sku) {
+      refs.push(`sku:${sku}`);
+    }
+
+    if (refs.length >= 40) {
+      break;
+    }
+  }
+
+  return refs;
+}
+
+function acquireSyncLock(lockFile, disableLock) {
+  if (disableLock) {
+    console.log("[logo-sync] lock disabled via SYNC_DISABLE_LOCK.");
+    return { path: lockFile, enabled: false };
+  }
+
+  if (fs.existsSync(lockFile)) {
+    console.warn(`[logo-sync] another sync is already running; lock file exists: ${lockFile}`);
+    return null;
+  }
+
+  const directory = path.dirname(lockFile);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(lockFile, `${new Date().toISOString()} ${process.pid}\n`, "utf8");
+  return { path: lockFile, enabled: true };
+}
+
+function releaseSyncLock(lockHandle) {
+  if (!lockHandle || !lockHandle.enabled || !lockHandle.path) {
+    return;
+  }
+
+  try {
+    if (fs.existsSync(lockHandle.path)) {
+      fs.unlinkSync(lockHandle.path);
+    }
+  } catch (error) {
+    console.warn(
+      `[logo-sync] could not remove lock file ${lockHandle.path}: ${error instanceof Error ? error.message : "unknown"}`
+    );
+  }
+}
+
+function loadSyncState(stateFile) {
+  if (!fs.existsSync(stateFile)) {
+    return null;
+  }
+
+  try {
+    const rawState = fs.readFileSync(stateFile, "utf8");
+    return JSON.parse(rawState);
+  } catch (error) {
+    console.warn(
+      `[logo-sync] could not read sync state file ${stateFile}: ${error instanceof Error ? error.message : "unknown"}`
+    );
+    return null;
+  }
+}
+
+function saveSyncState(stateFile, state) {
+  const directory = path.dirname(stateFile);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
+function updateFastStockState(state, sent, skipped, durationMs = Date.now() - runStartedAt) {
+  if (!config.sync.stockFast) {
+    return;
+  }
+
+  state.sent_count = sent;
+  state.skipped_count = skipped;
+  state.failed_count = normalizeInteger(state.failed_count) ?? 0;
+  state.last_run_completed_at = new Date().toISOString();
+  state.duration_ms = durationMs;
+}
+
 function buildConfig() {
   const batchSize = parseInteger(process.env.SYNC_BATCH_SIZE, 500);
   const timeoutMs = parseInteger(process.env.LOGO_SQL_REQUEST_TIMEOUT_MS, 30000);
@@ -400,6 +909,26 @@ function buildConfig() {
     nullable(process.env.POWERSA_PRODUCTS_SYNC_URL) ??
     deriveProductsSyncUrl(process.env.POWERSA_SYNC_URL);
   const syncKey = (process.env.POWERSA_PRODUCTS_SYNC_KEY ?? process.env.POWERSA_SYNC_KEY ?? "").trim();
+  const retryMax = parseInteger(process.env.SYNC_RETRY_MAX, 3);
+  const retryBaseDelayMs = parseInteger(process.env.SYNC_RETRY_BASE_DELAY_MS, 3000);
+  const stateFile = resolveSyncPath(process.env.SYNC_STATE_FILE, ".sync-state/products-sync-state.json");
+  const stockStateFile = resolveSyncPath(
+    process.env.SYNC_PRODUCTS_STOCK_STATE_FILE,
+    ".sync-state/products-stock-fast-state.json"
+  );
+  const catalogStateFile = resolveSyncPath(
+    process.env.SYNC_PRODUCTS_CATALOG_STATE_FILE,
+    ".sync-state/products-catalog-fast-state.json"
+  );
+  const failedFile = resolveSyncPath(
+    process.env.SYNC_FAILED_FILE,
+    ".sync-state/products-sync-failed.jsonl"
+  );
+  const imageFailedFile = resolveSyncPath(
+    process.env.SYNC_PRODUCT_IMAGE_FAILED_FILE ?? process.env.SYNC_FAILED_FILE,
+    ".sync-state/products-images-failed.jsonl"
+  );
+  const logDir = resolveSyncPath(process.env.SYNC_LOG_DIR, "logs", false);
 
   return {
     logo: {
@@ -419,6 +948,8 @@ function buildConfig() {
       productTable: nullable(process.env.LOGO_PRODUCT_TABLE) ?? logoFirmTable("ITEMS"),
       productCardTypes,
       stockTable: nullable(process.env.LOGO_STOCK_TABLE),
+      stockLineTable: nullable(process.env.LOGO_STOCK_LINE_TABLE),
+      stockFicheTable: nullable(process.env.LOGO_STOCK_FICHE_TABLE),
       warehouseInfoTable: nullable(process.env.LOGO_WAREHOUSE_INFO_TABLE),
       warehouseNameMap: parseWarehouseNameMap(process.env.LOGO_WAREHOUSE_NAME_MAP),
       warehouseRafKeyMap: parseWarehouseRafKeyMap(process.env.LOGO_WAREHOUSE_RAF_KEY_MAP),
@@ -434,6 +965,7 @@ function buildConfig() {
       productImagePathColumn: nullable(process.env.LOGO_PRODUCT_IMAGE_PATH_COLUMN),
       productImageOrderColumn: nullable(process.env.LOGO_PRODUCT_IMAGE_ORDER_COLUMN),
       productImageRoot: nullable(process.env.LOGO_PRODUCT_IMAGE_ROOT),
+      productImageBaseUrl: normalizeImageBaseUrl(process.env.LOGO_PRODUCT_IMAGE_BASE_URL),
       productImageMapFile: nullable(process.env.LOGO_PRODUCT_IMAGE_MAP_FILE),
       productImageFallbackDir: nullable(process.env.LOGO_PRODUCT_IMAGE_FALLBACK_DIR),
       productRafTable: nullable(process.env.LOGO_PRODUCT_RAF_TABLE),
@@ -468,8 +1000,54 @@ function buildConfig() {
       url: syncUrl ?? "",
       key: syncKey,
       priceListCode: nullable(process.env.POWERSA_PRICE_LIST_CODE) ?? "A",
-      stockOnly: parseBoolean(process.env.SYNC_PRODUCTS_STOCK_ONLY, false),
+      resume: parseBoolean(process.env.SYNC_RESUME, true),
+      stockFast: parseBoolean(process.env.SYNC_PRODUCTS_STOCK_FAST, false),
+      stockIncremental: parseBoolean(process.env.SYNC_PRODUCTS_STOCK_INCREMENTAL, false),
+      stockLookbackMinutes: parseInteger(process.env.SYNC_PRODUCTS_STOCK_LOOKBACK_MINUTES, 10),
+      stockSkipMovementFallback: parseBoolean(process.env.SYNC_PRODUCTS_STOCK_SKIP_MOVEMENT_FALLBACK, false),
+      stockRequireSummaryRow: parseBoolean(process.env.SYNC_PRODUCTS_STOCK_REQUIRE_SUMMARY_ROW, false),
+      stockIncludePrice: parseBoolean(process.env.SYNC_PRODUCTS_STOCK_INCLUDE_PRICE, true),
+      catalogIncremental: parseBoolean(process.env.SYNC_PRODUCTS_CATALOG_INCREMENTAL, false),
+      catalogLookbackMinutes: parseInteger(process.env.SYNC_PRODUCTS_CATALOG_LOOKBACK_MINUTES, 60),
+      catalogRecentLimit: parseInteger(process.env.SYNC_PRODUCTS_CATALOG_RECENT_LIMIT, 500),
+      catalogRollingLimit: parseInteger(process.env.SYNC_PRODUCTS_CATALOG_ROLLING_LIMIT, 0),
+      catalogStateFile,
+      targetRefs: parseProductTargetRefs(process.env.SYNC_PRODUCTS_TARGET_REFS),
+      targetCodes: parseProductTargetCodes(process.env.SYNC_PRODUCTS_TARGET_CODES),
+      stockOnly:
+        parseBoolean(process.env.SYNC_PRODUCTS_STOCK_ONLY, false) ||
+        parseBoolean(process.env.SYNC_PRODUCTS_STOCK_FAST, false) ||
+        parseBoolean(process.env.SYNC_PRODUCTS_STOCK_INCREMENTAL, false),
+      imagesOnly: parseBoolean(process.env.SYNC_PRODUCTS_IMAGES_ONLY, false),
       skipAliases: parseBoolean(process.env.SYNC_PRODUCTS_SKIP_ALIASES, false),
+      imageOptimize: parseBoolean(process.env.SYNC_PRODUCT_IMAGE_OPTIMIZE, false),
+      imageMaxWidth: parseInteger(process.env.SYNC_PRODUCT_IMAGE_MAX_WIDTH, 1200),
+      imageJpegQuality: parseInteger(process.env.SYNC_PRODUCT_IMAGE_JPEG_QUALITY, 80),
+      imageTargetMaxBytes: parseInteger(process.env.SYNC_PRODUCT_IMAGE_TARGET_MAX_BYTES, 1_500_000),
+      imageOutputFormat: normalizeString(process.env.SYNC_PRODUCT_IMAGE_OUTPUT_FORMAT) ?? "jpeg",
+      imageAllowOriginalIfSmall: parseBoolean(process.env.SYNC_PRODUCT_IMAGE_ALLOW_ORIGINAL_IF_SMALL, true),
+      imageOriginalMaxBytes: parseInteger(process.env.SYNC_PRODUCT_IMAGE_ORIGINAL_MAX_BYTES, 1_500_000),
+      retryMax: Number.isFinite(retryMax) ? retryMax : 3,
+      retryBaseDelayMs: Number.isFinite(retryBaseDelayMs) ? retryBaseDelayMs : 3000,
+      stateFile,
+      stockStateFile,
+      failedFile,
+      imageFailedFile,
+      logDir,
+      lockFile: path.resolve(scriptDir, ".sync-state/products-sync.lock"),
+      continueOnError: parseBoolean(process.env.SYNC_CONTINUE_ON_ERROR, false),
+      disableLock: parseBoolean(process.env.SYNC_DISABLE_LOCK, false),
+      imageStats: {
+        images_found: 0,
+        originals_sent: 0,
+        optimized_sent: 0,
+        optimized_failed: 0,
+        images_synced: 0,
+        skipped_no_image: 0,
+        total_original_bytes: 0,
+        total_sent_bytes: 0,
+      },
+      imageSkippedRefs: new Set(),
     },
   };
 }
@@ -491,6 +1069,8 @@ function validateConfig(currentConfig) {
   for (const tableName of [
     currentConfig.logo.productTable,
     currentConfig.logo.stockTable,
+    currentConfig.logo.stockLineTable,
+    currentConfig.logo.stockFicheTable,
     currentConfig.logo.warehouseInfoTable,
     currentConfig.logo.priceTable,
     currentConfig.logo.productUnitTable,
@@ -596,6 +1176,513 @@ async function fetchProducts(pool, currentConfig, schema) {
   return result.recordset ?? [];
 }
 
+async function fetchProductsForSync(pool, currentConfig, productSchema, productRafSchema) {
+  if (hasProductTargetSelection(currentConfig.sync)) {
+    return fetchTargetProducts(pool, currentConfig, productSchema);
+  }
+
+  if (currentConfig.sync.stockFast && currentConfig.sync.stockIncremental) {
+    return fetchIncrementalStockProducts(pool, currentConfig, productSchema);
+  }
+
+  if (currentConfig.sync.catalogIncremental) {
+    return fetchIncrementalCatalogProducts(pool, currentConfig, productSchema, productRafSchema);
+  }
+
+  return {
+    rows: await fetchProducts(pool, currentConfig, productSchema),
+    lastSeenStockLineRef: null,
+    sinceAt: null,
+    stockLineTable: null,
+    catalogTable: currentConfig.logo.productTable,
+  };
+}
+
+async function fetchTargetProducts(pool, currentConfig, productSchema) {
+  const logicalRefColumn = findColumn(productSchema.columns, ["LOGICALREF"]);
+  const codeColumn = findColumn(productSchema.columns, ["CODE", "CODE_", "sku"]);
+  const filters = [];
+  const request = pool.request();
+
+  if (currentConfig.sync.targetRefs.length > 0) {
+    if (logicalRefColumn) {
+      filters.push(`p.${logicalRefColumn} IN (${currentConfig.sync.targetRefs.join(", ")})`);
+    } else {
+      console.warn("[logo-sync] target refs requested but product table has no LOGICALREF column.");
+    }
+  }
+
+  if (currentConfig.sync.targetCodes.length > 0) {
+    if (codeColumn) {
+      const codeParams = [];
+      currentConfig.sync.targetCodes.forEach((code, index) => {
+        const param = `target_code_${index}`;
+        request.input(param, sql.NVarChar(128), code);
+        codeParams.push(`@${param}`);
+      });
+      filters.push(`p.${codeColumn} IN (${codeParams.join(", ")})`);
+    } else {
+      console.warn("[logo-sync] target codes requested but product table has no CODE column.");
+    }
+  }
+
+  if (filters.length === 0) {
+    return {
+      rows: [],
+      lastSeenStockLineRef: null,
+      sinceAt: null,
+      stockLineTable: null,
+      catalogTable: currentConfig.logo.productTable,
+      targeted: true,
+      targetRefs: currentConfig.sync.targetRefs,
+      targetCodes: currentConfig.sync.targetCodes,
+    };
+  }
+
+  const cardTypeFilter =
+    currentConfig.logo.productCardTypes.length > 0 && productSchema.columnSet.has("CARDTYPE")
+      ? `AND p.CARDTYPE IN (${currentConfig.logo.productCardTypes.join(", ")})`
+      : "";
+  const orderBy = logicalRefColumn ? `p.${logicalRefColumn} ASC` : `p.${codeColumn} ASC`;
+
+  const result = await request.query(`
+    SELECT p.*
+    FROM ${currentConfig.logo.productTable} p
+    WHERE (${filters.join(" OR ")})
+      ${cardTypeFilter}
+    ORDER BY ${orderBy}
+  `);
+
+  return {
+    rows: result.recordset ?? [],
+    lastSeenStockLineRef: null,
+    sinceAt: null,
+    stockLineTable: null,
+    catalogTable: currentConfig.logo.productTable,
+    targeted: true,
+    targetRefs: currentConfig.sync.targetRefs,
+    targetCodes: currentConfig.sync.targetCodes,
+  };
+}
+
+async function fetchIncrementalCatalogProducts(pool, currentConfig, productSchema, productRafSchema) {
+  const modifiedDateColumn = findColumn(productSchema.columns, [
+    "CAPIBLOCK_MODIFIEDDATE",
+    "MODIFIEDDATE",
+    "UPDATED_AT",
+    "UPDATEDAT",
+  ]);
+  const createdDateColumn = findColumn(productSchema.columns, [
+    "CAPIBLOCK_CREATEDDATE",
+    "CREATEDDATE",
+    "CREATED_AT",
+    "CREATEDAT",
+  ]);
+
+  const logicalRefColumn = findColumn(productSchema.columns, ["LOGICALREF"]);
+  const catalogRafRefs =
+    productRafSchema && logicalRefColumn
+      ? await fetchCatalogProductRefs(pool, currentConfig, productRafSchema)
+      : [];
+  if (catalogRafRefs.length > 0) {
+    const source = productRafSchema?.qualifiedName ?? "product raf table";
+    console.log(
+      `[logo-sync] catalog incremental added ${catalogRafRefs.length} product ref(s) from ${source} for shelf-address refresh`
+    );
+  }
+
+  if (!modifiedDateColumn && !createdDateColumn && !logicalRefColumn) {
+    console.warn("[logo-sync] catalog incremental requested but product table has no supported created/modified date or LOGICALREF columns.");
+    return {
+      rows: [],
+      lastSeenStockLineRef: null,
+      sinceAt: null,
+      stockLineTable: null,
+      catalogTable: currentConfig.logo.productTable,
+    };
+  }
+
+  const lookbackMinutes = Math.max(1, currentConfig.sync.catalogLookbackMinutes);
+  const sinceAt = new Date(Date.now() - lookbackMinutes * 60_000);
+  const filters = [];
+
+  if (modifiedDateColumn) {
+    filters.push(`p.${modifiedDateColumn} >= @sinceAt`);
+  }
+
+  if (createdDateColumn) {
+    filters.push(`p.${createdDateColumn} >= @sinceAt`);
+  }
+
+  if (catalogRafRefs.length > 0 && logicalRefColumn) {
+    filters.push(`p.${logicalRefColumn} IN (${catalogRafRefs.join(", ")})`);
+  }
+
+  const cardTypeFilter =
+    currentConfig.logo.productCardTypes.length > 0 && productSchema.columnSet.has("CARDTYPE")
+      ? `AND p.CARDTYPE IN (${currentConfig.logo.productCardTypes.join(", ")})`
+      : "";
+  const recentLimit = Math.max(0, currentConfig.sync.catalogRecentLimit);
+  if (logicalRefColumn && recentLimit > 0) {
+    const recentCardTypeFilter =
+      currentConfig.logo.productCardTypes.length > 0 && productSchema.columnSet.has("CARDTYPE")
+        ? `AND q.CARDTYPE IN (${currentConfig.logo.productCardTypes.join(", ")})`
+        : "";
+    filters.push(`p.${logicalRefColumn} IN (
+      SELECT TOP (${recentLimit}) q.${logicalRefColumn}
+      FROM ${currentConfig.logo.productTable} q
+      WHERE q.${logicalRefColumn} IS NOT NULL
+        ${recentCardTypeFilter}
+      ORDER BY q.${logicalRefColumn} DESC
+    )`);
+  }
+
+  const rollingSelection =
+    logicalRefColumn && Math.max(0, currentConfig.sync.catalogRollingLimit) > 0
+      ? await fetchRollingCatalogLogicalRefs(
+          pool,
+          currentConfig,
+          productSchema,
+          logicalRefColumn
+        )
+      : null;
+  if (rollingSelection?.refs?.length > 0) {
+    filters.push(`p.${logicalRefColumn} IN (${rollingSelection.refs.join(", ")})`);
+  }
+
+  if (filters.length === 0) {
+    console.warn("[logo-sync] catalog incremental requested but no usable catalog change filter could be built.");
+    return {
+      rows: [],
+      lastSeenStockLineRef: null,
+      sinceAt: null,
+      stockLineTable: null,
+      catalogTable: currentConfig.logo.productTable,
+    };
+  }
+
+  const orderBy = logicalRefColumn
+    ? `p.${logicalRefColumn} ASC`
+    : `COALESCE(p.${modifiedDateColumn ?? createdDateColumn}, p.${createdDateColumn ?? modifiedDateColumn}) ASC`;
+
+  const result = await pool
+    .request()
+    .input("sinceAt", sql.DateTime2, sinceAt)
+    .query(`
+      SELECT p.*
+      FROM ${currentConfig.logo.productTable} p
+      WHERE (${filters.join(" OR ")})
+        ${cardTypeFilter}
+      ORDER BY ${orderBy}
+    `);
+
+  return {
+    rows: result.recordset ?? [],
+    lastSeenStockLineRef: null,
+    sinceAt: sinceAt.toISOString(),
+    stockLineTable: null,
+    catalogTable: currentConfig.logo.productTable,
+    catalogRolling: rollingSelection,
+    catalogRafRefs,
+  };
+}
+
+async function fetchCatalogProductRefs(pool, currentConfig, productRafSchema) {
+  const referenceColumn = findColumn(productRafSchema.columns, [
+    "PARLOGREF",
+    "ITEMREF",
+    "CARDREF",
+    "STOCKREF",
+    "PRODUCTREF",
+    "INFOREF",
+    "LOGICALREF",
+  ]);
+
+  if (!referenceColumn) {
+    return [];
+  }
+
+  const modifiedDateColumn = findColumn(productRafSchema.columns, [
+    "CAPIBLOCK_MODIFIEDDATE",
+    "MODIFIEDDATE",
+    "UPDATED_AT",
+    "UPDATEDAT",
+    "UPDATE_DATE",
+  ]);
+  const createdDateColumn = findColumn(productRafSchema.columns, [
+    "CAPIBLOCK_CREATEDDATE",
+    "CREATEDDATE",
+    "CREATED_AT",
+    "CREATEDAT",
+  ]);
+  const recentLimit = Math.max(1, currentConfig.sync.catalogRecentLimit);
+  const lookbackMinutes = Math.max(1, currentConfig.sync.catalogLookbackMinutes);
+  const sinceAt = new Date(Date.now() - lookbackMinutes * 60_000);
+
+  const dateFilter = modifiedDateColumn || createdDateColumn;
+  if (dateFilter) {
+    const result = await pool
+      .request()
+      .input("sinceAt", sql.DateTime2, sinceAt)
+      .query(`
+        SELECT ${referenceColumn} AS product_ref
+        FROM ${productRafSchema.qualifiedName}
+        WHERE ${referenceColumn} IS NOT NULL
+          AND (
+            ${modifiedDateColumn ? `COALESCE(${modifiedDateColumn}, ${createdDateColumn ?? "NULL"}) >= @sinceAt` : ""}
+            ${modifiedDateColumn && createdDateColumn ? " OR " : ""}
+            ${!modifiedDateColumn && createdDateColumn ? `${createdDateColumn} >= @sinceAt` : ""}
+          )
+      `);
+
+    return dedupeNumericRefs(result.recordset ?? []);
+  }
+
+  const result = await pool.request().query(`
+    SELECT TOP (${recentLimit}) ${referenceColumn} AS product_ref
+    FROM ${productRafSchema.qualifiedName}
+    WHERE ${referenceColumn} IS NOT NULL
+    ORDER BY ${referenceColumn} DESC
+  `);
+
+  return dedupeNumericRefs(result.recordset ?? []);
+}
+
+function dedupeNumericRefs(rows) {
+  const seen = new Set();
+  const refs = [];
+
+  for (const row of rows) {
+    const value = normalizeInteger(row.product_ref);
+    if (value === null) {
+      continue;
+    }
+    const key = String(value);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    refs.push(value);
+  }
+
+  return refs;
+}
+
+async function fetchRollingCatalogLogicalRefs(pool, currentConfig, productSchema, logicalRefColumn) {
+  const limit = Math.max(0, currentConfig.sync.catalogRollingLimit);
+  if (limit <= 0) {
+    return null;
+  }
+
+  const state = loadSyncState(currentConfig.sync.catalogStateFile) ?? {};
+  const lastSeenLogicalRef = Math.max(0, normalizeInteger(state.last_seen_logical_ref) ?? 0);
+  const cardTypeFilter =
+    currentConfig.logo.productCardTypes.length > 0 && productSchema.columnSet.has("CARDTYPE")
+      ? `AND CARDTYPE IN (${currentConfig.logo.productCardTypes.join(", ")})`
+      : "";
+
+  let refs = await fetchRollingCatalogRefsAfter(
+    pool,
+    currentConfig,
+    logicalRefColumn,
+    cardTypeFilter,
+    lastSeenLogicalRef,
+    limit
+  );
+  let wrapped = false;
+
+  if (refs.length === 0 && lastSeenLogicalRef > 0) {
+    refs = await fetchRollingCatalogRefsAfter(
+      pool,
+      currentConfig,
+      logicalRefColumn,
+      cardTypeFilter,
+      0,
+      limit
+    );
+    wrapped = true;
+  }
+
+  const nextLogicalRef = refs.reduce((max, value) => Math.max(max, value), wrapped ? 0 : lastSeenLogicalRef);
+
+  return {
+    refs,
+    lastSeenLogicalRef,
+    nextLogicalRef,
+    limit,
+    wrapped,
+  };
+}
+
+function saveCatalogRollingState(currentConfig, rollingSelection) {
+  saveSyncState(currentConfig.sync.catalogStateFile, {
+    last_seen_logical_ref: rollingSelection.nextLogicalRef,
+    previous_seen_logical_ref: rollingSelection.lastSeenLogicalRef,
+    limit: rollingSelection.limit,
+    wrapped: rollingSelection.wrapped,
+    selected_count: rollingSelection.refs?.length ?? 0,
+    updated_at: new Date().toISOString(),
+    product_table: currentConfig.logo.productTable,
+  });
+}
+
+async function fetchRollingCatalogRefsAfter(pool, currentConfig, logicalRefColumn, cardTypeFilter, afterRef, limit) {
+  const result = await pool
+    .request()
+    .input("afterRef", sql.Int, afterRef)
+    .query(`
+      SELECT TOP (${limit}) ${logicalRefColumn} AS logical_ref
+      FROM ${currentConfig.logo.productTable}
+      WHERE ${logicalRefColumn} IS NOT NULL
+        AND ${logicalRefColumn} > @afterRef
+        ${cardTypeFilter}
+      ORDER BY ${logicalRefColumn} ASC
+    `);
+
+  return (result.recordset ?? [])
+    .map((row) => normalizeInteger(row.logical_ref))
+    .filter((value) => value !== null);
+}
+
+async function fetchIncrementalStockProducts(pool, currentConfig, productSchema) {
+  const stockLineSchema = await resolveOptionalTableSchema(
+    pool,
+    currentConfig,
+    "stockLineTable",
+    "stock line",
+    derivePrimaryStockMovementTableNames(currentConfig.logo.productTable)
+  );
+
+  if (!stockLineSchema) {
+    console.warn("[logo-sync] stock fast incremental requested but stock line table was not found.");
+    return { rows: [], lastSeenStockLineRef: null, sinceAt: null, stockLineTable: null };
+  }
+
+  const productRefColumn = findColumn(stockLineSchema.columns, [
+    "STOCKREF",
+    "ITEMREF",
+    "CARDREF",
+    "PRODUCTREF",
+  ]);
+  const lineRefColumn = findColumn(stockLineSchema.columns, ["LOGICALREF"]);
+  const lineDateColumn = findColumn(stockLineSchema.columns, ["DATE_", "DATE", "TRDATE"]);
+  const lineFtimeColumn = findColumn(stockLineSchema.columns, ["FTIME"]);
+  const ficheRefColumn = findColumn(stockLineSchema.columns, ["STFICHEREF"]);
+  const productLogicalRefColumn = findColumn(productSchema.columns, ["LOGICALREF"]);
+
+  if (!productRefColumn || !productLogicalRefColumn) {
+    console.warn("[logo-sync] stock fast incremental skipped; stock line or product table is missing reference columns.");
+    return {
+      rows: [],
+      lastSeenStockLineRef: null,
+      sinceAt: null,
+      stockLineTable: stockLineSchema.qualifiedName,
+    };
+  }
+
+  let ficheSchema = null;
+  let ficheDateColumn = null;
+  let ficheFtimeColumn = null;
+  let joinFicheSql = "";
+
+  if (!lineDateColumn && ficheRefColumn) {
+    ficheSchema = await resolveOptionalTableSchema(
+      pool,
+      currentConfig,
+      "stockFicheTable",
+      "stock fiche",
+      derivePrimaryStockFicheTableNames()
+    );
+    ficheDateColumn = ficheSchema ? findColumn(ficheSchema.columns, ["DATE_", "DATE", "TRDATE"]) : null;
+    ficheFtimeColumn = ficheSchema ? findColumn(ficheSchema.columns, ["FTIME"]) : null;
+    const ficheLogicalRefColumn = ficheSchema ? findColumn(ficheSchema.columns, ["LOGICALREF"]) : null;
+
+    if (ficheSchema && ficheLogicalRefColumn) {
+      joinFicheSql = `LEFT JOIN ${ficheSchema.qualifiedName} sf ON sf.${ficheLogicalRefColumn} = sl.${ficheRefColumn}`;
+    }
+  }
+
+  const eventDateSql = buildStockEventDateSql(
+    lineDateColumn ? "sl" : "sf",
+    lineDateColumn ?? ficheDateColumn,
+    lineFtimeColumn ?? ficheFtimeColumn
+  );
+
+  if (!eventDateSql) {
+    console.warn("[logo-sync] stock fast incremental skipped; DATE_ column was not found on stock line/fiche tables.");
+    return {
+      rows: [],
+      lastSeenStockLineRef: null,
+      sinceAt: null,
+      stockLineTable: stockLineSchema.qualifiedName,
+    };
+  }
+
+  const lookbackMinutes = Math.max(1, currentConfig.sync.stockLookbackMinutes);
+  const sinceAt = new Date(Date.now() - lookbackMinutes * 60_000);
+  const cardTypeFilter =
+    currentConfig.logo.productCardTypes.length > 0 && productSchema.columnSet.has("CARDTYPE")
+      ? `AND p.CARDTYPE IN (${currentConfig.logo.productCardTypes.join(", ")})`
+      : "";
+  const maxLineRefSql = lineRefColumn ? `MAX(sl.${lineRefColumn})` : "NULL";
+
+  const result = await pool
+    .request()
+    .input("sinceAt", sql.DateTime2, sinceAt)
+    .query(`
+      WITH ChangedStock AS (
+        SELECT
+          sl.${productRefColumn} AS product_ref,
+          ${maxLineRefSql} AS last_stock_line_ref
+        FROM ${stockLineSchema.qualifiedName} sl
+        ${joinFicheSql}
+        WHERE sl.${productRefColumn} IS NOT NULL
+          AND ${eventDateSql} >= @sinceAt
+        GROUP BY sl.${productRefColumn}
+      )
+      SELECT p.*, c.last_stock_line_ref
+      FROM ${currentConfig.logo.productTable} p
+      INNER JOIN ChangedStock c ON c.product_ref = p.${productLogicalRefColumn}
+      WHERE 1 = 1
+        ${cardTypeFilter}
+      ORDER BY p.${productLogicalRefColumn} ASC
+    `);
+
+  const rows = result.recordset ?? [];
+  const lastSeenStockLineRef = rows.reduce((max, row) => {
+    const current = normalizeInteger(row.last_stock_line_ref);
+    if (current === null) {
+      return max;
+    }
+
+    return max === null ? current : Math.max(max, current);
+  }, null);
+
+  console.log(
+    `[logo-sync] stock fast incremental selected ${rows.length} changed product(s) since ${sinceAt.toISOString()} from ${stockLineSchema.qualifiedName}`
+  );
+
+  return {
+    rows,
+    lastSeenStockLineRef,
+    sinceAt: sinceAt.toISOString(),
+    stockLineTable: stockLineSchema.qualifiedName,
+  };
+}
+
+function buildStockEventDateSql(alias, dateColumn, ftimeColumn) {
+  if (!alias || !dateColumn) {
+    return "";
+  }
+
+  const baseDate = `CAST(${alias}.${dateColumn} AS datetime2)`;
+  if (!ftimeColumn) {
+    return baseDate;
+  }
+
+  return `DATEADD(second, COALESCE(TRY_CONVERT(int, ${alias}.${ftimeColumn}), 0), ${baseDate})`;
+}
+
 async function fetchStockSnapshot(pool, currentConfig, schema, logicalRefs, warehouseInfoByNo = new Map()) {
   if (logicalRefs.length === 0) {
     return new Map();
@@ -624,6 +1711,16 @@ async function fetchStockSnapshot(pool, currentConfig, schema, logicalRefs, ware
   const remainingRefs = logicalRefs.filter((logicalRef) => !snapshot.has(String(logicalRef)));
   const refsNeedingWarehouseBreakdown = stockRefsNeedingWarehouseBreakdown(logicalRefs, snapshot);
   if (refsNeedingWarehouseBreakdown.length === 0) {
+    return snapshot;
+  }
+
+  if (currentConfig.sync.stockSkipMovementFallback) {
+    if (currentConfig.logo.explicitStockTable && remainingRefs.length > 0) {
+      console.warn(
+        `[logo-sync] stock summary returned no row for ${remainingRefs.length} product(s) on ${currentConfig.logo.explicitStockTable}; movement fallback skipped by config.`
+      );
+    }
+
     return snapshot;
   }
 
@@ -1053,6 +2150,10 @@ function derivePrimaryStockTableNames(productTable) {
   const branchCandidates = directCandidates.flatMap((candidate) => deriveBranch01TableNames(candidate));
   const viewCandidates = [...directCandidates, ...branchCandidates].flatMap((candidate) => deriveLogoStockViewTableNames(candidate));
   return uniqueColumns([...directCandidates, ...branchCandidates, ...viewCandidates]);
+}
+
+function derivePrimaryStockFicheTableNames() {
+  return [logoPeriodTable("STFICHE")];
 }
 
 function deriveLogoStockViewTableNames(stockTable) {
@@ -1491,6 +2592,14 @@ async function fetchProductImages(pool, currentConfig, schema, productRows, prod
 
   const result = await pool.request().query(query);
   const snapshot = new Map();
+  const skuByRef = new Map(
+    productRows
+      .map((row) => [
+        normalizeString(readFirst(row, ["external_ref", "LOGICALREF"])),
+        normalizeString(readFirst(row, ["sku", "code", "CODE"])),
+      ])
+      .filter(([productRef]) => productRef)
+  );
 
   for (const row of result.recordset ?? []) {
     const productRef = normalizeString(row.product_ref);
@@ -1498,16 +2607,46 @@ async function fetchProductImages(pool, currentConfig, schema, productRows, prod
       continue;
     }
 
-    const resolvedImage = resolveImagePayloadValue(
+    const resolvedImage = await resolveImagePayloadValue(
       row.image_blob,
       row.image_path,
-      currentConfig.logo.productImageRoot
+      currentConfig.logo.productImageRoot,
+      currentConfig.logo.productImageBaseUrl,
+      currentConfig
     );
 
     if (!resolvedImage) {
       continue;
     }
 
+    if (resolvedImage.reason) {
+      const sku = skuByRef.get(productRef) ?? null;
+      currentConfig.sync.imageStats.optimized_failed += 1;
+      currentConfig.sync.imageSkippedRefs.add(productRef);
+      appendImageFailed(currentConfig, {
+        product_ref: productRef,
+        sku,
+        original_bytes: resolvedImage.originalBytes ?? null,
+        optimized_bytes: resolvedImage.optimizedBytes ?? null,
+        reason: resolvedImage.reason,
+        table: schema.qualifiedName,
+        ref_column: resolvedColumns.referenceColumn,
+        data_column: resolvedColumns.dataColumn ?? null,
+      });
+      console.warn(
+        `[logo-sync] product image optimize failed product_ref=${productRef} sku=${sku ?? ""} original_bytes=${resolvedImage.originalBytes ?? "unknown"} optimized_bytes=${resolvedImage.optimizedBytes ?? "unknown"} reason=${resolvedImage.reason}`
+      );
+      continue;
+    }
+
+    currentConfig.sync.imageStats.images_found += 1;
+    currentConfig.sync.imageStats.total_original_bytes += resolvedImage.originalBytes ?? 0;
+    currentConfig.sync.imageStats.total_sent_bytes += resolvedImage.sentBytes ?? 0;
+    if (resolvedImage.optimized) {
+      currentConfig.sync.imageStats.optimized_sent += 1;
+    } else {
+      currentConfig.sync.imageStats.originals_sent += 1;
+    }
     snapshot.set(productRef, {
       rawKey: resolvedImage.source === "url" ? "IMAGE_URL" : resolvedImage.source === "path" ? "IMAGE_PATH" : "IMAGE",
       value: resolvedImage.value,
@@ -1635,16 +2774,45 @@ async function fetchProductImagesByCode(
       continue;
     }
 
-    const resolvedImage = resolveImagePayloadValue(
+    const resolvedImage = await resolveImagePayloadValue(
       row.image_blob,
       row.image_path,
-      currentConfig.logo.productImageRoot
+      currentConfig.logo.productImageRoot,
+      currentConfig.logo.productImageBaseUrl,
+      currentConfig
     );
 
     if (!resolvedImage) {
       continue;
     }
 
+    if (resolvedImage.reason) {
+      currentConfig.sync.imageStats.optimized_failed += 1;
+      currentConfig.sync.imageSkippedRefs.add(currentRef);
+      appendImageFailed(currentConfig, {
+        product_ref: currentRef,
+        sku: normalizeString(row.product_code),
+        original_bytes: resolvedImage.originalBytes ?? null,
+        optimized_bytes: resolvedImage.optimizedBytes ?? null,
+        reason: resolvedImage.reason,
+        table: imageSchema.qualifiedName,
+        ref_column: resolvedColumns.referenceColumn,
+        data_column: resolvedColumns.dataColumn ?? null,
+      });
+      console.warn(
+        `[logo-sync] product image optimize failed product_ref=${currentRef} sku=${normalizeString(row.product_code) ?? ""} original_bytes=${resolvedImage.originalBytes ?? "unknown"} optimized_bytes=${resolvedImage.optimizedBytes ?? "unknown"} reason=${resolvedImage.reason}`
+      );
+      continue;
+    }
+
+    currentConfig.sync.imageStats.images_found += 1;
+    currentConfig.sync.imageStats.total_original_bytes += resolvedImage.originalBytes ?? 0;
+    currentConfig.sync.imageStats.total_sent_bytes += resolvedImage.sentBytes ?? 0;
+    if (resolvedImage.optimized) {
+      currentConfig.sync.imageStats.optimized_sent += 1;
+    } else {
+      currentConfig.sync.imageStats.originals_sent += 1;
+    }
     snapshot.set(currentRef, {
       rawKey: resolvedImage.source === "url" ? "IMAGE_URL" : resolvedImage.source === "path" ? "IMAGE_PATH" : "IMAGE",
       value: resolvedImage.value,
@@ -2162,7 +3330,7 @@ function mergeProductCodeAliases(...groups) {
   return aliases;
 }
 
-function mapStockOnlyProductRow(row, schema, stockByRef) {
+function mapStockOnlyProductRow(row, schema, stockByRef, currentConfig = config) {
   const externalRef = normalizeString(readFirst(row, ["external_ref", "LOGICALREF"]));
   const sku = normalizeString(readFirst(row, ["sku", "code", "CODE"]));
 
@@ -2172,6 +3340,11 @@ function mapStockOnlyProductRow(row, schema, stockByRef) {
 
   const rawRecord = extractRawLogoRecord(row, schema.columns);
   const stock = externalRef ? stockByRef.get(externalRef) ?? null : null;
+
+  if (currentConfig.sync.stockRequireSummaryRow && !stock) {
+    return null;
+  }
+
   const rawStockAvailable = normalizeInteger(
     readFirst(row, ["available_total", "AVAILABLE_TOTAL", "ONHAND"])
   );
@@ -2261,6 +3434,23 @@ function mapProductRow(
     (externalRef ? productImagesByRef.get(externalRef) ?? null : null) ??
     resolveProductImageFromMap(sku, imageMap) ??
     resolveProductImageFromFileIndex(sku, imageFileIndex);
+
+  if (config.sync.imagesOnly) {
+    if (!productImage?.value) {
+      return null;
+    }
+
+    return {
+      external_ref: externalRef,
+      sku,
+      meta: {
+        raw: {
+          [productImage.rawKey]: productImage.value,
+        },
+      },
+    };
+  }
+
   const codeAliases = mergeProductCodeAliases(
     externalRef ? codeAliasesByRef.get(externalRef) ?? [] : [],
     extractInlineOemAliases(row),
@@ -2797,13 +3987,32 @@ function findFirstImageDataColumn(columns) {
   return sortAliasColumns(candidates)[0] ?? null;
 }
 
-function resolveImagePayloadValue(blobValue, pathValue, imageRoot) {
-  const normalizedBlob = normalizeImageBlobValue(blobValue);
-  if (normalizedBlob) {
-    return {
-      source: "blob",
-      value: normalizedBlob,
-    };
+function normalizeImageBaseUrl(value) {
+  const baseUrl = normalizeString(value);
+  if (!baseUrl) {
+    return null;
+  }
+
+  return baseUrl.replace(/\/+$/, "");
+}
+
+function resolveLogoImageUrl(imagePath, baseUrl) {
+  const normalizedPath = normalizeString(imagePath);
+  if (!normalizedPath || !baseUrl) {
+    return null;
+  }
+
+  if (/^[A-Za-z]:\\/.test(normalizedPath) || /^\\\\/.test(normalizedPath) || path.isAbsolute(normalizedPath)) {
+    return null;
+  }
+
+  return `${baseUrl}/${normalizedPath.replace(/^[\\/]+/, "").replace(/\\/g, "/")}`;
+}
+
+async function resolveImagePayloadValue(blobValue, pathValue, imageRoot, imageBaseUrl, currentConfig) {
+  const imageBuffer = extractImageBufferFromValue(blobValue);
+  if (imageBuffer) {
+    return optimizeImageBufferForSync(imageBuffer, currentConfig);
   }
 
   const normalizedPath = normalizeString(pathValue) ?? normalizeString(blobValue);
@@ -2818,11 +4027,25 @@ function resolveImagePayloadValue(blobValue, pathValue, imageRoot) {
     };
   }
 
-  if (/^data:image\//i.test(normalizedPath)) {
+  const baseUrl = resolveLogoImageUrl(normalizedPath, imageBaseUrl);
+  if (baseUrl) {
     return {
-      source: "blob",
-      value: normalizedPath,
+      source: "url",
+      value: baseUrl,
     };
+  }
+
+  if (/^data:image\//i.test(normalizedPath)) {
+    const dataBuffer = extractImageBufferFromValue(normalizedPath);
+    if (!dataBuffer) {
+      return {
+        source: "failed",
+        reason: "invalid_image_payload",
+        originalBytes: estimateImageByteLength(normalizedPath),
+      };
+    }
+
+    return optimizeImageBufferForSync(dataBuffer, currentConfig);
   }
 
   const candidatePaths = [];
@@ -2846,15 +4069,12 @@ function resolveImagePayloadValue(blobValue, pathValue, imageRoot) {
         continue;
       }
 
-      const imagePayload = normalizeImageBufferValue(buffer);
-      if (!imagePayload) {
+      const fileImageBuffer = extractImageBuffer(buffer);
+      if (!fileImageBuffer) {
         continue;
       }
 
-      return {
-        source: "path",
-        value: imagePayload,
-      };
+      return optimizeImageBufferForSync(fileImageBuffer, currentConfig, "path");
     } catch (error) {
       console.warn(
         `[logo-sync] failed to read product image file ${candidatePath}: ${error instanceof Error ? error.message : error}`
@@ -3462,6 +4682,180 @@ function normalizeImageBufferValue(buffer) {
   return imageBuffer ? imageBuffer.toString("base64") : null;
 }
 
+let sharpLoader = null;
+
+async function optimizeImageBufferForSync(imageBuffer, currentConfig, source = "blob") {
+  const originalBytes = imageBuffer.length;
+
+  if (
+    !currentConfig.sync.imageOptimize ||
+    (currentConfig.sync.imageAllowOriginalIfSmall &&
+      originalBytes <= currentConfig.sync.imageOriginalMaxBytes)
+  ) {
+    return {
+      source,
+      value: imageBuffer.toString("base64"),
+      originalBytes,
+      sentBytes: originalBytes,
+      optimizedBytes: originalBytes,
+      optimized: false,
+    };
+  }
+
+  let optimizedBuffer = null;
+  try {
+    optimizedBuffer = await optimizeImageBufferWithSharp(imageBuffer, currentConfig);
+  } catch (error) {
+    return {
+      source: "failed",
+      reason: "optimize_failed",
+      originalBytes,
+      optimizedBytes: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (!optimizedBuffer || optimizedBuffer.length === 0) {
+    return {
+      source: "failed",
+      reason: "optimize_failed",
+      originalBytes,
+      optimizedBytes: null,
+    };
+  }
+
+  if (
+    currentConfig.sync.imageTargetMaxBytes > 0 &&
+    optimizedBuffer.length > currentConfig.sync.imageTargetMaxBytes
+  ) {
+    return {
+      source: "failed",
+      reason: "optimize_failed",
+      originalBytes,
+      optimizedBytes: optimizedBuffer.length,
+    };
+  }
+
+  return {
+    source,
+    value: optimizedBuffer.toString("base64"),
+    originalBytes,
+    sentBytes: optimizedBuffer.length,
+    optimizedBytes: optimizedBuffer.length,
+    optimized: true,
+  };
+}
+
+async function optimizeImageBufferWithSharp(imageBuffer, currentConfig) {
+  const sharp = await loadSharp();
+  const format = String(currentConfig.sync.imageOutputFormat ?? "jpeg").toLowerCase();
+  const maxWidth = Math.max(1, currentConfig.sync.imageMaxWidth);
+  const baseQuality = clampInteger(currentConfig.sync.imageJpegQuality, 1, 100, 80);
+  const qualitySteps = uniqueColumns([baseQuality, 70, 60].filter((quality) => quality > 0));
+  let bestBuffer = null;
+
+  for (const quality of qualitySteps) {
+    let pipeline = sharp(imageBuffer, { failOn: "none" })
+      .rotate()
+      .resize({ width: maxWidth, withoutEnlargement: true });
+
+    if (format === "webp") {
+      pipeline = pipeline.webp({ quality });
+    } else if (format === "png") {
+      pipeline = pipeline.png({ compressionLevel: 9 });
+    } else {
+      pipeline = pipeline.jpeg({ quality, mozjpeg: true });
+    }
+
+    const candidate = await pipeline.toBuffer();
+    if (!bestBuffer || candidate.length < bestBuffer.length) {
+      bestBuffer = candidate;
+    }
+
+    if (currentConfig.sync.imageTargetMaxBytes <= 0 || candidate.length <= currentConfig.sync.imageTargetMaxBytes) {
+      return candidate;
+    }
+  }
+
+  return bestBuffer;
+}
+
+async function loadSharp() {
+  if (!sharpLoader) {
+    sharpLoader = import("sharp").then((mod) => mod.default ?? mod);
+  }
+
+  return sharpLoader;
+}
+
+function extractImageBufferFromValue(value) {
+  if (Buffer.isBuffer(value)) {
+    return extractImageBuffer(value);
+  }
+
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const dataImageMatch = normalized.match(/^data:image\/[^;]+;base64,(.+)$/i);
+  if (dataImageMatch) {
+    return Buffer.from(dataImageMatch[1], "base64");
+  }
+
+  if (/^[A-Za-z0-9+/=\r\n]+$/.test(normalized) && normalized.length > 128) {
+    return extractImageBuffer(Buffer.from(normalized.replace(/\s+/g, ""), "base64"));
+  }
+
+  return null;
+}
+
+function clampInteger(value, min, max, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function isImageTooLarge(imageBytes, maxBytes) {
+  return Number.isFinite(imageBytes) && Number.isFinite(maxBytes) && maxBytes > 0 && imageBytes > maxBytes;
+}
+
+function estimateImageByteLength(value) {
+  if (Buffer.isBuffer(value)) {
+    const imageBuffer = extractImageBuffer(value);
+    return imageBuffer?.length ?? value.length;
+  }
+
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const dataImageMatch = normalized.match(/^data:image\/[^;]+;base64,(.+)$/i);
+  if (dataImageMatch) {
+    return estimateBase64ByteLength(dataImageMatch[1]);
+  }
+
+  if (/^[A-Za-z0-9+/=\r\n]+$/.test(normalized) && normalized.length > 128) {
+    return estimateBase64ByteLength(normalized);
+  }
+
+  return Buffer.byteLength(normalized, "utf8");
+}
+
+function estimateBase64ByteLength(value) {
+  const compact = String(value ?? "").replace(/\s+/g, "");
+  if (compact.length === 0) {
+    return 0;
+  }
+
+  const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
+}
+
 function extractImageBuffer(buffer) {
   if (detectImageMimeFromBuffer(buffer)) {
     return buffer;
@@ -3570,6 +4964,38 @@ function detectImageMimeFromBuffer(buffer) {
   return null;
 }
 
+async function pushBatchWithRetry(records, currentConfig) {
+  const maxRetries = Number.parseInt(currentConfig.sync.retryMax, 10);
+  const baseDelayMs = Number.parseInt(currentConfig.sync.retryBaseDelayMs, 10);
+  let retryCount = 0;
+
+  while (true) {
+    try {
+      const result = await pushBatch(records, currentConfig);
+      return {
+        retryCount,
+        status: result.status,
+        responsePreview: result.responsePreview,
+      };
+    } catch (error) {
+      const syncError = ensureSyncError(error);
+      syncError.retryCount = retryCount;
+
+      if (retryCount >= (Number.isFinite(maxRetries) ? maxRetries : 0) || !isRetryableError(syncError)) {
+        throw syncError;
+      }
+
+      retryCount += 1;
+      const delayMs = Math.max(1, (Number.isFinite(baseDelayMs) ? baseDelayMs : 3000)) * (2 ** (retryCount - 1));
+      appendSyncLog(
+        resolveLogFilePath(currentConfig.sync.logDir),
+        `[logo-sync] retrying batch request after failure status=${syncError.httpStatus ?? "n/a"} error=${syncError.message}; retry=${retryCount}/${maxRetries} delay_ms=${delayMs}`
+      );
+      await waitMs(delayMs);
+    }
+  }
+}
+
 async function pushBatch(records, currentConfig) {
   const payload = {
     records,
@@ -3580,31 +5006,123 @@ async function pushBatch(records, currentConfig) {
     payload.stock_only = true;
   }
 
+  if (currentConfig.sync.imagesOnly) {
+    payload.mode = "images_only";
+    payload.images_only = true;
+  }
+
   if (currentConfig.sync.priceListCode) {
     payload.price_list_code = currentConfig.sync.priceListCode;
   }
 
-  const response = await fetch(currentConfig.sync.url, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-      "x-integration-key": currentConfig.sync.key,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const contentType = response.headers.get("content-type") ?? "";
-    const body = contentType.includes("application/json")
-      ? JSON.stringify(await response.json())
-      : await response.text();
-
-    throw new Error(`sync endpoint returned ${response.status}: ${body}`);
+  let response;
+  try {
+    response = await fetch(currentConfig.sync.url, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-integration-key": currentConfig.sync.key,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    throw buildSyncError(error, {
+      stage: "request",
+      httpStatus: null,
+    });
   }
 
-  const body = await response.json();
-  console.log("[logo-sync] sync response:", JSON.stringify(body.summary ?? body));
+  const contentType = response.headers.get("content-type") ?? "";
+  const rawBody = await response.text();
+  const parsedBody = contentType.includes("application/json") ? parseMaybeJson(rawBody) : rawBody;
+  const responsePreview = typeof parsedBody === "string" ? parsedBody : JSON.stringify(parsedBody ?? {});
+  const preview = responsePreview.slice(0, 1024);
+
+  if (!response.ok) {
+    throw buildSyncError(new Error(`sync endpoint returned ${response.status}`), {
+      httpStatus: response.status,
+      responsePreview: preview,
+    });
+  }
+
+  console.log("[logo-sync] sync response:", preview);
+
+  return {
+    status: response.status,
+    responsePreview: preview,
+    body: parsedBody,
+  };
+}
+
+function isRetryableError(error) {
+  const retryableStatuses = [408, 429, 500, 502, 503, 504];
+  const retryableCodes = ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN"];
+  const code = normalizeString(error.code) ?? normalizeString(error.cause?.code) ?? normalizeString(error.cause?.errno);
+  const status = normalizeInteger(error.httpStatus ?? error.status);
+  const message = normalizeString(error.message) ?? "";
+
+  if (Number.isFinite(status) && retryableStatuses.includes(status)) {
+    return true;
+  }
+
+  if (code && retryableCodes.includes(code.toUpperCase())) {
+    return true;
+  }
+
+  if (message?.toLowerCase().includes("fetch failed")) {
+    return true;
+  }
+
+  return false;
+}
+
+function buildSyncError(error, options = {}) {
+  if (error instanceof Error) {
+    if (Number.isFinite(Number.parseInt(error.httpStatus, 10))) {
+      error.httpStatus = Number.parseInt(error.httpStatus, 10);
+    }
+    if (!error.httpStatus && Number.isFinite(Number.parseInt(options.httpStatus, 10))) {
+      error.httpStatus = Number.parseInt(options.httpStatus, 10);
+    }
+    if (!error.responsePreview && options.responsePreview) {
+      error.responsePreview = options.responsePreview;
+    }
+    error.retryContext = options;
+    return error;
+  }
+
+  const syncError = new Error(
+    normalizeString(error?.message) ?? normalizeString(error) ?? "product batch request failed"
+  );
+  if (Number.isFinite(Number.parseInt(options.httpStatus, 10))) {
+    syncError.httpStatus = Number.parseInt(options.httpStatus, 10);
+  }
+  if (options.responsePreview) {
+    syncError.responsePreview = options.responsePreview;
+  }
+  syncError.retryContext = options;
+  return syncError;
+}
+
+function ensureSyncError(error) {
+  if (error instanceof Error) {
+    return error;
+  }
+
+  return buildSyncError(error);
+}
+
+function parseMaybeJson(rawBody) {
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    return rawBody;
+  }
+}
+
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function chunk(items, size) {

@@ -54,6 +54,36 @@ class ReturnRequestApiTest extends TestCase
             ->assertJsonPath('data.0.customer.id', $customer->id);
     }
 
+    public function test_point_user_with_returns_permission_can_create_and_list_return_request(): void
+    {
+        [$user, $order, $orderItem, $customer] = $this->createOrderContext('point', [
+            'menu_permissions' => ['dashboard', 'orders', 'returns'],
+        ]);
+
+        $this->actingAs($user);
+
+        $createResponse = $this->postJson('/api/returns', [
+            'order_id' => $order->id,
+            'order_item_id' => $orderItem->id,
+            'request_type' => 'return',
+            'reason_code' => 'wrong_product_sent',
+            'reason_note' => 'Kasadan iade talebi girildi.',
+            'quantity' => 1,
+        ]);
+
+        $createResponse
+            ->assertCreated()
+            ->assertJsonPath('data.request_type', 'return')
+            ->assertJsonPath('data.status', 'submitted')
+            ->assertJsonPath('data.customer.id', $customer->id);
+
+        $this
+            ->getJson('/api/returns?limit=10')
+            ->assertOk()
+            ->assertJsonPath('summary.total_count', 1)
+            ->assertJsonPath('data.0.customer.id', $customer->id);
+    }
+
     public function test_return_request_quantity_cannot_exceed_order_item_quantity(): void
     {
         [$user, $order, $orderItem] = $this->createOrderContext('salesperson');
@@ -219,6 +249,109 @@ class ReturnRequestApiTest extends TestCase
         ]);
     }
 
+    public function test_completed_return_does_not_requeue_synced_logo_exports(): void
+    {
+        config(['integrations.logo.return_sync_key' => 'return-sync-key']);
+
+        [$user, $order, $orderItem] = $this->createOrderContext('salesperson');
+
+        $this->actingAs($user);
+
+        $createResponse = $this->postJson('/api/returns', [
+            'order_id' => $order->id,
+            'order_item_id' => $orderItem->id,
+            'request_type' => 'faulty',
+            'reason_code' => 'defective_on_arrival',
+            'quantity' => 1,
+        ]);
+
+        $requestId = (int) $createResponse->json('data.id');
+
+        $this
+            ->patchJson("/api/returns/{$requestId}/status", [
+                'status' => 'approved',
+                'resolution_note' => 'Logo aktarımı için onaylandı.',
+            ])
+            ->assertOk()
+            ->assertJsonPath('data.logo_sync_status', 'queued')
+            ->assertJsonPath('data.scrap_logo_sync_status', 'queued');
+
+        $this
+            ->withHeader('X-Integration-Key', 'return-sync-key')
+            ->postJson('/api/integrations/logo/returns/ack', [
+                'records' => [
+                    [
+                        'return_request_id' => $requestId,
+                        'status' => 'synced',
+                        'external_ref' => 'RETURN-LOGO-001',
+                    ],
+                ],
+            ])
+            ->assertOk()
+            ->assertJsonPath('summary.synced', 1);
+
+        $this
+            ->withHeader('X-Integration-Key', 'return-sync-key')
+            ->postJson('/api/integrations/logo/return-scraps/ack', [
+                'records' => [
+                    [
+                        'return_request_id' => $requestId,
+                        'status' => 'synced',
+                        'external_ref' => 'SCRAP-LOGO-001',
+                    ],
+                ],
+            ])
+            ->assertOk()
+            ->assertJsonPath('summary.synced', 1);
+
+        $this
+            ->patchJson("/api/returns/{$requestId}/status", [
+                'status' => 'completed',
+                'resolution_note' => 'Logo aktarımı tamamlandı.',
+            ])
+            ->assertOk()
+            ->assertJsonPath('data.status', ReturnRequest::STATUS_COMPLETED)
+            ->assertJsonPath('data.logo_sync_status', 'synced')
+            ->assertJsonPath('data.logo_external_ref', 'RETURN-LOGO-001')
+            ->assertJsonPath('data.scrap_logo_sync_status', 'synced')
+            ->assertJsonPath('data.scrap_logo_external_ref', 'SCRAP-LOGO-001');
+    }
+
+    public function test_completed_return_without_existing_logo_state_queues_exports(): void
+    {
+        [$user, $order, $orderItem] = $this->createOrderContext('salesperson');
+
+        $this->actingAs($user);
+
+        $createResponse = $this->postJson('/api/returns', [
+            'order_id' => $order->id,
+            'order_item_id' => $orderItem->id,
+            'request_type' => 'faulty',
+            'reason_code' => 'defective_on_arrival',
+            'quantity' => 1,
+        ]);
+
+        $requestId = (int) $createResponse->json('data.id');
+
+        $this
+            ->patchJson("/api/returns/{$requestId}/status", [
+                'status' => 'reviewing',
+            ])
+            ->assertOk()
+            ->assertJsonPath('data.logo_sync_status', null)
+            ->assertJsonPath('data.scrap_logo_sync_status', null);
+
+        $this
+            ->patchJson("/api/returns/{$requestId}/status", [
+                'status' => 'completed',
+                'resolution_note' => 'Doğrudan tamamlandı.',
+            ])
+            ->assertOk()
+            ->assertJsonPath('data.status', ReturnRequest::STATUS_COMPLETED)
+            ->assertJsonPath('data.logo_sync_status', 'queued')
+            ->assertJsonPath('data.scrap_logo_sync_status', 'queued');
+    }
+
     public function test_dealer_admin_cannot_update_return_request_status(): void
     {
         [$user, $order, $orderItem] = $this->createOrderContext('dealer_admin');
@@ -245,10 +378,10 @@ class ReturnRequestApiTest extends TestCase
     /**
      * @return array{0: User, 1: Order, 2: OrderItem, 3: Customer}
      */
-    private function createOrderContext(string $roleSlug): array
+    private function createOrderContext(string $roleSlug, array $userOverrides = []): array
     {
         $dealer = $this->createDealer('DLR-RET-'.Str::upper(Str::random(4)));
-        $user = $this->createUserWithRole($roleSlug, $dealer);
+        $user = $this->createUserWithRole($roleSlug, $dealer, $userOverrides);
         $customer = $this->createCustomer(
             $dealer,
             'RET-001',
@@ -323,17 +456,17 @@ class ReturnRequestApiTest extends TestCase
         ]);
     }
 
-    private function createUserWithRole(string $roleSlug, ?Dealer $dealer = null): User
+    private function createUserWithRole(string $roleSlug, ?Dealer $dealer = null, array $overrides = []): User
     {
         $role = Role::query()->firstOrCreate(
             ['slug' => $roleSlug],
             ['name' => Str::headline(str_replace('_', ' ', $roleSlug))]
         );
 
-        $user = User::factory()->create([
+        $user = User::factory()->create(array_merge([
             'dealer_id' => $dealer?->id,
             'is_active' => true,
-        ]);
+        ], $overrides));
 
         $user->roles()->sync([$role->id]);
 

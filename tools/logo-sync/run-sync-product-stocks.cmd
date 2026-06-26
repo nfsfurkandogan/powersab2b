@@ -15,7 +15,12 @@ if not exist node_modules (
 )
 
 set "SYNC_PRODUCTS_STOCK_ONLY=true"
-if "%SYNC_BATCH_SIZE%"=="" set "SYNC_BATCH_SIZE=500"
+set "SYNC_PRODUCTS_IMAGES_ONLY=false"
+set "SYNC_RESUME=true"
+if "%SYNC_BATCH_SIZE%"=="" set "SYNC_BATCH_SIZE=100"
+if "%SYNC_RETRY_MAX%"=="" set "SYNC_RETRY_MAX=3"
+if "%SYNC_RETRY_BASE_DELAY_MS%"=="" set "SYNC_RETRY_BASE_DELAY_MS=3000"
+if "%SYNC_CONTINUE_ON_ERROR%"=="" set "SYNC_CONTINUE_ON_ERROR=false"
 if "%LOGO_STOCK_TABLE%"=="" set "LOGO_STOCK_TABLE=dbo.LV_003_01_STINVTOT"
 if "%POWERSA_PRODUCTS_SYNC_URL%"=="" set "POWERSA_PRODUCTS_SYNC_URL=https://powersab2b.com/backend/api/integrations/logo/products/sync"
 

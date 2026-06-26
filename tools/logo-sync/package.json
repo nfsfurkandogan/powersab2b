@@ -12,6 +12,7 @@
     "sync:pos-sales": "node logo-pos-sales-export.mjs",
     "sync:pos-expenses": "node logo-pos-expenses-export.mjs",
     "sync:documents-export": "node logo-documents-export.mjs",
+    "sync:shipment-immediate-bridge": "node logo-shipment-immediate-bridge.mjs",
     "sync:all": "node logo-sync-all.mjs",
     "sync:daemon": "node logo-sync-daemon.mjs",
     "sync:doctor": "node logo-sync-doctor.mjs",
@@ -20,6 +21,7 @@
   },
   "dependencies": {
     "dotenv": "^16.6.1",
-    "mssql": "^11.0.1"
+    "mssql": "^11.0.1",
+    "sharp": "^0.34.5"
   }
 }

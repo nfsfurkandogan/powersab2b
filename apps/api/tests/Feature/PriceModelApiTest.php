@@ -326,6 +326,69 @@ class PriceModelApiTest extends TestCase
             ->assertJsonPath('items.0.unit_price', '147.90');
     }
 
+    public function test_cart_response_includes_logo_integration_readiness_summary(): void
+    {
+        $dealer = $this->createDealer('DLR-PRC-CART-LOGO');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        [$customer, $product] = $this->createCustomerAndProduct($dealer, $user);
+
+        $customer->forceFill([
+            'source_system' => 'logo',
+            'source_reference' => 'CUST-LOGO-REF',
+            'last_synced_at' => '2026-06-22 20:30:00',
+        ])->save();
+
+        $product->forceFill([
+            'meta' => [
+                'integrations' => [
+                    'logo' => [
+                        'synced_at' => '2026-06-22T21:10:00+03:00',
+                        'external_ref' => 'ITEM-LOGO-REF',
+                        'payload' => [
+                            'raw' => [
+                                'SPECODE4' => 'E',
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])->save();
+
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+        $dealer->update(['price_list_id' => $priceListId]);
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 100.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $cartResponse = $this->postJson('/api/cart/items', [
+            'customer_id' => $customer->id,
+            'product_id' => $product->id,
+            'quantity' => 2,
+        ]);
+
+        $cartResponse
+            ->assertOk()
+            ->assertJsonPath('logo_integration.customer_ready', true)
+            ->assertJsonPath('logo_integration.items_total', 1)
+            ->assertJsonPath('logo_integration.items_ready', 1)
+            ->assertJsonPath('logo_integration.items_missing', 0)
+            ->assertJsonPath('logo_integration.order_will_queue', true)
+            ->assertJsonPath('logo_integration.latest_product_synced_at', '2026-06-22T21:10:00+03:00')
+            ->assertJsonPath('logo_integration.customer_last_synced_at', '2026-06-22T20:30:00.000000Z');
+
+        $this->getJson('/api/cart?customer_id='.$customer->id)
+            ->assertOk()
+            ->assertJsonPath('logo_integration.order_will_queue', true)
+            ->assertJsonPath('logo_integration.items_ready', 1);
+    }
+
     public function test_products_search_applies_price_list_discount_rate_over_base_price(): void
     {
         $dealer = $this->createDealer('DLR-PRC-004');

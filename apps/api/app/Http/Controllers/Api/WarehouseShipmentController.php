@@ -3,11 +3,13 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Warehouse\AddShipmentItemRequest;
 use App\Http\Requests\Warehouse\CancelShipmentRequest;
 use App\Http\Requests\Warehouse\CreateShipmentRequest;
 use App\Http\Requests\Warehouse\FinalizeShipmentRequest;
 use App\Http\Requests\Warehouse\ReturnShipmentItemRequest;
 use App\Http\Requests\Warehouse\ScanShipmentRequest;
+use App\Http\Requests\Warehouse\UpdateShipmentItemQuantityRequest;
 use App\Http\Resources\Warehouse\ShipmentStateResource;
 use App\Models\Shipment;
 use App\Models\User;
@@ -125,6 +127,49 @@ class WarehouseShipmentController extends Controller
                 'item_id' => (int) $request->integer('item_id'),
                 'qty' => $request->filled('qty') ? (int) $request->integer('qty') : null,
             ]
+        );
+
+        return response()->json(['data' => new ShipmentStateResource($state)]);
+    }
+
+    public function returnAllItems(
+        Request $request,
+        Shipment $shipment,
+        WarehouseShipmentService $service
+    ): JsonResponse {
+        $state = $service->returnAllShipmentItems(
+            user: $request->user(),
+            shipment: $shipment
+        );
+
+        return response()->json(['data' => new ShipmentStateResource($state)]);
+    }
+
+    public function addItem(
+        AddShipmentItemRequest $request,
+        Shipment $shipment,
+        WarehouseShipmentService $service
+    ): JsonResponse {
+        $state = $service->addShipmentItem(
+            user: $request->user(),
+            shipment: $shipment,
+            payload: $request->validated()
+        );
+
+        return response()->json(['data' => new ShipmentStateResource($state)]);
+    }
+
+    public function updateItemQuantity(
+        UpdateShipmentItemQuantityRequest $request,
+        Shipment $shipment,
+        int $item,
+        WarehouseShipmentService $service
+    ): JsonResponse {
+        $state = $service->updateShipmentItemQuantity(
+            user: $request->user(),
+            shipment: $shipment,
+            itemId: $item,
+            quantity: (int) $request->integer('quantity')
         );
 
         return response()->json(['data' => new ShipmentStateResource($state)]);

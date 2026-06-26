@@ -1,22 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { LucideIcon } from "lucide-react";
 import {
   Activity,
   ArrowRight,
   BarChart3,
-  CalendarDays,
   FileDown,
   FileSpreadsheet,
-  FileText,
   Loader2,
-  PieChart,
   RefreshCcw,
   RotateCcw,
   ShoppingCart,
   TrendingUp,
-  Users,
   Wallet,
 } from "lucide-react";
 
@@ -29,7 +24,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import {
   getReportCollections,
@@ -38,9 +32,11 @@ import {
   getReportSales,
   type ReportQueueResponse,
 } from "@/lib/api";
+import { useSession } from "@/components/auth/session-provider";
 
 type ReportKey = "customer" | "order" | "collection" | "sales";
 type ReportPayload = Record<string, unknown> | null;
+type CustomerFilterOption = { id: number; label: string };
 
 const REPORT_KEYS: ReportKey[] = ["customer", "order", "collection", "sales"];
 
@@ -58,45 +54,6 @@ function currentMonthRange() {
     to: toDateInputValue(today),
   };
 }
-
-const REPORT_META: Record<
-  ReportKey,
-	  {
-	    title: string;
-	    icon: LucideIcon;
-	    tileClassName: string;
-	    iconClassName: string;
-	  }
-	> = {
-	  customer: {
-	    title: "Cari Bakiye Durumları",
-	    icon: Wallet,
-	    tileClassName:
-	      "border-emerald-300/40 bg-[radial-gradient(circle_at_18%_16%,rgba(166,230,178,0.34),transparent_38%),linear-gradient(145deg,rgba(8,38,25,0.96),rgba(28,91,60,0.9))]",
-	    iconClassName: "bg-emerald-300/20 text-emerald-200",
-	  },
-	  order: {
-	    title: "Sipariş Bakiye Durumları",
-	    icon: ShoppingCart,
-	    tileClassName:
-	      "border-sky-300/40 bg-[radial-gradient(circle_at_18%_16%,rgba(125,211,252,0.34),transparent_38%),linear-gradient(145deg,rgba(9,31,55,0.96),rgba(20,83,128,0.88))]",
-	    iconClassName: "bg-sky-300/20 text-sky-100",
-	  },
-	  collection: {
-	    title: "Tahsilat Raporu",
-	    icon: FileText,
-	    tileClassName:
-	      "border-amber-300/45 bg-[radial-gradient(circle_at_18%_16%,rgba(252,211,77,0.34),transparent_38%),linear-gradient(145deg,rgba(64,38,8,0.96),rgba(133,77,14,0.88))]",
-	    iconClassName: "bg-amber-200/20 text-amber-100",
-	  },
-	  sales: {
-	    title: "Satış Raporu",
-	    icon: BarChart3,
-	    tileClassName:
-	      "border-violet-300/45 bg-[radial-gradient(circle_at_18%_16%,rgba(196,181,253,0.34),transparent_38%),linear-gradient(145deg,rgba(35,20,61,0.96),rgba(91,33,182,0.82))]",
-	    iconClassName: "bg-violet-200/20 text-violet-100",
-	  },
-	};
 
 function hasRun(payload: unknown): payload is ReportQueueResponse {
   return Boolean(
@@ -147,42 +104,6 @@ function parseNumericLike(value: string | number): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function humanizeKey(key: string): string {
-  const dictionary: Record<string, string> = {
-    total: "Toplam",
-    count: "Adet",
-    grand_total: "Genel Toplam",
-    net_total: "Net Toplam",
-    total_due: "Toplam Bakiye",
-    order_due: "Sipariş Bakiyesi",
-    order_count: "Sipariş Adedi",
-    customer_count: "Cari Adedi",
-    item_count: "Kalem Adedi",
-    sale_count: "Satış Adedi",
-    quantity_total: "Miktar Toplamı",
-    collection_count: "Tahsilat Adedi",
-    collection_total: "Tahsilat Toplamı",
-    open_order_count: "Açık Sipariş",
-    open_subtotal: "Açık Ara Toplam",
-    open_grand_total: "Açık Genel Toplam",
-    subtotal: "Ara Toplam",
-    tax_total: "Vergi Toplamı",
-    amount: "Tutar",
-    balance: "Bakiye",
-    overdue_total: "Vadesi Geçen",
-    ordered_at: "Sipariş Tarihi",
-    report: "Rapor",
-  };
-
-  if (dictionary[key]) {
-    return dictionary[key];
-  }
-
-  return key
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase());
-}
-
 function isMoneyKey(key: string): boolean {
   return /(total|due|amount|balance|subtotal|tax|vat)/i.test(key) && !/count|quantity/i.test(key);
 }
@@ -210,65 +131,6 @@ function formatMetricValue(
   return parsed.toLocaleString("tr-TR", { maximumFractionDigits: 2 });
 }
 
-function extractSummary(payload: ReportPayload): Array<{ label: string; value: string }> {
-  const root = asRecord(payload);
-  if (!root) {
-    return [];
-  }
-
-  const summary = asRecord(root.summary);
-  const totals = summary ? asRecord(summary.totals) : null;
-  const source = totals ?? summary ?? asRecord(root.totals) ?? root;
-  const currency =
-    typeof source.currency === "string" && source.currency.trim().length > 0
-      ? source.currency
-      : "TRY";
-
-  const priority = [
-    "grand_total",
-    "open_grand_total",
-    "collection_total",
-    "net_total",
-    "total_due",
-    "order_due",
-    "open_order_count",
-    "order_count",
-    "sale_count",
-    "customer_count",
-    "collection_count",
-    "quantity_total",
-  ];
-
-  const entries: Array<{ label: string; value: string }> = [];
-  const seen = new Set<string>();
-
-  priority.forEach((key) => {
-    const value = source[key];
-    if (!isPrimitive(value)) {
-      return;
-    }
-
-    seen.add(key);
-    entries.push({
-      label: humanizeKey(key),
-      value: formatMetricValue(key, value, currency),
-    });
-  });
-
-  Object.entries(source).forEach(([key, value]) => {
-    if (seen.has(key) || !isPrimitive(value)) {
-      return;
-    }
-
-    entries.push({
-      label: humanizeKey(key),
-      value: formatMetricValue(key, value, currency),
-    });
-  });
-
-  return entries.slice(0, 8);
-}
-
 function formatDateTime(iso: string | null | undefined): string {
   if (!iso) {
     return "-";
@@ -286,94 +148,6 @@ function formatDateTime(iso: string | null | undefined): string {
     hour: "2-digit",
     minute: "2-digit",
   });
-}
-
-function extractBreakdownBadges(key: ReportKey, payload: ReportPayload): string[] {
-  const root = asRecord(payload);
-  if (!root) {
-    return [];
-  }
-
-  if (key === "order") {
-    const rows = Array.isArray(root.status_breakdown) ? root.status_breakdown : [];
-    return rows
-      .slice(0, 4)
-      .map((row) => {
-        const record = asRecord(row);
-        if (!record) {
-          return null;
-        }
-        const status = typeof record.status === "string" ? record.status : "-";
-        const total = isPrimitive(record.total) ? formatMetricValue("total", record.total, "TRY") : "-";
-        return `${status}: ${total}`;
-      })
-      .filter((item): item is string => Boolean(item));
-  }
-
-  if (key === "collection") {
-    const rows = Array.isArray(root.method_breakdown) ? root.method_breakdown : [];
-    return rows
-      .slice(0, 5)
-      .map((row) => {
-        const record = asRecord(row);
-        if (!record) {
-          return null;
-        }
-        const method = typeof record.method === "string" ? record.method.toUpperCase() : "N/A";
-        const total = isPrimitive(record.total) ? formatMetricValue("total", record.total, "TRY") : "-";
-        return `${method}: ${total}`;
-      })
-      .filter((item): item is string => Boolean(item));
-  }
-
-  if (key === "sales") {
-    const rows = Array.isArray(root.data) ? root.data : [];
-    return rows
-      .slice(0, 3)
-      .map((row) => {
-        const record = asRecord(row);
-        if (!record) {
-          return null;
-        }
-
-        const product = asRecord(record.product);
-        const customer = asRecord(record.customer);
-        const brand = asRecord(record.brand);
-
-        const label =
-          (typeof product?.name === "string" && product.name) ||
-          (typeof brand?.name === "string" && brand.name) ||
-          (typeof customer?.title === "string" && customer.title) ||
-          "Kırılım";
-
-        const total = isPrimitive(record.net_total)
-          ? formatMetricValue("net_total", record.net_total, "TRY")
-          : "-";
-
-        return `${label}: ${total}`;
-      })
-      .filter((item): item is string => Boolean(item));
-  }
-
-  if (key === "customer") {
-    const rows = Array.isArray(root.data) ? root.data : [];
-    return rows
-      .slice(0, 3)
-      .map((row) => {
-        const record = asRecord(row);
-        if (!record) {
-          return null;
-        }
-        const code = typeof record.code === "string" ? record.code : "Cari";
-        const balance = isPrimitive(record.balance)
-          ? formatMetricValue("balance", record.balance, "TRY")
-          : "-";
-        return `${code}: ${balance}`;
-      })
-      .filter((item): item is string => Boolean(item));
-  }
-
-  return [];
 }
 
 function extractPreviewRows(key: ReportKey, payload: ReportPayload): Array<Record<string, string>> {
@@ -436,43 +210,192 @@ function extractPreviewRows(key: ReportKey, payload: ReportPayload): Array<Recor
     .filter((row): row is Record<string, string> => row !== null);
 }
 
-function ReportPreviewTable({ rows }: { rows: Array<Record<string, string>> }) {
-  if (rows.length === 0) {
-    return (
-      <div className="rounded-2xl border border-dashed border-[var(--brand-border)] bg-[var(--surface-soft)] p-5 text-sm font-semibold text-[var(--muted-foreground)]">
-        Seçili filtrelerde kayıt bulunamadı.
-      </div>
-    );
+function extractCustomerFilterOptions(...payloads: ReportPayload[]): CustomerFilterOption[] {
+  const options = new Map<number, string>();
+
+  payloads.forEach((payload) => {
+    const root = asRecord(payload);
+    const rows = root && Array.isArray(root.data) ? root.data : [];
+
+    rows.forEach((row) => {
+      const record = asRecord(row);
+      if (!record) {
+        return;
+      }
+
+      const nestedCustomer = asRecord(record.customer);
+      const rawId = record.customer_id ?? nestedCustomer?.id;
+      const id = typeof rawId === "number" ? rawId : typeof rawId === "string" ? Number(rawId) : null;
+
+      if (!id || !Number.isFinite(id)) {
+        return;
+      }
+
+      const code = typeof record.code === "string" ? record.code : typeof nestedCustomer?.code === "string" ? nestedCustomer.code : "";
+      const title =
+        typeof record.title === "string"
+          ? record.title
+          : typeof nestedCustomer?.title === "string"
+            ? nestedCustomer.title
+            : "Cari";
+      const label = [code, title].filter(Boolean).join(" - ");
+
+      if (!options.has(id)) {
+        options.set(id, label);
+      }
+    });
+  });
+
+  return Array.from(options, ([id, label]) => ({ id, label })).sort((left, right) =>
+    left.label.localeCompare(right.label, "tr")
+  );
+}
+
+function getNestedRecord(payload: ReportPayload, path: string[]): Record<string, unknown> | null {
+  let current: unknown = payload;
+
+  for (const key of path) {
+    const record = asRecord(current);
+    if (!record) {
+      return null;
+    }
+    current = record[key];
   }
 
-  const columns = Object.keys(rows[0] ?? {});
+  return asRecord(current);
+}
 
-  return (
-    <div className="overflow-x-auto rounded-2xl border border-[var(--brand-border)] bg-[var(--surface)]">
-      <table className="w-full min-w-[560px] text-left text-sm">
-        <thead>
-          <tr className="border-b border-[var(--brand-border)] text-xs uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
-            {columns.map((column) => (
-              <th key={column} className="px-3 py-3 font-black">
-                {column}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, rowIndex) => (
-            <tr key={`preview-${rowIndex}`} className="border-b border-[var(--brand-border)]/60 last:border-0">
-              {columns.map((column) => (
-                <td key={`${rowIndex}-${column}`} className="max-w-[260px] truncate px-3 py-3 font-semibold text-[var(--foreground)]">
-                  {row[column]}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
+function getPayloadRows(payload: ReportPayload, key: string): Record<string, unknown>[] {
+  const root = asRecord(payload);
+  const rows = root && Array.isArray(root[key]) ? root[key] : [];
+
+  return rows.map(asRecord).filter((row): row is Record<string, unknown> => row !== null);
+}
+
+function percentOf(value: number, total: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, (value / total) * 100));
+}
+
+function methodLabel(method: string): string {
+  const labels: Record<string, string> = {
+    cash: "Nakit",
+    transfer: "Havale/EFT",
+    check: "Çek",
+    note: "Senet",
+    cc: "Kredi Kartı",
+  };
+
+  return labels[method] ?? method.toUpperCase();
+}
+
+function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "Bekliyor",
+    approved: "Onaylandı",
+    preparing: "Hazırlanıyor",
+    shipped: "Sevk Edildi",
+    delivered: "Teslim Edildi",
+    completed: "Tamamlandı",
+    cancelled: "İptal",
+  };
+
+  return labels[status] ?? status;
+}
+
+function extractSalesBars(payload: ReportPayload): Array<{ label: string; value: number; formatted: string }> {
+  return extractPreviewRows("sales", payload)
+    .map((row) => {
+      const value = parseNumericLike(row.Tutar ?? "0") ?? 0;
+      return {
+        label: row.Kırılım ?? row.Cari ?? "Kırılım",
+        value,
+        formatted: row.Tutar ?? "0,00 ₺",
+      };
+    })
+    .filter((row) => row.value > 0)
+    .slice(0, 6);
+}
+
+function extractCollectionDailyBars(payload: ReportPayload): Array<{ label: string; value: number; formatted: string }> {
+  return getPayloadRows(payload, "daily_breakdown")
+    .map((row) => {
+      const date = typeof row.date === "string" ? row.date.slice(5) : "-";
+      const value = isPrimitive(row.total) ? parseNumericLike(row.total) ?? 0 : 0;
+
+      return {
+        label: date,
+        value,
+        formatted: formatMetricValue("total", value, "TRY"),
+      };
+    })
+    .filter((row) => row.value > 0)
+    .slice(-12);
+}
+
+function extractCollectionMethodRows(payload: ReportPayload): Array<{ label: string; value: number; formatted: string; percent: number; color: string }> {
+  const colors = ["#4ade80", "#60a5fa", "#fbbf24", "#a855f7", "#ef4444"];
+  const rows = getPayloadRows(payload, "method_breakdown")
+    .map((row, index) => {
+      const value = isPrimitive(row.total) ? parseNumericLike(row.total) ?? 0 : 0;
+      const method = typeof row.method === "string" ? row.method : "-";
+
+      return {
+        label: methodLabel(method),
+        value,
+        formatted: formatMetricValue("total", value, "TRY"),
+        percent: 0,
+        color: colors[index % colors.length],
+      };
+    })
+    .filter((row) => row.value > 0);
+
+  const total = rows.reduce((sum, row) => sum + row.value, 0);
+
+  return rows.map((row) => ({ ...row, percent: percentOf(row.value, total) }));
+}
+
+function extractOrderStatusRows(payload: ReportPayload): Array<{ label: string; count: number; total: string; color: string }> {
+  const colors = ["bg-emerald-400", "bg-blue-400", "bg-violet-400", "bg-amber-400", "bg-red-400"];
+
+  return getPayloadRows(payload, "status_breakdown")
+    .map((row, index) => {
+      const status = typeof row.status === "string" ? row.status : "-";
+      const count = isPrimitive(row.order_count) ? parseNumericLike(row.order_count) ?? 0 : 0;
+      const total = isPrimitive(row.total) ? formatMetricValue("total", row.total, "TRY") : "0,00 ₺";
+
+      return {
+        label: statusLabel(status),
+        count,
+        total,
+        color: colors[index % colors.length],
+      };
+    })
+    .filter((row) => row.count > 0);
+}
+
+function extractAgingRows(payload: ReportPayload): Array<{ label: string; value: number; formatted: string; percent: number }> {
+  const aging = getNestedRecord(payload, ["summary", "aging_totals"]);
+  const rows = [
+    { key: "0_30", label: "0-30" },
+    { key: "31_60", label: "31-60" },
+    { key: "60_plus", label: "61+" },
+  ].map((bucket) => {
+    const value = aging && isPrimitive(aging[bucket.key]) ? parseNumericLike(aging[bucket.key]) ?? 0 : 0;
+
+    return {
+      label: bucket.label,
+      value,
+      formatted: formatMetricValue("balance", value, "TRY"),
+      percent: 0,
+    };
+  });
+  const total = rows.reduce((sum, row) => sum + row.value, 0);
+
+  return rows.map((row) => ({ ...row, percent: percentOf(row.value, total) }));
 }
 
 function getMetricValue(
@@ -530,10 +453,6 @@ function getMetricNumber(payload: ReportPayload, keys: string[], fallback = 0): 
   return fallback;
 }
 
-function formatMoney(value: number): string {
-  return `${value.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₺`;
-}
-
 function MiniLineChart({ color = "#4ade80" }: { color?: string }) {
   return (
     <svg viewBox="0 0 120 54" className="h-16 w-32 opacity-95" aria-hidden="true">
@@ -568,7 +487,7 @@ function MiniBars({ color = "#60a5fa" }: { color?: string }) {
   );
 }
 
-function RingChart({ value, color }: { value: number; color: string }) {
+function RingChart({ value, color, label = "Toplam" }: { value: number; color: string; label?: string }) {
   const normalized = Math.max(0, Math.min(100, value));
   return (
     <div
@@ -579,7 +498,7 @@ function RingChart({ value, color }: { value: number; color: string }) {
     >
       <div className="grid h-20 w-20 place-items-center rounded-full bg-[#071421] text-center shadow-[inset_0_0_22px_rgba(0,0,0,0.45)]">
         <span className="text-xl font-black text-white">{Math.round(value)}</span>
-        <span className="-mt-4 text-[11px] font-bold text-[#8aa0b8]">Toplam</span>
+        <span className="-mt-4 text-[11px] font-bold text-[#8aa0b8]">{label}</span>
       </div>
     </div>
   );
@@ -634,10 +553,10 @@ function CompactTable({ rows, footerLabel }: { rows: Array<Record<string, string
 }
 
 export function ReportsPage() {
+  const { user, selectedCustomer } = useSession();
   const [dateFrom, setDateFrom] = useState(() => currentMonthRange().from);
   const [dateTo, setDateTo] = useState(() => currentMonthRange().to);
   const [salesBreakdown, setSalesBreakdown] = useState<"product" | "brand" | "customer">("product");
-  const [branchFilter, setBranchFilter] = useState("all");
   const [customerFilter, setCustomerFilter] = useState("all");
 
   const [loadingKey, setLoadingKey] = useState<ReportKey | "all" | null>(null);
@@ -653,13 +572,21 @@ export function ReportsPage() {
 
   const isAnyLoading = loadingKey !== null;
   const hasDateFilters = Boolean(dateFrom) || Boolean(dateTo);
-  const hasActiveFilters = hasDateFilters || salesBreakdown !== "product" || branchFilter !== "all" || customerFilter !== "all";
+  const hasActiveFilters = hasDateFilters || salesBreakdown !== "product" || customerFilter !== "all";
   const activeFilterCount =
     Number(Boolean(dateFrom)) +
     Number(Boolean(dateTo)) +
     Number(salesBreakdown !== "product") +
-    Number(branchFilter !== "all") +
     Number(customerFilter !== "all");
+  const effectiveDealerId = user?.dealer_id ?? undefined;
+  const effectiveCustomerId =
+    customerFilter !== "all" && Number.isFinite(Number(customerFilter))
+      ? Number(customerFilter)
+      : selectedCustomer?.id;
+  const scopeLabel =
+    selectedCustomer
+      ? `${selectedCustomer.code} - ${selectedCustomer.title}`
+      : user?.dealer?.name ?? "Yetkili kapsam";
 
   const setReportPayload = useCallback((key: ReportKey, payload: Record<string, unknown>) => {
     setReportsByKey((previous) => ({ ...previous, [key]: payload }));
@@ -676,12 +603,16 @@ export function ReportsPage() {
       ({
         customer: () =>
           getReportCustomerBalances({
+            dealer_id: effectiveDealerId,
+            customer_id: effectiveCustomerId,
             date_to: dateTo || undefined,
             per_page: 20,
             async: false,
           }),
         order: () =>
           getReportOrderBalances({
+            dealer_id: effectiveDealerId,
+            customer_id: effectiveCustomerId,
             date_from: dateFrom || undefined,
             date_to: dateTo || undefined,
             per_page: 20,
@@ -689,6 +620,8 @@ export function ReportsPage() {
           }),
         collection: () =>
           getReportCollections({
+            dealer_id: effectiveDealerId,
+            customer_id: effectiveCustomerId,
             date_from: dateFrom || undefined,
             date_to: dateTo || undefined,
             per_page: 20,
@@ -696,6 +629,8 @@ export function ReportsPage() {
           }),
         sales: () =>
           getReportSales({
+            dealer_id: effectiveDealerId,
+            customer_id: effectiveCustomerId,
             date_from: dateFrom || undefined,
             date_to: dateTo || undefined,
             breakdown: salesBreakdown,
@@ -706,7 +641,7 @@ export function ReportsPage() {
         ReportKey,
         () => Promise<Record<string, unknown> | ReportQueueResponse>
       >,
-    [dateFrom, dateTo, salesBreakdown]
+    [dateFrom, dateTo, effectiveCustomerId, effectiveDealerId, salesBreakdown]
   );
 
   const loadAllReports = useCallback(() => {
@@ -743,6 +678,12 @@ export function ReportsPage() {
   const customerRows = extractPreviewRows("customer", reportsByKey.customer);
   const orderRows = extractPreviewRows("order", reportsByKey.order);
   const collectionRows = extractPreviewRows("collection", reportsByKey.collection);
+  const customerOptions = extractCustomerFilterOptions(
+    reportsByKey.customer,
+    reportsByKey.order,
+    reportsByKey.collection,
+    reportsByKey.sales
+  );
   const lastUpdated =
     Object.values(updatedAtByKey)
       .filter((value): value is string => Boolean(value))
@@ -751,11 +692,20 @@ export function ReportsPage() {
   const totalSales = getMetricValue(reportsByKey.sales, ["net_total", "grand_total", "total"], "0,00 ₺");
   const totalCollections = getMetricValue(reportsByKey.collection, ["collection_total", "amount", "total"], "0,00 ₺");
   const openOrders = getMetricValue(reportsByKey.order, ["open_grand_total", "order_due", "grand_total"], "0,00 ₺");
-  const customerBalance = getMetricValue(reportsByKey.customer, ["total_due", "balance", "grand_total"], "0,00 ₺");
+  const customerBalance = getMetricValue(reportsByKey.customer, ["balance_total", "total_due", "balance", "grand_total"], "0,00 ₺");
+  const salesTaxTotal = getMetricValue(reportsByKey.sales, ["tax_total"], "0,00 ₺");
   const openOrderCount = getMetricNumber(reportsByKey.order, ["open_order_count", "order_count", "count"], 0);
   const customerCount = getMetricNumber(reportsByKey.customer, ["customer_count", "count"], customerRows.length);
-  const collectionAmount = getMetricNumber(reportsByKey.collection, ["collection_total", "amount", "total"], 0);
-  const salesAmount = getMetricNumber(reportsByKey.sales, ["net_total", "grand_total", "total"], 0);
+  const salesOrderCount = getMetricNumber(reportsByKey.sales, ["order_count", "sale_count", "count"], 0);
+  const salesQuantityTotal = getMetricNumber(reportsByKey.sales, ["quantity_total"], 0);
+  const collectionCount = getMetricNumber(reportsByKey.collection, ["collection_count", "count"], 0);
+  const salesBars = extractSalesBars(reportsByKey.sales);
+  const collectionDailyBars = extractCollectionDailyBars(reportsByKey.collection);
+  const collectionMethodRows = extractCollectionMethodRows(reportsByKey.collection);
+  const orderStatusRows = extractOrderStatusRows(reportsByKey.order);
+  const agingRows = extractAgingRows(reportsByKey.customer);
+  const agingTotal = agingRows.reduce((sum, row) => sum + row.value, 0);
+  const collectionMethodTopPercent = Math.round(collectionMethodRows[0]?.percent ?? 0);
 
   const fieldClassName =
     "h-11 rounded-xl border-[#1d3449] bg-[#081a29] text-sm font-bold text-[#dce9f4] shadow-none placeholder:text-[#6f879d] focus-visible:ring-[#38bdf8]/35";
@@ -763,8 +713,8 @@ export function ReportsPage() {
     {
       title: "Toplam Satış",
       value: totalSales,
-      detail: "Önceki Dönem",
-      sub: formatMoney(Math.max(0, salesAmount * 0.82)),
+      detail: "Sipariş Adedi",
+      sub: String(salesOrderCount),
       icon: TrendingUp,
       color: "#4ade80",
       className: "border-emerald-400/35 bg-[linear-gradient(145deg,rgba(13,70,48,0.95),rgba(5,36,31,0.98))]",
@@ -773,8 +723,8 @@ export function ReportsPage() {
     {
       title: "Tahsilat",
       value: totalCollections,
-      detail: "Önceki Dönem",
-      sub: formatMoney(Math.max(0, collectionAmount * 0.79)),
+      detail: "Tahsilat Adedi",
+      sub: String(collectionCount),
       icon: BarChart3,
       color: "#60a5fa",
       className: "border-sky-400/35 bg-[linear-gradient(145deg,rgba(11,58,93,0.95),rgba(6,29,51,0.98))]",
@@ -793,18 +743,18 @@ export function ReportsPage() {
     {
       title: "Cari Bakiye",
       value: customerBalance,
-      detail: "Risk Seviyesi",
-      sub: "Düşük",
+      detail: "Cari Adedi",
+      sub: String(customerCount),
       icon: Wallet,
       color: "#34d399",
       className: "border-emerald-400/35 bg-[linear-gradient(145deg,rgba(7,83,64,0.95),rgba(5,41,35,0.98))]",
       visual: <Wallet className="h-16 w-16 text-emerald-300/70" />,
     },
     {
-      title: "Karlılık",
-      value: formatMoney(Math.max(salesAmount - collectionAmount, 0)),
-      detail: "Kâr Marjı",
-      sub: "%18,13",
+      title: "Satış KDV",
+      value: salesTaxTotal,
+      detail: "Satış Adedi",
+      sub: String(salesQuantityTotal),
       icon: Activity,
       color: "#c084fc",
       className: "border-violet-400/35 bg-[linear-gradient(145deg,rgba(67,43,126,0.95),rgba(36,24,78,0.98))]",
@@ -815,7 +765,7 @@ export function ReportsPage() {
   return (
     <div className="reports-pro-screen -mx-1 space-y-3 rounded-[22px] bg-[#04111c] p-3 text-[#dce9f4] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
       <Panel className="bg-[linear-gradient(180deg,rgba(7,26,41,0.96),rgba(5,21,34,0.96))] p-3">
-        <div className="grid gap-3 xl:grid-cols-[180px_180px_220px_220px_minmax(180px,1fr)_auto] xl:items-end">
+        <div className="grid gap-3 xl:grid-cols-[180px_180px_220px_minmax(220px,1fr)_minmax(180px,1fr)_auto] xl:items-end">
           <label className="block">
             <span className="mb-1.5 block text-[11px] font-black text-[#7f96aa]">Başlangıç</span>
             <Input type="date" value={dateFrom} disabled={isAnyLoading} onChange={(event) => setDateFrom(event.target.value)} className={fieldClassName} />
@@ -835,26 +785,18 @@ export function ReportsPage() {
               </SelectContent>
             </Select>
           </label>
-          <label className="block">
-            <span className="mb-1.5 block text-[11px] font-black text-[#7f96aa]">Şube</span>
-            <Select value={branchFilter} onValueChange={setBranchFilter} disabled={isAnyLoading}>
-              <SelectTrigger className={fieldClassName}><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">Tümü</SelectItem>
-                <SelectItem value="erzurum">Erzurum</SelectItem>
-                <SelectItem value="trabzon">Trabzon</SelectItem>
-                <SelectItem value="samsun">Samsun</SelectItem>
-              </SelectContent>
-            </Select>
-          </label>
+          <div className="block">
+            <span className="mb-1.5 block text-[11px] font-black text-[#7f96aa]">Kapsam</span>
+            <div className={cn(fieldClassName, "flex items-center truncate px-3")}>{scopeLabel}</div>
+          </div>
           <label className="block">
             <span className="mb-1.5 block text-[11px] font-black text-[#7f96aa]">Müşteri</span>
             <Select value={customerFilter} onValueChange={setCustomerFilter} disabled={isAnyLoading}>
               <SelectTrigger className={fieldClassName}><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">Tümü</SelectItem>
-                {customerRows.slice(0, 8).map((row, index) => (
-                  <SelectItem key={`customer-filter-${index}`} value={row.Cari}>{row.Cari}</SelectItem>
+                {customerOptions.slice(0, 16).map((option) => (
+                  <SelectItem key={`customer-filter-${option.id}`} value={String(option.id)}>{option.label}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -872,7 +814,6 @@ export function ReportsPage() {
                 setDateFrom(range.from);
                 setDateTo(range.to);
                 setSalesBreakdown("product");
-                setBranchFilter("all");
                 setCustomerFilter("all");
               }}
               className="h-11 rounded-xl border-[#26384e] bg-[#0b1625] px-4 text-sm font-black text-[#91a6ba] hover:bg-[#122237] hover:text-white"
@@ -928,31 +869,50 @@ export function ReportsPage() {
       <div className="grid gap-3 xl:grid-cols-[1.08fr_0.96fr_0.98fr]">
         <Panel>
           <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-base font-black text-white">Aylık Satış Trendi</h2>
-            <span className="rounded-xl border border-[#1d3449] px-3 py-1.5 text-xs font-black text-[#9fb2c4]">12 Ay</span>
+            <h2 className="text-base font-black text-white">Satış Kırılımı</h2>
+            <span className="rounded-xl border border-[#1d3449] px-3 py-1.5 text-xs font-black text-[#9fb2c4]">{salesBreakdown === "product" ? "Ürün" : salesBreakdown === "brand" ? "Marka" : "Müşteri"}</span>
           </div>
-          <div className="relative h-[238px] overflow-hidden rounded-xl bg-[#061522] p-4">
-            <div className="absolute inset-x-4 bottom-10 top-4 bg-[repeating-linear-gradient(to_bottom,transparent_0,transparent_35px,rgba(148,163,184,0.13)_36px)]" />
-            <svg viewBox="0 0 520 210" className="relative h-full w-full" aria-hidden="true">
-              <path d="M20 172 C55 132 72 118 95 86 C126 42 145 70 170 86 C200 106 220 52 248 55 C276 58 292 74 318 61 C348 44 370 80 398 102 C430 128 455 90 500 44" fill="none" stroke="#4ade80" strokeWidth="5" strokeLinecap="round" />
-              <path d="M20 172 C55 132 72 118 95 86 C126 42 145 70 170 86 C200 106 220 52 248 55 C276 58 292 74 318 61 C348 44 370 80 398 102 C430 128 455 90 500 44 L500 210 L20 210 Z" fill="rgba(74,222,128,0.13)" />
-              <path d="M20 184 C62 150 91 118 128 137 C166 154 183 116 218 92 C252 69 286 88 318 69 C356 47 395 112 428 122 C466 132 482 92 510 116" fill="none" stroke="#38bdf8" strokeWidth="4" strokeDasharray="7 9" strokeLinecap="round" opacity="0.85" />
-            </svg>
-            <div className="absolute bottom-2 left-5 right-5 grid grid-cols-6 text-center text-[11px] font-bold text-[#8fa3b8]">
-              {["Oca", "Şub", "Mar", "Nis", "May", "Haz"].map((month) => <span key={month}>{month}</span>)}
-            </div>
+          <div className="grid h-[238px] gap-3 rounded-xl bg-[#061522] p-4">
+            {salesBars.length === 0 ? (
+              <div className="grid place-items-center text-sm font-semibold text-[#7890a8]">Seçili filtrelerde satış kırılımı yok.</div>
+            ) : (
+              salesBars.map((row) => {
+                const maxValue = Math.max(...salesBars.map((item) => item.value), 1);
+
+                return (
+                  <div key={row.label} className="grid grid-cols-[120px_minmax(0,1fr)_100px] items-center gap-3 text-sm">
+                    <span className="truncate font-bold text-[#9fb2c4]">{row.label}</span>
+                    <span className="h-3 overflow-hidden rounded-full bg-[#12283a]">
+                      <span className="block h-full rounded-full bg-[linear-gradient(90deg,#4ade80,#7dd3fc)]" style={{ width: `${Math.max(8, percentOf(row.value, maxValue))}%` }} />
+                    </span>
+                    <span className="truncate text-right font-black text-[#dce9f4]">{row.formatted}</span>
+                  </div>
+                );
+              })
+            )}
           </div>
         </Panel>
 
         <Panel>
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-base font-black text-white">Tahsilat Performansı</h2>
-            <span className="rounded-xl border border-[#1d3449] px-3 py-1.5 text-xs font-black text-[#9fb2c4]">12 Ay</span>
+            <span className="rounded-xl border border-[#1d3449] px-3 py-1.5 text-xs font-black text-[#9fb2c4]">Günlük</span>
           </div>
-          <div className="flex h-[238px] items-end gap-4 rounded-xl bg-[#061522] px-5 pb-8 pt-5">
-            {[48, 38, 46, 34, 68, 62, 56, 43, 52, 67, 82, 58].map((height, index) => (
-              <span key={`collection-bar-${index}`} className="flex-1 rounded-t-lg bg-[linear-gradient(180deg,#63e487,#164b34)]" style={{ height: `${height}%` }} />
-            ))}
+          <div className="flex h-[238px] items-end gap-3 rounded-xl bg-[#061522] px-5 pb-8 pt-5">
+            {collectionDailyBars.length === 0 ? (
+              <div className="grid h-full w-full place-items-center text-sm font-semibold text-[#7890a8]">Seçili filtrelerde tahsilat yok.</div>
+            ) : (
+              collectionDailyBars.map((row) => {
+                const maxValue = Math.max(...collectionDailyBars.map((item) => item.value), 1);
+
+                return (
+                  <div key={row.label} className="flex h-full flex-1 flex-col justify-end gap-2 text-center">
+                    <span className="rounded-t-lg bg-[linear-gradient(180deg,#63e487,#164b34)]" style={{ height: `${Math.max(6, percentOf(row.value, maxValue))}%` }} title={row.formatted} />
+                    <span className="text-[10px] font-bold text-[#8fa3b8]">{row.label}</span>
+                  </div>
+                );
+              })
+            )}
           </div>
         </Panel>
 
@@ -962,18 +922,13 @@ export function ReportsPage() {
             <span className="rounded-xl border border-[#1d3449] px-3 py-1.5 text-xs font-black text-[#9fb2c4]">Bu Ay</span>
           </div>
           <div className="grid h-[238px] grid-cols-[150px_minmax(0,1fr)] items-center gap-6">
-            <RingChart value={collectionRows.length ? collectionRows.length * 18 : 56} color="#4ade80" />
+            <RingChart value={collectionMethodTopPercent} color="#4ade80" label="En Büyük" />
             <div className="space-y-3 text-sm">
-              {[
-                ["Vadesinde", "#4ade80", "56,0"],
-                ["0-30 Gün", "#fbbf24", "27,0"],
-                ["31-60 Gün", "#a855f7", "12,0"],
-                ["61+ Gün", "#ef4444", "5,0"],
-              ].map(([label, color, percent]) => (
-                <div key={label} className="grid grid-cols-[16px_minmax(0,1fr)_60px] items-center gap-2">
-                  <span className="h-3 w-3 rounded" style={{ backgroundColor: color }} />
-                  <span className="font-bold text-[#b8c8d8]">{label}</span>
-                  <span className="text-right font-black text-[#dce9f4]">%{percent}</span>
+              {(collectionMethodRows.length ? collectionMethodRows : [{ label: "Kayıt yok", color: "#64748b", percent: 0, formatted: "0,00 ₺" }]).map((row) => (
+                <div key={row.label} className="grid grid-cols-[16px_minmax(0,1fr)_60px] items-center gap-2">
+                  <span className="h-3 w-3 rounded" style={{ backgroundColor: row.color }} />
+                  <span className="truncate font-bold text-[#b8c8d8]">{row.label}</span>
+                  <span className="text-right font-black text-[#dce9f4]">%{row.percent.toLocaleString("tr-TR", { maximumFractionDigits: 1 })}</span>
                 </div>
               ))}
             </div>
@@ -985,7 +940,11 @@ export function ReportsPage() {
         <Panel>
           <h2 className="mb-4 text-base font-black text-white">En Çok Satan Ürün Grupları</h2>
           <div className="space-y-3">
-            {(salesRows.length ? salesRows.slice(0, 5) : [{ Kırılım: "Filtre", Tutar: totalSales }, { Kırılım: "Yağ", Tutar: "0,00 ₺" }]).map((row, index) => (
+            {salesRows.length === 0 ? (
+              <div className="grid min-h-[132px] place-items-center rounded-xl border border-dashed border-[#1a3348] text-sm font-semibold text-[#7890a8]">
+                Seçili filtrelerde satış kaydı yok.
+              </div>
+            ) : salesRows.slice(0, 5).map((row, index) => (
               <div key={`sales-row-${index}`} className="grid grid-cols-[100px_minmax(0,1fr)_90px] items-center gap-3 text-sm">
                 <span className="truncate font-bold text-[#9fb2c4]">{row.Kırılım ?? row.Cari ?? "Ürün"}</span>
                 <span className="h-3 overflow-hidden rounded-full bg-[#12283a]">
@@ -1001,34 +960,42 @@ export function ReportsPage() {
           <h2 className="mb-4 text-base font-black text-white">Sipariş Durumları</h2>
           <div className="grid grid-cols-[1fr_130px] items-center gap-4">
             <div className="space-y-3 text-sm">
-              {["Onaylandı", "Hazırlanıyor", "Sevk Edildi", "İptal"].map((label, index) => (
-                <div key={label} className="flex items-center justify-between gap-3">
+              {(orderStatusRows.length ? orderStatusRows : [{ label: "Kayıt yok", count: 0, total: "0,00 ₺", color: "bg-slate-500" }]).map((row) => (
+                <div key={row.label} className="flex items-center justify-between gap-3">
                   <span className="inline-flex items-center gap-2 font-bold text-[#b8c8d8]">
-                    <span className={cn("h-3 w-3 rounded-full", ["bg-emerald-400", "bg-blue-400", "bg-violet-400", "bg-red-400"][index])} />
-                    {label}
+                    <span className={cn("h-3 w-3 rounded-full", row.color)} />
+                    {row.label}
                   </span>
-                  <span className="font-black text-[#dce9f4]">{Math.max(1, openOrderCount - index)}</span>
+                  <span className="font-black text-[#dce9f4]">{row.count}</span>
                 </div>
               ))}
             </div>
-            <RingChart value={Math.max(25, openOrderCount || 25)} color="#3b82f6" />
+            <RingChart value={Math.min(100, openOrderCount)} color="#3b82f6" label="Açık" />
           </div>
         </Panel>
 
         <Panel>
           <h2 className="mb-4 text-base font-black text-white">Vade Analizi</h2>
           <div className="overflow-hidden rounded-xl border border-[#1a3348] text-center text-sm">
-            <div className="grid grid-cols-6 bg-[#0b2032] text-[12px] font-black text-[#cbd5e1]">
-              {["0-30", "31-60", "61-90", "91-120", "120+", "Toplam"].map((label) => <span key={label} className="border-r border-[#1a3348] px-2 py-3 last:border-r-0">{label}</span>)}
+            <div className="grid grid-cols-4 bg-[#0b2032] text-[12px] font-black text-[#cbd5e1]">
+              {[...agingRows.map((row) => row.label), "Toplam"].map((label) => <span key={label} className="border-r border-[#1a3348] px-2 py-3 last:border-r-0">{label}</span>)}
             </div>
-            <div className="grid grid-cols-6 text-[12px] font-black text-[#dce9f4]">
-              {["3.510", "1.560", "980", "540", "650", "7.240"].map((label, index) => <span key={index} className="border-r border-t border-[#1a3348] px-2 py-3 last:border-r-0">{label}</span>)}
+            <div className="grid grid-cols-4 text-[12px] font-black text-[#dce9f4]">
+              {[...agingRows.map((row) => row.formatted), formatMetricValue("balance", agingTotal, "TRY")].map((label, index) => <span key={index} className="border-r border-t border-[#1a3348] px-2 py-3 last:border-r-0">{label}</span>)}
             </div>
-            <div className="grid grid-cols-6 text-[12px] font-black text-[#dce9f4]">
-              {["56%", "25%", "13%", "7%", "5%", "100%"].map((label, index) => <span key={index} className="border-r border-t border-[#1a3348] px-2 py-3 last:border-r-0">{label}</span>)}
+            <div className="grid grid-cols-4 text-[12px] font-black text-[#dce9f4]">
+              {[...agingRows.map((row) => `%${row.percent.toLocaleString("tr-TR", { maximumFractionDigits: 1 })}`), agingTotal > 0 ? "%100" : "%0"].map((label, index) => <span key={index} className="border-r border-t border-[#1a3348] px-2 py-3 last:border-r-0">{label}</span>)}
             </div>
           </div>
-          <div className="mt-4 h-3 rounded-full bg-[linear-gradient(90deg,#22c55e,#eab308,#f97316,#ef4444)]" />
+          <div className="mt-4 flex h-3 overflow-hidden rounded-full bg-[#12283a]">
+            {agingRows.map((row, index) => (
+              <span
+                key={row.label}
+                className={cn(["bg-emerald-400", "bg-amber-400", "bg-red-400"][index])}
+                style={{ width: `${agingTotal > 0 ? row.percent : index === 0 ? 100 : 0}%` }}
+              />
+            ))}
+          </div>
         </Panel>
       </div>
 

@@ -9,6 +9,8 @@ import {
   CheckCircle2,
   ClipboardList,
   CreditCard,
+  Eye,
+  EyeOff,
   FileText,
   LayoutDashboard,
   Loader2,
@@ -544,12 +546,6 @@ function userMatchesSearch(
 
 export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
   const queryClient = useQueryClient();
-  const overviewQuery = useQuery({
-    queryKey: ["moderator", "overview"],
-    queryFn: getModeratorOverview,
-    staleTime: 30_000,
-  });
-
   const [userForm, setUserForm] = useState<UserFormState>(EMPTY_USER_FORM);
   const [customerForm, setCustomerForm] = useState<CustomerFormState>(EMPTY_CUSTOMER_FORM);
   const [customerDrafts, setCustomerDrafts] = useState<Record<number, Partial<CustomerFormState>>>({});
@@ -558,6 +554,22 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
   const [userModalOpen, setUserModalOpen] = useState(view === "create-user");
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
   const [userSearch, setUserSearch] = useState("");
+  const [showUserPassword, setShowUserPassword] = useState(false);
+  const [customerSearch, setCustomerSearch] = useState("");
+  const trimmedCustomerSearch = customerSearch.trim();
+  const overviewParams = useMemo(
+    () => ({
+      include_customers: view === "manage-customers",
+      customer_limit: view === "manage-customers" ? 80 : undefined,
+      customer_q: view === "manage-customers" ? trimmedCustomerSearch : undefined,
+    }),
+    [trimmedCustomerSearch, view]
+  );
+  const overviewQuery = useQuery({
+    queryKey: ["moderator", "overview", overviewParams],
+    queryFn: () => getModeratorOverview(overviewParams),
+    staleTime: 30_000,
+  });
 
   const dealers = overviewQuery.data?.dealers ?? [];
   const roleOptions = overviewQuery.data?.roles ?? EMPTY_ROLES;
@@ -798,11 +810,13 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
   const openCreateUserModal = () => {
     setEditingUserId(null);
     setUserForm(EMPTY_USER_FORM);
+    setShowUserPassword(false);
     setUserModalOpen(true);
   };
   const openEditUserModal = (user: ModeratorUserRecord) => {
     setEditingUserId(user.id);
     setUserForm(userRecordToForm(user));
+    setShowUserPassword(false);
     setUserModalOpen(true);
   };
   const closeUserModal = (open: boolean) => {
@@ -811,6 +825,7 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
     if (!open) {
       setEditingUserId(null);
       setUserForm(EMPTY_USER_FORM);
+      setShowUserPassword(false);
     }
   };
   const submitUserModal = async () => {
@@ -849,15 +864,16 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
 
     if (isEditingUser) {
       const password = userForm.password.trim();
+      const updatePayload: Parameters<typeof updateModeratorUser>[1] = { ...payload };
+
+      if (password.length >= 6) {
+        updatePayload.password = password;
+      }
 
       await updateUserMutation.mutateAsync({
         userId: editingUser.id,
-        payload,
+        payload: updatePayload,
       });
-
-      if (password.length >= 6) {
-        await resetUserPasswordMutation.mutateAsync({ userId: editingUser.id, password });
-      }
 
       return;
     }
@@ -1009,13 +1025,28 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
                 <span className={cn("font-semibold", isDarkMode ? "text-[#dce9df]" : "text-[var(--brand-primary-strong)]")}>
                   {isEditingUser ? "Yeni Şifre" : "Şifre"}
                 </span>
-                <Input
-                  className={userModalInputClassName}
-                  type="password"
-                  value={userForm.password}
-                  onChange={(event) => setUserForm((prev) => ({ ...prev, password: event.target.value }))}
-                  placeholder={isEditingUser ? "Değişmeyecekse boş bırakın" : "En az 6 karakter"}
-                />
+                <div className="relative">
+                  <Input
+                    className={cn(userModalInputClassName, "pr-11")}
+                    type={showUserPassword ? "text" : "password"}
+                    value={userForm.password}
+                    onChange={(event) => setUserForm((prev) => ({ ...prev, password: event.target.value }))}
+                    placeholder={isEditingUser ? "Değişmeyecekse boş bırakın" : "En az 6 karakter"}
+                  />
+                  <button
+                    type="button"
+                    aria-label={showUserPassword ? "Şifreyi gizle" : "Şifreyi göster"}
+                    onClick={() => setShowUserPassword((previous) => !previous)}
+                    className={cn(
+                      "absolute right-2 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-md transition-colors",
+                      isDarkMode
+                        ? "text-[#a9b9ae] hover:bg-[#1b2b21] hover:text-[#dce9df]"
+                        : "text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                    )}
+                  >
+                    {showUserPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
               </label>
 
               <label className="space-y-2 text-sm">
@@ -2314,6 +2345,21 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
           </div>
         </div>
 
+        <div className="mb-4 grid gap-3 xl:grid-cols-[minmax(280px,420px)_auto] xl:items-center xl:justify-between">
+          <label className="relative block">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--muted-foreground)]" />
+            <Input
+              value={customerSearch}
+              onChange={(event) => setCustomerSearch(event.target.value)}
+              placeholder="Cari kodu, unvan, şehir veya telefon ara"
+              className="h-11 rounded-xl pl-9"
+            />
+          </label>
+          <div className="text-xs font-extrabold text-[var(--muted-foreground)]">
+            {overviewQuery.isFetching ? "Cariler yenileniyor..." : `${customers.length} / ${summary.customers_total} cari listeleniyor`}
+          </div>
+        </div>
+
         <div className={tableShellClassName}>
           <table className="w-full min-w-[1260px] text-sm">
             <thead className={tableHeadClassName}>
@@ -2329,6 +2375,13 @@ export function ModeratorPanelPage({ view }: { view: ModeratorPanelView }) {
               </tr>
             </thead>
             <tbody>
+              {customers.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="px-4 py-10 text-center text-sm font-semibold text-[var(--muted-foreground)]">
+                    Cari bulunamadı.
+                  </td>
+                </tr>
+              ) : null}
               {customers.map((customer) => {
                 const draft = getCustomerDraft(customer);
                 const totalDue = customer.balance_summary?.total_due ?? customer.credit_limit;

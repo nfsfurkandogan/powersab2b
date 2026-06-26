@@ -5,6 +5,9 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Product;
 use App\Support\Products\ProductImageDataUrl;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
@@ -22,6 +25,29 @@ class ProductImageController extends Controller
             $imageUrl = ProductImageDataUrl::urlFromMeta($product->meta);
 
             abort_if($imageUrl === null, SymfonyResponse::HTTP_NOT_FOUND);
+
+            $remoteImage = $this->remoteImage($imageUrl, (int) $product->id);
+            if ($remoteImage !== null) {
+                $etag = $this->etag(
+                    $product,
+                    $request->integer('w', 192),
+                    $remoteImage['path'],
+                    null
+                );
+
+                if ($request->headers->get('If-None-Match') === $etag) {
+                    return response('', SymfonyResponse::HTTP_NOT_MODIFIED)
+                        ->header('ETag', $etag)
+                        ->header('Cache-Control', 'private, max-age=2592000, immutable');
+                }
+
+                return response(file_get_contents($remoteImage['path']) ?: '', SymfonyResponse::HTTP_OK)
+                    ->header('Content-Type', $remoteImage['mime'])
+                    ->header('Content-Length', (string) filesize($remoteImage['path']))
+                    ->header('Cache-Control', 'private, max-age=2592000, immutable')
+                    ->header('ETag', $etag)
+                    ->header('X-Content-Type-Options', 'nosniff');
+            }
 
             return redirect()
                 ->away($imageUrl)
@@ -131,12 +157,175 @@ class ProductImageController extends Controller
         return is_string($thumbnail) && $thumbnail !== '' ? $thumbnail : null;
     }
 
-    private function etag(Product $product, int $width, ?string $path, string $fallbackBinary): string
+    private function etag(Product $product, int $width, ?string $path, ?string $fallbackBinary): string
     {
-        $size = $path !== null && is_file($path) ? (int) filesize($path) : strlen($fallbackBinary);
+        $size = $path !== null && is_file($path) ? (int) filesize($path) : strlen((string) $fallbackBinary);
         $mtime = $path !== null && is_file($path) ? (int) filemtime($path) : $this->version($product);
 
         return '"'.sha1($product->id.'|'.$this->version($product).'|'.$width.'|'.$size.'|'.$mtime).'"';
+    }
+
+    private function remoteImage(string $imageUrl, int $productId): ?array
+    {
+        if (! filter_var($imageUrl, FILTER_VALIDATE_URL)) {
+            return null;
+        }
+
+        if (! $this->isRemoteImageFetchEnabled() || ! $this->isAllowedRemoteImageHost($imageUrl)) {
+            return null;
+        }
+
+        $cacheTtlSeconds = (int) (env('PRODUCT_IMAGE_REMOTE_CACHE_TTL_SECONDS', 86400));
+        $cacheDir = storage_path('app/product-image-remote-cache');
+        if (! is_dir($cacheDir) && ! mkdir($cacheDir, 0775, true) && ! is_dir($cacheDir)) {
+            return null;
+        }
+
+        $hash = hash('sha256', $imageUrl);
+        $subFolder = $cacheDir.'/'.substr($hash, 0, 2).'/'.substr($hash, 2, 2);
+        if (! is_dir($subFolder) && ! mkdir($subFolder, 0775, true) && ! is_dir($subFolder)) {
+            return null;
+        }
+
+        $path = $subFolder.'/'.$hash;
+        $metaPath = $path.'.meta';
+
+        if (is_file($path) && is_file($metaPath)) {
+            $meta = json_decode((string) file_get_contents($metaPath), true);
+            if (is_array($meta)) {
+                $fetchedAt = (int) ($meta['fetched_at'] ?? 0);
+                if (time() - $fetchedAt < $cacheTtlSeconds) {
+                    $mime = is_string($meta['mime'] ?? null) ? $meta['mime'] : null;
+                    if (is_string($mime) && $mime !== '' && is_file($path) && filesize($path) > 0) {
+                        return ['path' => $path, 'mime' => $mime];
+                    }
+                }
+            }
+        }
+
+        return $this->downloadAndCacheRemoteImage($imageUrl, $path, $metaPath, $productId);
+    }
+
+    private function isRemoteImageFetchEnabled(): bool
+    {
+        return filter_var(env('PRODUCT_IMAGE_FETCH_REMOTE', false), FILTER_VALIDATE_BOOLEAN);
+    }
+
+    private function isAllowedRemoteImageHost(string $imageUrl): bool
+    {
+        $hostList = env('PRODUCT_IMAGE_ALLOWED_HOSTS', '');
+        $allowedHosts = array_values(array_filter(array_map(
+            static fn (string $host): string => strtolower(trim($host)),
+            preg_split('/\s*,\s*/', $hostList ?? '', -1, PREG_SPLIT_NO_EMPTY)
+        )));
+
+        if ($allowedHosts === []) {
+            return false;
+        }
+
+        $hostname = strtolower((string) parse_url($imageUrl, PHP_URL_HOST));
+        if ($hostname === '') {
+            return false;
+        }
+
+        foreach ($allowedHosts as $allowedHost) {
+            if ($allowedHost === '') {
+                continue;
+            }
+
+            $normalizedAllowed = ltrim($allowedHost, '*');
+            $normalizedAllowed = ltrim($normalizedAllowed, '.');
+
+            if (
+                $hostname === $normalizedAllowed
+                || str_ends_with($hostname, '.'.$normalizedAllowed)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function downloadAndCacheRemoteImage(
+        string $imageUrl,
+        string $path,
+        string $metaPath,
+        int $productId
+    ): ?array {
+        try {
+            $timeoutSeconds = (int) (env('PRODUCT_IMAGE_REMOTE_TIMEOUT_SECONDS', 8));
+            $maxBytes = (int) (env('PRODUCT_IMAGE_REMOTE_MAX_BYTES', 8_000_000));
+
+            $response = Http::timeout($timeoutSeconds)
+                ->withHeaders([
+                    'Accept' => 'image/*',
+                    'User-Agent' => 'PowersaB2B Product Image Fetcher',
+                ])
+                ->get($imageUrl);
+
+            if (! $response->successful()) {
+                return null;
+            }
+
+            $contentType = trim((string) ($response->header('Content-Type') ?? ''));
+            $contentLength = (int) ($response->header('Content-Length') ?? 0);
+            if ($contentLength > 0 && $contentLength > $maxBytes) {
+                return null;
+            }
+
+            $binary = $response->body();
+            if (strlen($binary) === 0 || strlen($binary) > $maxBytes) {
+                return null;
+            }
+
+            $mime = $this->extractImageMimeFromContent($binary, $contentType);
+            if ($mime === null) {
+                return null;
+            }
+
+            if (! str_starts_with($mime, 'image/')) {
+                return null;
+            }
+
+            if (file_put_contents($path, $binary, LOCK_EX) === false) {
+                return null;
+            }
+
+            $meta = [
+                'mime' => $mime,
+                'fetched_at' => time(),
+                'product_id' => $productId,
+                'source' => $imageUrl,
+            ];
+
+            file_put_contents($metaPath, json_encode($meta), LOCK_EX);
+
+            return ['path' => $path, 'mime' => $mime];
+        } catch (RequestException | ConnectionException) {
+            return null;
+        }
+    }
+
+    private function extractImageMimeFromContent(string $binary, string $contentType): ?string
+    {
+        if ($contentType !== '' && str_starts_with($contentType, 'image/')) {
+            return explode(';', $contentType, 2)[0];
+        }
+
+        $info = @finfo_open(FILEINFO_MIME_TYPE);
+        if ($info === false) {
+            return null;
+        }
+
+        $detected = finfo_buffer($info, $binary);
+        finfo_close($info);
+
+        if (is_string($detected) && $detected !== '' && str_starts_with($detected, 'image/')) {
+            return explode(';', $detected, 2)[0];
+        }
+
+        return null;
     }
 
     private function version(Product $product): int

@@ -11,6 +11,7 @@ use App\Models\Customer;
 use App\Models\CustomerCardRequest;
 use App\Models\CustomerCardRequestAttachment;
 use App\Models\Dealer;
+use App\Models\IntegrationSyncEvent;
 use App\Models\User;
 use App\Services\Integrations\Logo\LogoWritePublisher;
 use Illuminate\Database\Eloquent\Builder;
@@ -275,6 +276,7 @@ class CustomerCardRequestController extends Controller
         $dealerId = $this->resolveDealerId($user, $validated);
         $salesperson = $this->resolveSalesperson($user, $dealerId, $validated);
         $autoConvert = (bool) ($validated['auto_convert'] ?? false);
+        $createdCustomer = null;
 
         if ($dealerId === null) {
             return response()->json([
@@ -318,7 +320,7 @@ class CustomerCardRequestController extends Controller
         ]);
 
         if ($autoConvert) {
-            $this->createCustomerFromRequest($customerCardRequest, $user, $logoWritePublisher, false);
+            $createdCustomer = $this->createCustomerFromRequest($customerCardRequest, $user, $logoWritePublisher, false);
         }
 
         $customerCardRequest->loadMissing([
@@ -334,11 +336,9 @@ class CustomerCardRequestController extends Controller
 
         return response()->json([
             'data' => $this->serializeCustomerCardRequest($customerCardRequest),
-            'customer' => $customerCardRequest->customer ? [
-                'id' => $customerCardRequest->customer->id,
-                'code' => $customerCardRequest->customer->code,
-                'name' => $customerCardRequest->customer->name,
-            ] : null,
+            'customer' => $createdCustomer instanceof Customer
+                ? $this->serializeCreatedCustomer($createdCustomer)
+                : ($customerCardRequest->customer ? $this->serializeCreatedCustomer($customerCardRequest->customer) : null),
         ], Response::HTTP_CREATED);
     }
 
@@ -427,11 +427,7 @@ class CustomerCardRequestController extends Controller
                 'attachments:id,customer_card_request_id,uploaded_by_user_id,attachment_type,disk,path,original_name,mime_type,size_bytes,note,created_at',
                 'attachments.uploadedBy:id,name',
             ])),
-            'customer' => [
-                'id' => $customer->id,
-                'code' => $customer->code,
-                'name' => $customer->name,
-            ],
+            'customer' => $this->serializeCreatedCustomer($customer),
         ]);
     }
 
@@ -518,7 +514,7 @@ class CustomerCardRequestController extends Controller
 
     private function ensureCustomerCardAutoConvertRole(User $user): void
     {
-        if (! $user->hasAnyRole(['admin', 'salesperson', 'point'])) {
+        if (! $user->hasAnyRole(['admin', 'dealer_admin', 'salesperson', 'point'])) {
             abort(Response::HTTP_FORBIDDEN);
         }
     }
@@ -814,6 +810,34 @@ class CustomerCardRequestController extends Controller
 
             return $customer;
         });
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function serializeCreatedCustomer(Customer $customer): array
+    {
+        return [
+            'id' => $customer->id,
+            'code' => $customer->code,
+            'name' => $customer->name,
+            'sync_status' => $customer->sync_status,
+            'logo_queue_status' => $this->latestLogoCustomerWriteStatus($customer),
+        ];
+    }
+
+    private function latestLogoCustomerWriteStatus(Customer $customer): ?string
+    {
+        $status = IntegrationSyncEvent::query()
+            ->where('system', 'logo')
+            ->where('domain', 'customers-write')
+            ->where('direction', 'outbound')
+            ->where('entity_type', Customer::class)
+            ->where('entity_id', (int) $customer->id)
+            ->latest('id')
+            ->value('status');
+
+        return is_string($status) ? $status : null;
     }
 
     /**

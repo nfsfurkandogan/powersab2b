@@ -102,12 +102,18 @@ class WarehouseOrderController extends Controller
 
         if ($q !== '') {
             $query->where(function (Builder $builder) use ($q): void {
-                $builder->where('order_no', 'like', "%{$q}%")
-                    ->orWhereHas('customer', function (Builder $customerQuery) use ($q): void {
-                        $customerQuery
-                            ->where('code', 'like', "%{$q}%")
-                            ->orWhere('name', 'like', "%{$q}%");
-                    });
+                if (ctype_digit($q)) {
+                    $builder->whereKey((int) $q)
+                        ->orWhere('order_no', 'like', "%{$q}%");
+                } else {
+                    $builder->where('order_no', 'like', "%{$q}%");
+                }
+
+                $builder->orWhereHas('customer', function (Builder $customerQuery) use ($q): void {
+                    $customerQuery
+                        ->where('code', 'like', "%{$q}%")
+                        ->orWhere('name', 'like', "%{$q}%");
+                });
             });
         }
 

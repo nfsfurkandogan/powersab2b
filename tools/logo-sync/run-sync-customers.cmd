@@ -14,6 +14,9 @@ if not exist node_modules (
   call npm ci --omit=dev
 )
 
+set "SYNC_BATCH_SIZE=100"
+set "SYNC_CUSTOMERS_LOOKBACK_SECONDS=300"
+
 call npm run sync:customers >> "%~dp0sync-customers.log" 2>&1
 set "EXITCODE=%ERRORLEVEL%"
 

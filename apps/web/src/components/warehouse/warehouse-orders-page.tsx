@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -226,6 +226,7 @@ function buildPaginationKey(params: {
 export function WarehouseOrdersPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [query, setQuery] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -253,6 +254,10 @@ export function WarehouseOrdersPage() {
   );
 
   const currentPagination = paginationByKey[paginationKey] ?? { cursor: undefined, history: [] };
+
+  useEffect(() => {
+    searchInputRef.current?.focus();
+  }, []);
 
   const readyOrdersQuery = useQuery({
     queryKey: [
@@ -600,9 +605,11 @@ export function WarehouseOrdersPage() {
               <div className="relative">
                 <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--muted-foreground)]" />
                 <Input
+                  ref={searchInputRef}
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Sipariş no / cari kod / cari ünvan"
+                  autoFocus
+                  placeholder="Barkod okut / sipariş no / cari kod / cari ünvan"
                   className="h-11 rounded-xl pl-11 text-sm font-bold"
                 />
               </div>
@@ -671,7 +678,108 @@ export function WarehouseOrdersPage() {
       <Card className="overflow-hidden">
         <CardContent className="p-0">
           <div className="overflow-hidden bg-[var(--surface)] shadow-[0_22px_46px_-38px_rgba(10,32,20,0.32)] md:rounded-[22px]">
-            <div className="overflow-hidden px-2 pb-1 pt-2 lg:px-3">
+            <div className="space-y-3 p-3 lg:hidden">
+              {readyOrdersQuery.isLoading ? (
+                Array.from({ length: 4 }).map((_, index) => (
+                  <Skeleton key={`warehouse-mobile-skeleton-${index}`} className="h-40 rounded-2xl" />
+                ))
+              ) : null}
+
+              {readyOrdersQuery.isError ? (
+                <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-bold text-red-700">
+                  {readyOrdersQuery.error instanceof Error ? readyOrdersQuery.error.message : "Depo siparişleri alınamadı."}
+                </div>
+              ) : null}
+
+              {!readyOrdersQuery.isLoading && !readyOrdersQuery.isError && rows.length === 0 ? (
+                <div className="rounded-2xl border border-[var(--brand-border)] bg-[var(--surface-soft)] p-5 text-center text-[var(--muted-foreground)]">
+                  <PackageSearch className="mx-auto h-9 w-9 text-[var(--brand-primary)]" />
+                  <p className="mt-3 text-sm font-black">Sipariş yok</p>
+                  {hasActiveFilters ? (
+                    <Button variant="outline" size="sm" className="mt-3" onClick={clearFilters}>
+                      Filtreleri Temizle
+                    </Button>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {!readyOrdersQuery.isLoading &&
+                !readyOrdersQuery.isError &&
+                rows.map((order: WarehouseReadyOrderItem) => {
+                  const totalQuantity = toSafeNumber(order.items_summary?.total_quantity);
+                  const itemCount = toSafeNumber(order.items_summary?.item_count);
+
+                  return (
+                    <article
+                      key={`warehouse-mobile-order-${order.id}`}
+                      className="rounded-2xl border border-[var(--brand-border)] bg-[var(--surface)] p-3 shadow-[0_16px_36px_-30px_rgba(10,32,20,0.45)]"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-black text-[var(--brand-primary-strong)]">
+                            {toDisplayText(order.order_no)}
+                          </p>
+                          <p className="mt-1 text-xs font-bold text-[var(--muted-foreground)]">
+                            {itemCount} kalem · {totalQuantity} adet
+                          </p>
+                        </div>
+                        <span className="shrink-0 rounded-lg border border-[#c7ddd1] bg-[#eef8f1] px-2 py-1 text-xs font-black text-[#1f6a43]">
+                          {formatMoney(order.grand_total, order.currency)}
+                        </span>
+                      </div>
+
+                      <div className="mt-3 grid gap-2 rounded-xl bg-[var(--surface-soft)] p-3 text-xs">
+                        <div>
+                          <p className="font-black text-[var(--foreground)]">{toDisplayText(order.customer?.title)}</p>
+                          <p className="mt-0.5 font-bold text-[var(--muted-foreground)]">{toDisplayText(order.customer?.code)}</p>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <p className="text-[10px] font-black uppercase text-[var(--muted-foreground)]">Plasiyer</p>
+                            <p className="truncate font-bold text-[var(--foreground)]">{toDisplayText(order.salesperson?.name, "Atanmamış")}</p>
+                          </div>
+                          <div>
+                            <p className="text-[10px] font-black uppercase text-[var(--muted-foreground)]">Tarih</p>
+                            <p className="font-bold text-[var(--foreground)]">{formatDate(order.approved_at)}</p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 grid grid-cols-3 gap-2">
+                        <Button
+                          type="button"
+                          className={cn(WAREHOUSE_DETAIL_ACTION_CLASSNAME, "h-10 px-2 text-[11px]")}
+                          onClick={() => openOrderDetail(order)}
+                        >
+                          <Eye className="h-4 w-4 shrink-0" />
+                          Detay
+                        </Button>
+                        <Button
+                          className={cn(WAREHOUSE_TABLE_ACTION_CLASSNAME, WAREHOUSE_PRINT_ACTION_CLASSNAME, "h-10 px-2 text-[11px]")}
+                          asChild
+                        >
+                          <Link href={`/warehouse/orders/${order.id}/print`} target="_blank" rel="noreferrer">
+                            <Printer className="h-4 w-4 shrink-0" />
+                            Form
+                          </Link>
+                        </Button>
+                        <Button
+                          className={cn(WAREHOUSE_TABLE_ACTION_CLASSNAME, WAREHOUSE_PRIMARY_ACTION_CLASSNAME, "h-10 px-2 text-[11px]")}
+                          onClick={() => {
+                            setShipmentOrder(order);
+                            setSelectedWarehouseStaffId(warehouseStaff[0] ? String(warehouseStaff[0].id) : "");
+                          }}
+                        >
+                          <Truck className="h-4 w-4 shrink-0" />
+                          Sevkiyat
+                        </Button>
+                      </div>
+                    </article>
+                  );
+                })}
+            </div>
+
+            <div className="hidden overflow-hidden px-2 pb-1 pt-2 lg:block lg:px-3">
               <Table className="min-w-0 table-fixed text-[11px]">
                 <colgroup>
                   <col className="w-[7%]" />

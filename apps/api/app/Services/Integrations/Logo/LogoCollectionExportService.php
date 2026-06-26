@@ -264,7 +264,7 @@ class LogoCollectionExportService
 
         return [
             'id' => (int) $cashbox->id,
-            'code' => $this->normalizeCashboxCode($cashbox->code),
+            'code' => $this->normalizeCashboxCode($cashbox->code, $cashbox->name),
             'name' => $this->normalizeCashboxName($cashbox->code, $cashbox->name),
         ];
     }
@@ -296,12 +296,13 @@ class LogoCollectionExportService
         return $normalized === '' ? null : $normalized;
     }
 
-    private function normalizeCashboxCode(mixed $code): ?string
+    private function normalizeCashboxCode(mixed $code, mixed $name = null): ?string
     {
         $normalizedCode = $this->nullableString($code);
+        $normalizedName = $this->nullableString($name);
 
         if ($this->isLocalPointCashboxCode($normalizedCode)) {
-            return $this->nullableString(config('integrations.pos.point_cashbox_code')) ?? $normalizedCode;
+            return $this->pointLogoCashboxCode($normalizedCode, $normalizedName) ?? $normalizedCode;
         }
 
         return $normalizedCode;
@@ -312,7 +313,7 @@ class LogoCollectionExportService
         $normalizedName = $this->nullableString($name);
 
         if ($this->isLocalPointCashboxCode($this->nullableString($code))) {
-            return $this->nullableString(config('integrations.pos.point_cashbox_name')) ?? $normalizedName;
+            return $this->pointLogoCashboxName($this->nullableString($code), $normalizedName) ?? $normalizedName;
         }
 
         return $normalizedName;
@@ -321,5 +322,32 @@ class LogoCollectionExportService
     private function isLocalPointCashboxCode(?string $code): bool
     {
         return $code !== null && str_starts_with($code, 'POINT-');
+    }
+
+    private function pointLogoCashboxCode(?string $code, ?string $name): ?string
+    {
+        if ($this->isBatumCashbox($code, $name)) {
+            return $this->nullableString(config('integrations.pos.batum_point_cashbox_code'));
+        }
+
+        return $this->nullableString(config('integrations.pos.erzurum_point_cashbox_code'))
+            ?? $this->nullableString(config('integrations.pos.point_cashbox_code'));
+    }
+
+    private function pointLogoCashboxName(?string $code, ?string $name): ?string
+    {
+        if ($this->isBatumCashbox($code, $name)) {
+            return $this->nullableString(config('integrations.pos.batum_point_cashbox_name'));
+        }
+
+        return $this->nullableString(config('integrations.pos.erzurum_point_cashbox_name'))
+            ?? $this->nullableString(config('integrations.pos.point_cashbox_name'));
+    }
+
+    private function isBatumCashbox(?string $code, ?string $name): bool
+    {
+        $haystack = mb_strtoupper(trim(($code ?? '').' '.($name ?? '')), 'UTF-8');
+
+        return str_contains($haystack, 'BATUM');
     }
 }

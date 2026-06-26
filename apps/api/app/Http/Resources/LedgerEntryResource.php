@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources;
 
+use App\Support\Pricing\DisplayCurrency;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -18,6 +19,8 @@ class LedgerEntryResource extends JsonResource
         $type = $this->type ?? $this->entry_type;
         $debit = $this->debit ?? ($this->entry_type === 'debit' ? $this->amount : 0);
         $credit = $this->credit ?? ($this->entry_type === 'credit' ? $this->amount : 0);
+
+        $currency = $this->displayCurrency((string) $this->currency, $request);
 
         return [
             'id' => $this->id,
@@ -37,7 +40,7 @@ class LedgerEntryResource extends JsonResource
                 ''
             ),
             'description' => $this->description,
-            'currency' => $this->currency,
+            'currency' => $currency,
             'reference_no' => $this->reference_no,
             'order_id' => $this->order_id,
             'collection_id' => $this->collection_id,
@@ -49,6 +52,18 @@ class LedgerEntryResource extends JsonResource
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
         ];
+    }
+
+    private function displayCurrency(string $currency, Request $request): string
+    {
+        $normalized = strtoupper(trim($currency));
+        $user = $request->user();
+
+        if ($normalized === 'GEL' && ! DisplayCurrency::usesLariPricing($user)) {
+            return 'TRY';
+        }
+
+        return DisplayCurrency::normalize($normalized, $user);
     }
 
     /**

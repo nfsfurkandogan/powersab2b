@@ -20,6 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   type LedgerEntryDto,
   type CollectionMethodFilter,
+  type LedgerEntryType,
   type OrderDetailResponse,
   type PaginatedResponse,
   getOrderDetail,
@@ -79,6 +80,13 @@ const COLLECTION_METHOD_FILTERS: Array<{ value: CollectionMethodFilter; label: s
   { value: "factory_cc", label: "Fabrika Kart Çekimi", className: "border-orange-300/40 bg-orange-400/10 text-orange-100 hover:bg-orange-400/16" },
 ];
 
+const LEDGER_TYPE_FILTERS: Array<{ value: LedgerEntryType; label: string; className: string }> = [
+  { value: "invoice", label: "Fatura", className: "border-amber-300/40 bg-amber-400/10 text-amber-100 hover:bg-amber-400/16" },
+  { value: "payment", label: "Tahsilat", className: "border-emerald-300/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/16" },
+  { value: "credit", label: "Alacak", className: "border-blue-300/40 bg-blue-400/10 text-blue-100 hover:bg-blue-400/16" },
+  { value: "debit", label: "Borç", className: "border-rose-300/40 bg-rose-400/10 text-rose-100 hover:bg-rose-400/16" },
+];
+
 function toAmount(value: string | number): number {
   if (typeof value === "number") {
     return Number.isFinite(value) ? value : 0;
@@ -97,11 +105,49 @@ function formatAmount(value: string | number, currency: string): string {
   })} ${label}`;
 }
 
+function formatSyncDateTime(value: string | null | undefined): string {
+  if (!value) {
+    return "-";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("tr-TR", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(parsed);
+}
+
+function getSourceMeta(sourceSystem: string | null | undefined): { label: string; className: string } {
+  if (sourceSystem === "logo") {
+    return {
+      label: "Logo",
+      className: "border-sky-300/45 bg-sky-400/14 text-sky-100",
+    };
+  }
+
+  if (sourceSystem === "b2b") {
+    return {
+      label: "B2B",
+      className: "border-emerald-300/45 bg-emerald-400/14 text-emerald-100",
+    };
+  }
+
+  return {
+    label: "Yerel",
+    className: "border-[var(--brand-border)] bg-[var(--surface-soft)] text-[var(--muted-foreground)]",
+  };
+}
+
 export function LedgerPage() {
   const { selectedCustomer } = useSession();
 
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [ledgerTypeFilter, setLedgerTypeFilter] = useState<LedgerEntryType | "">("");
   const [collectionMethodFilter, setCollectionMethodFilter] = useState<CollectionMethodFilter | "">("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -114,7 +160,12 @@ export function LedgerPage() {
 
   const fetchLedger = (
     page = 1,
-    overrides?: { dateFrom?: string; dateTo?: string; collectionMethod?: CollectionMethodFilter | "" }
+    overrides?: {
+      dateFrom?: string;
+      dateTo?: string;
+      ledgerType?: LedgerEntryType | "";
+      collectionMethod?: CollectionMethodFilter | "";
+    }
   ) => {
     if (!selectedCustomer) {
       setPayload(null);
@@ -123,6 +174,7 @@ export function LedgerPage() {
 
     const effectiveDateFrom = overrides?.dateFrom ?? dateFrom;
     const effectiveDateTo = overrides?.dateTo ?? dateTo;
+    const effectiveLedgerType = overrides?.ledgerType ?? ledgerTypeFilter;
     const effectiveCollectionMethod = overrides?.collectionMethod ?? collectionMethodFilter;
 
     setLoading(true);
@@ -131,6 +183,7 @@ export function LedgerPage() {
     void listCustomerLedger(selectedCustomer.id, {
       date_from: effectiveDateFrom || undefined,
       date_to: effectiveDateTo || undefined,
+      type: effectiveLedgerType || undefined,
       collection_method: effectiveCollectionMethod || undefined,
       per_page: 50,
       page,
@@ -157,7 +210,7 @@ export function LedgerPage() {
       .finally(() => setDetailLoading(false));
   };
 
-  const hasActiveFilters = Boolean(dateFrom) || Boolean(dateTo) || Boolean(collectionMethodFilter);
+  const hasActiveFilters = Boolean(dateFrom) || Boolean(dateTo) || Boolean(ledgerTypeFilter) || Boolean(collectionMethodFilter);
   const displayRows = useMemo(() => payload?.data ?? [], [payload?.data]);
   const listedRowCount = payload?.summary?.total_count ?? payload?.meta?.total ?? displayRows.length;
   const summary = useMemo(() => {
@@ -194,7 +247,7 @@ export function LedgerPage() {
     <div className="space-y-3">
       <Card className="dashboard-panel-card md:sticky md:top-24 md:z-20">
         <CardContent className="p-3">
-          <div className="grid gap-3 xl:grid-cols-[minmax(150px,0.8fr)_minmax(150px,0.8fr)_minmax(360px,2fr)_auto_auto] xl:items-end">
+          <div className="grid gap-3 xl:grid-cols-[minmax(150px,0.75fr)_minmax(150px,0.75fr)_minmax(300px,1.35fr)_minmax(360px,1.65fr)_auto_auto] xl:items-end">
             <div>
               <label className="mb-1 inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
                 <CalendarDays className="h-3.5 w-3.5" />
@@ -220,6 +273,50 @@ export function LedgerPage() {
                 onChange={(event) => setDateTo(event.target.value)}
                 className="h-12"
               />
+            </div>
+            <div>
+              <label className="mb-1 inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
+                Hareket Tipi
+              </label>
+              <div className="flex min-h-12 flex-wrap items-center gap-2 rounded-[14px] border border-[var(--brand-border)] bg-[var(--surface)] px-2 py-1.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className={
+                    ledgerTypeFilter === ""
+                      ? "h-8 border-white/70 bg-white/18 px-3 text-xs text-white"
+                      : "h-8 border-white/15 bg-white/[0.04] px-3 text-xs text-slate-200 hover:bg-white/[0.08] hover:text-white"
+                  }
+                  disabled={loading || !selectedCustomer}
+                  onClick={() => {
+                    setLedgerTypeFilter("");
+                    fetchLedger(1, { ledgerType: "" });
+                  }}
+                >
+                  Tümü
+                </Button>
+                {LEDGER_TYPE_FILTERS.map((option) => {
+                  const selected = ledgerTypeFilter === option.value;
+                  return (
+                    <Button
+                      type="button"
+                      key={option.value}
+                      size="sm"
+                      variant="outline"
+                      className={selected ? "h-8 border-white/70 bg-white/18 px-3 text-xs text-white" : `h-8 px-3 text-xs ${option.className}`}
+                      disabled={loading || !selectedCustomer}
+                      onClick={() => {
+                        const nextType = selected ? "" : option.value;
+                        setLedgerTypeFilter(nextType);
+                        fetchLedger(1, { ledgerType: nextType });
+                      }}
+                    >
+                      {option.label}
+                    </Button>
+                  );
+                })}
+              </div>
             </div>
             <div>
               <label className="mb-1 inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-foreground)]">
@@ -277,8 +374,9 @@ export function LedgerPage() {
                 onClick={() => {
                   setDateFrom("");
                   setDateTo("");
+                  setLedgerTypeFilter("");
                   setCollectionMethodFilter("");
-                  fetchLedger(1, { dateFrom: "", dateTo: "", collectionMethod: "" });
+                  fetchLedger(1, { dateFrom: "", dateTo: "", ledgerType: "", collectionMethod: "" });
                 }}
               >
                 Temizle
@@ -324,23 +422,25 @@ export function LedgerPage() {
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                  setDateFrom("");
-                  setDateTo("");
-                  setCollectionMethodFilter("");
-                  fetchLedger(1, { dateFrom: "", dateTo: "", collectionMethod: "" });
-                }}
-              >
+                    setDateFrom("");
+                    setDateTo("");
+                    setLedgerTypeFilter("");
+                    setCollectionMethodFilter("");
+                    fetchLedger(1, { dateFrom: "", dateTo: "", ledgerType: "", collectionMethod: "" });
+                  }}
+                >
                   Temizle
                 </Button>
               ) : null}
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1210px] text-left text-[13px]">
+              <table className="w-full min-w-[1320px] text-left text-[13px]">
                 <thead>
                   <tr className="border-b border-[var(--brand-border)] text-[11px] uppercase text-[var(--muted-foreground)]">
                     <th className="px-3 py-2 text-center">Detay</th>
                     <th className="px-3 py-2">Tarih</th>
+                    <th className="px-3 py-2">Kaynak</th>
                     <th className="px-3 py-2">Tip</th>
                     <th className="px-3 py-2">Satış Tipi</th>
                     <th className="px-3 py-2">Açıklama</th>
@@ -370,6 +470,21 @@ export function LedgerPage() {
                         )}
                       </td>
                       <td className="px-3 py-2.5 font-medium">{formatLedgerDate(row.date)}</td>
+                      <td className="px-3 py-2.5">
+                        <Badge
+                          variant="outline"
+                          className={`h-6 px-2 text-xs font-black ${getSourceMeta(row.source_system).className}`}
+                          title={
+                            row.source_system === "logo"
+                              ? `Logo ref: ${row.source_reference ?? "-"} · Sync: ${formatSyncDateTime(row.last_synced_at)}`
+                              : row.source_system === "b2b"
+                                ? "B2B kaynaklı hareket"
+                                : "Yerel hareket"
+                          }
+                        >
+                          {getSourceMeta(row.source_system).label}
+                        </Badge>
+                      </td>
                       <td className="px-3 py-2.5">
                         <Badge
                           variant="outline"

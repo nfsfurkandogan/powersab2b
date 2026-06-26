@@ -3,8 +3,11 @@
 import { useMemo, useState } from "react";
 import {
   Barcode,
+  CheckCircle2,
   ClipboardCheck,
   ClipboardList,
+  DatabaseZap,
+  Loader2,
   PackageCheck,
   Plus,
   RotateCcw,
@@ -13,7 +16,9 @@ import {
   Truck,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useMutation } from "@tanstack/react-query";
 
+import { createPurchaseReceipt, type PurchaseReceiptRecord } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -64,6 +69,7 @@ export function MalKabulPage() {
   const [note, setNote] = useState("");
   const [draftLine, setDraftLine] = useState<DraftLine>(emptyLine);
   const [lines, setLines] = useState<ReceiptLine[]>([]);
+  const [lastReceipt, setLastReceipt] = useState<PurchaseReceiptRecord | null>(null);
 
   const totals = useMemo(
     () =>
@@ -118,13 +124,40 @@ export function MalKabulPage() {
     setLines([]);
   };
 
+  const saveReceiptMutation = useMutation({
+    mutationFn: () =>
+      createPurchaseReceipt({
+        document_no: documentNo.trim() || null,
+        supplier_name: supplier.trim() || null,
+        warehouse_code: warehouse.trim() || null,
+        warehouse_name: warehouse.trim() || null,
+        received_at: receivedAt,
+        note: note.trim() || null,
+        items: lines.map((line) => ({
+          product_code: line.productCode || null,
+          product_name: line.productName,
+          expected_quantity: line.expectedQuantity,
+          accepted_quantity: line.acceptedQuantity,
+          note: line.note || null,
+        })),
+      }),
+    onSuccess: (response) => {
+      setLastReceipt(response.data);
+      toast.success(`${response.data.receipt_no} Logo kuyruğuna alındı.`);
+      resetDraft();
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Mal kabul kaydedilemedi.");
+    },
+  });
+
   const prepareReceipt = () => {
     if (lines.length === 0) {
       toast.error("Mal kabul için en az bir ürün satırı ekleyin.");
       return;
     }
 
-    toast.success("Mal kabul taslağı hazırlandı.");
+    saveReceiptMutation.mutate();
   };
 
   return (
@@ -138,7 +171,7 @@ export function MalKabulPage() {
                 Satınalma / Mal Kabul
               </CardTitle>
               <Badge variant="secondary" className="w-fit px-3 py-1 text-xs font-black">
-                Taslak Kayıt
+                Logo Kuyruğu
               </Badge>
             </div>
           </CardHeader>
@@ -166,6 +199,16 @@ export function MalKabulPage() {
               <span className="text-xs font-black uppercase tracking-[0.12em] text-[var(--muted-foreground)]">Not</span>
               <Textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Belge veya teslimat notu" />
             </label>
+
+            <div className="rounded-2xl border border-emerald-200/60 bg-emerald-50/80 p-3 text-sm text-emerald-950">
+              <div className="flex items-start gap-2">
+                <DatabaseZap className="mt-0.5 h-4 w-4 shrink-0" />
+                <p className="font-bold">
+                  Kaydettiğiniz mal kabul B2B veritabanına yazılır ve Logo GO Wings köprüsü için
+                  <span className="font-black"> purchase-receipts</span> kuyruğuna alınır.
+                </p>
+              </div>
+            </div>
           </CardContent>
         </Card>
 
@@ -279,13 +322,40 @@ export function MalKabulPage() {
               <RotateCcw className="h-4 w-4" />
               Temizle
             </Button>
-            <Button type="button" className="h-11 rounded-xl px-5 font-black" onClick={prepareReceipt}>
-              <Save className="h-4 w-4" />
-              Kaydı Hazırla
+            <Button
+              type="button"
+              className="h-11 rounded-xl px-5 font-black"
+              disabled={saveReceiptMutation.isPending}
+              onClick={prepareReceipt}
+            >
+              {saveReceiptMutation.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Save className="h-4 w-4" />
+              )}
+              Kaydet ve Logo Kuyruğuna Al
             </Button>
           </div>
         </CardContent>
       </Card>
+
+      {lastReceipt ? (
+        <Card className="border-emerald-200 bg-emerald-50/90">
+          <CardContent className="flex flex-col gap-3 p-4 text-emerald-950 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" />
+              <div>
+                <p className="text-sm font-black">{lastReceipt.receipt_no}</p>
+                <p className="text-xs font-bold">
+                  Logo durumu: {lastReceipt.logo_sync_status ?? lastReceipt.status}
+                  {lastReceipt.logo_external_ref ? ` · Ref: ${lastReceipt.logo_external_ref}` : ""}
+                </p>
+              </div>
+            </div>
+            <Badge className="w-fit bg-emerald-700 text-white">Kuyrukta</Badge>
+          </CardContent>
+        </Card>
+      ) : null}
     </div>
   );
 }

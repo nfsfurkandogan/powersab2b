@@ -6,9 +6,12 @@ use App\Models\Cashbox;
 use App\Models\Collection;
 use App\Models\Customer;
 use App\Models\Dealer;
+use App\Models\IntegrationSyncState;
 use App\Models\LedgerEntry;
 use App\Models\PosExpense;
+use App\Models\PosPayment;
 use App\Models\PosSale;
+use App\Models\PosSaleItem;
 use App\Models\PosSession;
 use App\Models\Product;
 use App\Models\Role;
@@ -198,6 +201,175 @@ class PointPosAccessApiTest extends TestCase
             ->assertJsonPath('data.status', 'closed');
     }
 
+    public function test_closing_pos_session_queues_paid_sales_for_logo_export(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-POINT-'.Str::upper(Str::random(4)),
+            'name' => 'Point Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'menu_permissions' => ['pos', 'pos-expenses', 'pos-day-end', 'delivery-notes'],
+        ])->save();
+
+        $cashbox = Cashbox::query()->create([
+            'code' => 'POINT-'.$user->id,
+            'name' => 'Erzurum Point Kasa',
+            'is_active' => true,
+        ]);
+
+        $session = PosSession::query()->create([
+            'cashbox_id' => $cashbox->id,
+            'opened_by' => $user->id,
+            'opened_at' => now(),
+            'opening_cash' => 0,
+            'status' => 'open',
+        ]);
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'source_system' => 'logo',
+            'source_reference' => '1001',
+            'code' => '120-POS-DAY-END',
+            'name' => 'POS Gün Sonu Cari',
+            'is_active' => true,
+        ]);
+
+        $sale = PosSale::query()->create([
+            'pos_session_id' => $session->id,
+            'customer_id' => $customer->id,
+            'sale_type' => 'cash',
+            'document_type' => 'delivery',
+            'receipt_no' => 'POS-DAY-END-001',
+            'subtotal' => '100.00',
+            'discount_total' => '0.00',
+            'vat_total' => '20.00',
+            'grand_total' => '120.00',
+            'status' => 'paid',
+            'created_by' => $user->id,
+        ]);
+
+        $this->assertDatabaseMissing('integration_sync_states', [
+            'system' => 'logo',
+            'domain' => 'pos-sales',
+            'direction' => 'outbound',
+            'entity_type' => PosSale::class,
+            'entity_id' => $sale->id,
+        ]);
+
+        $this->actingAs($user);
+
+        $this->postJson('/api/pos/sessions/close', [
+            'cashbox_id' => $cashbox->id,
+            'closing_cash_counted' => 120,
+        ])
+            ->assertOk()
+            ->assertJsonPath('data.status', 'closed');
+
+        $this->assertDatabaseHas('integration_sync_states', [
+            'system' => 'logo',
+            'domain' => 'pos-sales',
+            'direction' => 'outbound',
+            'entity_type' => PosSale::class,
+            'entity_id' => $sale->id,
+            'status' => 'queued',
+        ]);
+
+        $this->assertDatabaseHas('integration_sync_events', [
+            'system' => 'logo',
+            'domain' => 'pos-sales',
+            'direction' => 'outbound',
+            'entity_type' => PosSale::class,
+            'entity_id' => $sale->id,
+            'status' => 'queued',
+        ]);
+    }
+
+    public function test_delivery_note_list_can_search_by_receipt_or_customer(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-DELIVERY-'.Str::upper(Str::random(4)),
+            'name' => 'Delivery Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'menu_permissions' => ['pos', 'delivery-notes'],
+        ])->save();
+
+        $cashbox = Cashbox::query()->create([
+            'code' => 'POINT-'.$user->id,
+            'name' => 'Point Kasa',
+            'is_active' => true,
+        ]);
+
+        $session = PosSession::query()->create([
+            'cashbox_id' => $cashbox->id,
+            'opened_by' => $user->id,
+            'opened_at' => now(),
+            'opening_cash' => 0,
+            'status' => 'open',
+        ]);
+
+        $matchingCustomer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'DLV-SPECIAL-CARI',
+            'name' => 'Ozel Irsaliye Cari',
+            'is_active' => true,
+        ]);
+
+        $otherCustomer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'DLV-OTHER',
+            'name' => 'Baska Cari',
+            'is_active' => true,
+        ]);
+
+        PosSale::query()->create([
+            'pos_session_id' => $session->id,
+            'customer_id' => $matchingCustomer->id,
+            'sale_type' => 'cash',
+            'document_type' => 'delivery',
+            'receipt_no' => 'IRS-SPECIAL-001',
+            'subtotal' => '100.00',
+            'discount_total' => '0.00',
+            'vat_total' => '0.00',
+            'grand_total' => '100.00',
+            'status' => 'paid',
+            'created_by' => $user->id,
+        ]);
+
+        PosSale::query()->create([
+            'pos_session_id' => $session->id,
+            'customer_id' => $otherCustomer->id,
+            'sale_type' => 'cash',
+            'document_type' => 'delivery',
+            'receipt_no' => 'IRS-OTHER-001',
+            'subtotal' => '200.00',
+            'discount_total' => '0.00',
+            'vat_total' => '0.00',
+            'grand_total' => '200.00',
+            'status' => 'paid',
+            'created_by' => $user->id,
+        ]);
+
+        $this->actingAs($user);
+
+        $this->getJson('/api/pos/sales?document_type=delivery&q=Ozel%20Irsaliye&limit=10')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.receipt_no', 'IRS-SPECIAL-001')
+            ->assertJsonPath('data.0.customer.code', 'DLV-SPECIAL-CARI');
+
+        $this->getJson('/api/pos/sales?document_type=delivery&q=IRS-OTHER&limit=10')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.receipt_no', 'IRS-OTHER-001');
+    }
+
     public function test_point_user_can_open_pos_session_without_sending_cashbox_id(): void
     {
         $dealer = Dealer::query()->create([
@@ -302,7 +474,7 @@ class PointPosAccessApiTest extends TestCase
             ->assertCreated()
             ->assertJsonPath('data.category', 'Kargo')
             ->assertJsonPath('data.amount', '125.50')
-            ->assertJsonPath('data.currency', 'GEL');
+            ->assertJsonPath('data.currency', 'TRY');
 
         $this->getJson('/api/pos/reports/day-end?pos_session_id='.$sessionId)
             ->assertOk()
@@ -329,8 +501,48 @@ class PointPosAccessApiTest extends TestCase
             ->assertJsonPath('records.0.pos_expense_id', $expense->id)
             ->assertJsonPath('records.0.category', 'Kargo')
             ->assertJsonPath('records.0.amount', '125.50')
-            ->assertJsonPath('records.0.currency', 'GEL')
+            ->assertJsonPath('records.0.currency', 'TRY')
             ->assertJsonPath('records.0.cashbox_code', $cashbox->code);
+    }
+
+    public function test_batum_point_user_records_pos_expense_in_gel(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-BATUM-EXPENSE-'.Str::upper(Str::random(4)),
+            'name' => 'Batum Expense Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+            'menu_permissions' => ['pos', 'pos-expenses', 'pos-day-end', 'delivery-notes'],
+        ])->save();
+
+        $cashbox = Cashbox::query()->create([
+            'code' => '100.01.002',
+            'name' => 'BATUM B2B VE HIZLI SATIS Kasasi',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($user);
+
+        $openResponse = $this->postJson('/api/pos/sessions/open', [
+            'cashbox_id' => $cashbox->id,
+            'opening_cash' => 0,
+        ])->assertCreated();
+
+        $sessionId = (int) $openResponse->json('data.id');
+
+        $this->postJson('/api/pos/expenses', [
+            'pos_session_id' => $sessionId,
+            'amount' => 25,
+            'category' => 'Masraf',
+            'note' => 'Batum masraf',
+        ])
+            ->assertCreated()
+            ->assertJsonPath('data.currency', 'GEL');
     }
 
     public function test_logo_pos_expense_sync_imports_batum_cashbox_expenses_into_current_session(): void
@@ -494,6 +706,140 @@ class PointPosAccessApiTest extends TestCase
             ->assertJsonPath('data.opened_by.id', $user->id);
     }
 
+    public function test_admin_can_list_open_pos_sessions_for_day_end_branch_selection(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-DAY-END-ADMIN-'.Str::upper(Str::random(4)),
+            'name' => 'Day End Admin Dealer',
+            'is_active' => true,
+        ]);
+
+        $admin = $this->createUserWithRole('admin');
+        $admin->forceFill([
+            'menu_permissions' => ['pos', 'pos-day-end'],
+        ])->save();
+
+        $erzurumUser = $this->createUserWithRole('point', $dealer);
+        $erzurumUser->forceFill([
+            'branch_code' => 'ERZURUM',
+            'logo_cashbox_code' => 'POINT-ERZURUM',
+            'logo_cashbox_name' => 'ERZURUM HIZLI SATIS Kasasi',
+        ])->save();
+        $batumUser = $this->createUserWithRole('point', $dealer);
+        $batumUser->forceFill([
+            'branch_code' => 'BATUM',
+            'logo_cashbox_code' => 'POINT-BATUM',
+            'logo_cashbox_name' => 'BATUM B2B VE HIZLI SATIS Kasasi',
+        ])->save();
+
+        $erzurumCashbox = Cashbox::query()->create([
+            'code' => 'POINT-ERZURUM',
+            'name' => 'ERZURUM HIZLI SATIS Kasasi',
+            'is_active' => true,
+        ]);
+        $batumCashbox = Cashbox::query()->create([
+            'code' => 'POINT-BATUM',
+            'name' => 'BATUM B2B VE HIZLI SATIS Kasasi',
+            'is_active' => true,
+        ]);
+
+        PosSession::query()->create([
+            'cashbox_id' => $erzurumCashbox->id,
+            'opened_by' => $erzurumUser->id,
+            'opened_at' => now()->subMinutes(10),
+            'opening_cash' => 100,
+            'status' => 'open',
+        ]);
+        PosSession::query()->create([
+            'cashbox_id' => $batumCashbox->id,
+            'opened_by' => $batumUser->id,
+            'opened_at' => now()->subMinutes(5),
+            'opening_cash' => 200,
+            'status' => 'open',
+        ]);
+
+        $this->actingAs($admin);
+
+        $this->getJson('/api/pos/sessions/current?all=1')
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonPath('data.0.cashbox.code', 'POINT-BATUM')
+            ->assertJsonPath('data.0.opened_by.branch_code', 'BATUM')
+            ->assertJsonPath('data.1.cashbox.code', 'POINT-ERZURUM')
+            ->assertJsonPath('data.1.opened_by.branch_code', 'ERZURUM');
+    }
+
+    public function test_admin_current_pos_session_does_not_default_to_other_branch_session(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-ADMIN-CURRENT-'.Str::upper(Str::random(4)),
+            'name' => 'Admin Current Dealer',
+            'is_active' => true,
+        ]);
+
+        $admin = $this->createUserWithRole('admin');
+        $admin->forceFill([
+            'menu_permissions' => ['pos', 'pos-expenses', 'pos-day-end'],
+        ])->save();
+
+        $batumUser = $this->createUserWithRole('point', $dealer);
+        $batumUser->forceFill([
+            'branch_code' => 'BATUM',
+            'region_code' => 'BATUM',
+            'logo_cashbox_code' => 'POINT-BATUM',
+            'logo_cashbox_name' => 'BATUM B2B VE HIZLI SATIS Kasasi',
+        ])->save();
+
+        $batumCashbox = Cashbox::query()->create([
+            'code' => 'POINT-BATUM',
+            'name' => 'BATUM B2B VE HIZLI SATIS Kasasi',
+            'is_active' => true,
+        ]);
+
+        PosSession::query()->create([
+            'cashbox_id' => $batumCashbox->id,
+            'opened_by' => $batumUser->id,
+            'opened_at' => now(),
+            'opening_cash' => 0,
+            'status' => 'open',
+        ]);
+
+        $this->actingAs($admin);
+
+        $this->getJson('/api/pos/sessions/current')
+            ->assertOk()
+            ->assertJsonPath('data', null);
+
+        $this->getJson('/api/pos/sessions/current?all=1')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.cashbox.code', 'POINT-BATUM');
+    }
+
+    public function test_admin_open_pos_session_without_cashbox_uses_main_pos_cashbox(): void
+    {
+        $admin = $this->createUserWithRole('admin');
+        $admin->forceFill([
+            'menu_permissions' => ['pos', 'pos-expenses', 'pos-day-end'],
+        ])->save();
+
+        Cashbox::query()->create([
+            'code' => 'POINT-BATUM',
+            'name' => 'BATUM B2B VE HIZLI SATIS Kasasi',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($admin);
+
+        $this->postJson('/api/pos/sessions/open', [
+            'opening_cash' => 0,
+        ])
+            ->assertCreated()
+            ->assertJsonPath('data.status', 'open')
+            ->assertJsonPath('data.cashbox.code', 'MAIN-POS')
+            ->assertJsonPath('data.opened_by.id', $admin->id);
+    }
+
     public function test_point_user_can_collect_customer_payment_and_it_reflects_in_day_end(): void
     {
         $dealer = Dealer::query()->create([
@@ -548,6 +894,88 @@ class PointPosAccessApiTest extends TestCase
             ->assertJsonPath('data.summary.expected_cash', '700.00')
             ->assertJsonPath('data.totals_by_method.0.method', 'cash')
             ->assertJsonPath('data.totals_by_method.0.total_amount', '200.00');
+    }
+
+    public function test_closing_day_end_queues_session_customer_collections_for_logo_cashbox(): void
+    {
+        config(['integrations.logo.collection_sync_key' => 'test-sync-key']);
+
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-DAY-END-COL-'.Str::upper(Str::random(4)),
+            'name' => 'Day End Collection Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'menu_permissions' => ['pos', 'pos-day-end', 'delivery-notes'],
+        ])->save();
+
+        $cashbox = Cashbox::query()->create([
+            'code' => 'POINT-CASHBOX',
+            'name' => 'Erzurum Hızlı Satış Kasası',
+            'is_active' => true,
+        ]);
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'source_system' => 'b2b',
+            'source_reference' => '120-25-900',
+            'sync_status' => 'synced',
+            'code' => '120-25-900',
+            'name' => 'Logo Tahsilat Cari',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($user);
+
+        $openResponse = $this->postJson('/api/pos/sessions/open', [
+            'cashbox_id' => $cashbox->id,
+            'opening_cash' => 0,
+        ])->assertCreated();
+
+        $sessionId = (int) $openResponse->json('data.id');
+
+        $this->postJson("/api/customers/{$customer->id}/collections", [
+            'method' => 'cash',
+            'amount' => 320,
+            'note' => 'Gün sonu tahsilatı',
+            'meta' => [
+                'source' => 'point_collection',
+                'pos_session_id' => $sessionId,
+                'cashbox_id' => $cashbox->id,
+            ],
+        ])
+            ->assertCreated()
+            ->assertJsonPath('collection.sync_status', 'draft');
+
+        $collection = Collection::query()->latest('id')->firstOrFail();
+
+        $this->postJson('/api/pos/sessions/close', [
+            'cashbox_id' => $cashbox->id,
+            'closing_cash_counted' => 320,
+        ])->assertOk();
+
+        $this->assertDatabaseHas('collections', [
+            'id' => $collection->id,
+            'sync_status' => 'pending',
+        ]);
+
+        $this->assertDatabaseHas('integration_sync_states', [
+            'system' => 'logo',
+            'domain' => 'collections-write',
+            'entity_type' => Collection::class,
+            'entity_id' => $collection->id,
+            'status' => 'queued',
+        ]);
+
+        $this
+            ->withHeader('X-Integration-Key', 'test-sync-key')
+            ->getJson('/api/integrations/logo/collections/pending?limit=10')
+            ->assertOk()
+            ->assertJsonPath('records.0.collection_id', $collection->id)
+            ->assertJsonPath('records.0.cashbox_id', $cashbox->id)
+            ->assertJsonPath('records.0.cashbox_code', config('integrations.pos.erzurum_point_cashbox_code'));
     }
 
     public function test_point_day_end_includes_session_linked_customer_collection_without_source_tag(): void
@@ -608,6 +1036,132 @@ class PointPosAccessApiTest extends TestCase
             ->assertJsonPath('data.totals_by_method.1.total_amount', '75.00')
             ->assertJsonPath('data.report_tables.card_collections.0.customer_name', 'Tahsilat Cari')
             ->assertJsonPath('data.report_tables.card_collections.0.amount', '75.00');
+    }
+
+    public function test_point_day_end_keeps_pos_sale_payments_out_of_collection_panels(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-POINT-DAY-END-'.Str::upper(Str::random(4)),
+            'name' => 'Point Day End Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+        $user->forceFill([
+            'menu_permissions' => ['pos', 'pos-day-end', 'delivery-notes'],
+        ])->save();
+
+        $cashbox = Cashbox::query()->create([
+            'code' => 'POINT-'.$user->id,
+            'name' => 'Erzurum Hızlı Satış Kasası',
+            'is_active' => true,
+        ]);
+
+        $cashCustomer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'source_system' => 'logo',
+            'source_reference' => '1001',
+            'code' => 'POINT-NAKIT',
+            'name' => 'ERZURUM POINT NAKIT SATIS',
+            'is_active' => true,
+        ]);
+
+        $cardCustomer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'source_system' => 'logo',
+            'source_reference' => '1002',
+            'code' => 'POINT-KREDI-KARTI',
+            'name' => 'ERZURUM POINT KREDI KARTI SATIS',
+            'is_active' => true,
+        ]);
+
+        $collectionCustomer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'CR-TAHSILAT',
+            'name' => 'Tahsilat Cari',
+            'is_active' => true,
+        ]);
+
+        $product = Product::withoutEvents(function (): Product {
+            return Product::query()->create([
+                'sku' => 'POS-DAY-END-001',
+                'name' => 'POS Day End Product',
+                'unit' => 'adet',
+                'vat_rate' => 20,
+                'is_active' => true,
+            ]);
+        });
+
+        DB::table('stock_summary')->insert([
+            'product_id' => $product->id,
+            'available_total' => 5,
+            'reserved_total' => 0,
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $openResponse = $this->postJson('/api/pos/sessions/open', [
+            'cashbox_id' => $cashbox->id,
+            'opening_cash' => 0,
+        ])->assertCreated();
+
+        $sessionId = (int) $openResponse->json('data.id');
+
+        foreach ([
+            ['customer' => $cashCustomer, 'sale_type' => 'cash', 'receipt_no' => 'POS-CASH-001', 'amount' => 100],
+            ['customer' => $cardCustomer, 'sale_type' => 'card', 'receipt_no' => 'POS-CARD-001', 'amount' => 200],
+        ] as $salePayload) {
+            $this->postJson('/api/pos/sales', [
+                'pos_session_id' => $sessionId,
+                'customer_id' => $salePayload['customer']->id,
+                'sale_type' => $salePayload['sale_type'],
+                'document_type' => 'delivery',
+                'receipt_no' => $salePayload['receipt_no'],
+                'items' => [
+                    [
+                        'product_id' => $product->id,
+                        'qty' => 1,
+                        'unit_price' => $salePayload['amount'],
+                        'vat_rate' => 20,
+                    ],
+                ],
+                'payments' => [
+                    [
+                        'method' => $salePayload['sale_type'],
+                        'amount' => $salePayload['amount'],
+                    ],
+                ],
+            ])->assertCreated();
+        }
+
+        $this->postJson("/api/customers/{$collectionCustomer->id}/collections", [
+            'method' => 'cash',
+            'amount' => 50,
+            'note' => 'Cari ödeme',
+            'meta' => [
+                'source' => 'point_collection',
+                'pos_session_id' => $sessionId,
+                'cashbox_id' => $cashbox->id,
+            ],
+        ])->assertCreated();
+
+        $this->getJson('/api/pos/reports/day-end?pos_session_id='.$sessionId)
+            ->assertOk()
+            ->assertJsonCount(1, 'data.report_tables.cash_sales')
+            ->assertJsonPath('data.report_tables.cash_sales.0.customer_name', 'ERZURUM POINT NAKIT SATIS')
+            ->assertJsonPath('data.report_tables.cash_sales.0.grand_total', '100.00')
+            ->assertJsonCount(1, 'data.report_tables.card_sales')
+            ->assertJsonPath('data.report_tables.card_sales.0.customer_name', 'ERZURUM POINT KREDI KARTI SATIS')
+            ->assertJsonPath('data.report_tables.card_sales.0.grand_total', '200.00')
+            ->assertJsonCount(1, 'data.report_tables.cash_collections')
+            ->assertJsonPath('data.report_tables.cash_collections.0.customer_name', 'Tahsilat Cari')
+            ->assertJsonPath('data.report_tables.cash_collections.0.amount', '50.00')
+            ->assertJsonCount(0, 'data.report_tables.card_collections')
+            ->assertJsonPath('data.totals_by_method.0.method', 'cash')
+            ->assertJsonPath('data.totals_by_method.0.total_amount', '150.00')
+            ->assertJsonPath('data.totals_by_method.1.method', 'card')
+            ->assertJsonPath('data.totals_by_method.1.total_amount', '200.00');
     }
 
     public function test_pos_menu_alone_does_not_allow_expenses_or_day_end_report(): void
@@ -894,6 +1448,92 @@ class PointPosAccessApiTest extends TestCase
             ->assertJsonPath('records.0.items.0.product_code', 'POS-TEST-001');
     }
 
+    public function test_cash_and_card_pos_sales_do_not_add_vat_to_point_total(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-POINT-VAT-'.Str::upper(Str::random(4)),
+            'name' => 'Point Vat Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+
+        $cashbox = Cashbox::query()->create([
+            'code' => 'POINT-'.$user->id,
+            'name' => 'Erzurum Point Kasa',
+            'is_active' => true,
+        ]);
+
+        $session = PosSession::query()->create([
+            'cashbox_id' => $cashbox->id,
+            'opened_by' => $user->id,
+            'opened_at' => now(),
+            'opening_cash' => 0,
+            'status' => 'open',
+        ]);
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'source_system' => 'logo',
+            'source_reference' => '1001',
+            'code' => 'POINT-NAKIT',
+            'name' => 'Point Nakit Satış',
+            'is_active' => true,
+        ]);
+
+        $product = Product::withoutEvents(function (): Product {
+            return Product::query()->create([
+                'sku' => 'POS-NO-VAT-001',
+                'name' => 'POS No Vat Product',
+                'unit' => 'adet',
+                'vat_rate' => 20,
+                'is_active' => true,
+            ]);
+        });
+
+        DB::table('stock_summary')->insert([
+            'product_id' => $product->id,
+            'available_total' => 5,
+            'reserved_total' => 0,
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        foreach (['cash', 'card'] as $index => $saleType) {
+            $this->postJson('/api/pos/sales', [
+                'pos_session_id' => $session->id,
+                'customer_id' => $customer->id,
+                'sale_type' => $saleType,
+                'document_type' => 'delivery',
+                'receipt_no' => 'POS-NO-VAT-00'.($index + 1),
+                'items' => [
+                    [
+                        'product_id' => $product->id,
+                        'qty' => 1,
+                        'unit_price' => 100,
+                        'vat_rate' => 20,
+                    ],
+                ],
+                'payments' => [
+                    [
+                        'method' => $saleType,
+                        'amount' => 100,
+                    ],
+                ],
+            ])
+                ->assertCreated()
+                ->assertJsonPath('data.subtotal', '100.00')
+                ->assertJsonPath('data.vat_total', '0.00')
+                ->assertJsonPath('data.grand_total', '100.00');
+        }
+
+        $this->assertDatabaseCount('pos_sales', 2);
+        $this->assertDatabaseMissing('pos_sales', [
+            'vat_total' => '20.00',
+        ]);
+    }
+
     public function test_pos_sale_can_be_created_when_stock_summary_is_missing(): void
     {
         $dealer = Dealer::query()->create([
@@ -977,6 +1617,115 @@ class PointPosAccessApiTest extends TestCase
             ->assertOk()
             ->assertJsonPath('records.0.pos_sale_id', $sale->id)
             ->assertJsonPath('records.0.document_type', 'invoice');
+    }
+
+    public function test_logo_pos_sale_pending_payload_marks_delivery_as_sales_dispatch_note(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-POS-LOGO-'.Str::upper(Str::random(4)),
+            'name' => 'POS Logo Dealer',
+            'is_active' => true,
+        ]);
+        $user = $this->createUserWithRole('point', $dealer);
+
+        $cashbox = Cashbox::query()->create([
+            'code' => 'POINT-'.$user->id,
+            'name' => 'ERZURUM POINT KASASI',
+            'is_active' => true,
+        ]);
+
+        $session = PosSession::query()->create([
+            'cashbox_id' => $cashbox->id,
+            'opened_by' => $user->id,
+            'opened_at' => now(),
+            'opening_cash' => 0,
+            'status' => 'open',
+        ]);
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => '120-POS-LOGO',
+            'name' => 'POS Logo Cari',
+            'source_system' => 'logo',
+            'source_reference' => '1001',
+            'is_active' => true,
+        ]);
+
+        $product = Product::withoutEvents(function (): Product {
+            return Product::query()->create([
+                'sku' => 'POS-DLV-001',
+                'name' => 'POS Delivery Product',
+                'unit' => 'adet',
+                'vat_rate' => 20,
+                'is_active' => true,
+                'meta' => [
+                    'integrations' => [
+                        'logo' => [
+                            'external_ref' => '2002',
+                            'payload' => [
+                                'unitset_ref' => 1,
+                                'logo_price' => [
+                                    'uomref' => 1,
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ]);
+        });
+
+        $sale = PosSale::query()->create([
+            'pos_session_id' => $session->id,
+            'customer_id' => $customer->id,
+            'sale_type' => 'cash',
+            'document_type' => 'delivery',
+            'receipt_no' => 'POS-DLV-LOGO-001',
+            'subtotal' => '100.00',
+            'discount_total' => '0.00',
+            'vat_total' => '20.00',
+            'grand_total' => '120.00',
+            'status' => 'paid',
+            'created_by' => $user->id,
+        ]);
+
+        PosSaleItem::query()->create([
+            'pos_sale_id' => $sale->id,
+            'product_id' => $product->id,
+            'qty' => '1.000',
+            'unit_price' => '100.00',
+            'vat_rate' => '20.00',
+            'line_total' => '100.00',
+        ]);
+
+        PosPayment::query()->create([
+            'pos_sale_id' => $sale->id,
+            'method' => 'cash',
+            'amount' => '120.00',
+        ]);
+
+        IntegrationSyncState::query()->create([
+            'system' => 'logo',
+            'domain' => 'pos-sales',
+            'direction' => 'outbound',
+            'entity_type' => PosSale::class,
+            'entity_id' => $sale->id,
+            'status' => 'queued',
+            'meta' => [
+                'export_key' => 'B2B-POSSALE-'.$sale->id,
+            ],
+        ]);
+
+        config(['integrations.logo.pos_sale_sync_key' => 'test-pos-sale-key']);
+
+        $this
+            ->withHeader('X-Integration-Key', 'test-pos-sale-key')
+            ->getJson('/api/integrations/logo/pos-sales/pending?limit=10')
+            ->assertOk()
+            ->assertJsonPath('records.0.pos_sale_id', $sale->id)
+            ->assertJsonPath('records.0.document_type', 'delivery')
+            ->assertJsonPath('records.0.logo.document_target', 'sales_dispatch_note')
+            ->assertJsonPath('records.0.logo.trcode', 8)
+            ->assertJsonPath('records.0.logo.target_tables', ['STFICHE', 'STLINE']);
     }
 
     public function test_customer_collections_can_be_filtered_by_method_and_invoice_entries(): void
@@ -1074,6 +1823,68 @@ class PointPosAccessApiTest extends TestCase
         $this->getJson("/api/customers/{$customer->id}/collections")
             ->assertOk()
             ->assertJsonCount(2, 'data');
+    }
+
+    public function test_customer_collections_response_includes_compact_logo_sync_summary(): void
+    {
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-COL-SUM-'.Str::upper(Str::random(4)),
+            'name' => 'Collection Summary Dealer',
+            'is_active' => true,
+        ]);
+
+        $user = $this->createUserWithRole('point', $dealer);
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'CR-SUM-'.Str::upper(Str::random(5)),
+            'name' => 'Tahsilat Ozet Cari',
+            'is_active' => true,
+        ]);
+
+        Collection::query()->create([
+            'dealer_id' => $dealer->id,
+            'customer_id' => $customer->id,
+            'source_system' => 'b2b',
+            'sync_status' => 'pending',
+            'date' => '2026-06-01',
+            'collection_date' => '2026-06-01',
+            'method' => 'cash',
+            'amount' => 100,
+            'currency' => 'TRY',
+        ]);
+
+        Collection::query()->create([
+            'dealer_id' => $dealer->id,
+            'customer_id' => $customer->id,
+            'source_system' => 'b2b',
+            'sync_status' => 'synced',
+            'last_synced_at' => '2026-06-22 21:45:00',
+            'date' => '2026-06-02',
+            'collection_date' => '2026-06-02',
+            'method' => 'transfer',
+            'amount' => 250,
+            'currency' => 'TRY',
+        ]);
+
+        $this->actingAs($user);
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+
+        $this->getJson("/api/customers/{$customer->id}/collections")
+            ->assertOk()
+            ->assertJsonPath('logo_sync.pending', 1)
+            ->assertJsonPath('logo_sync.synced', 1)
+            ->assertJsonPath('logo_sync.latest_synced_at', '2026-06-22T21:45:00.000000Z');
+
+        DB::disableQueryLog();
+
+        $collectionQueries = collect(DB::getQueryLog())
+            ->filter(fn (array $query): bool => str_contains((string) $query['query'], 'collections'))
+            ->count();
+
+        $this->assertLessThanOrEqual(5, $collectionQueries);
     }
 
     public function test_point_user_can_update_and_delete_draft_customer_collections(): void

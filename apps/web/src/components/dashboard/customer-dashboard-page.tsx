@@ -149,6 +149,7 @@ export function CustomerDashboardPage() {
             alt="PowerSA depo rafları"
             fill
             priority
+            quality={80}
             sizes="760px"
             className="object-cover opacity-70 saturate-[0.9]"
           />
@@ -199,10 +200,26 @@ export function CustomerDashboardPage() {
 
           <div className="hidden min-h-[250px] items-end justify-center gap-4 xl:flex">
             <div className="relative h-[210px] w-[170px] rounded-[22px] border border-white/10 bg-[#13251f]/90 p-4 shadow-[0_24px_70px_-38px_rgba(0,0,0,0.8)] backdrop-blur-xl">
-              <Image src="/brand/powersa-packshot-1.png" alt="Powersa filtre kutusu" fill sizes="170px" className="object-contain p-4 drop-shadow-[0_28px_34px_rgba(0,0,0,0.42)]" />
+              <Image
+                src="/brand/powersa-packshot-1.png"
+                alt="Powersa filtre kutusu"
+                fill
+                sizes="170px"
+                loading="eager"
+                quality={80}
+                className="object-contain p-4 drop-shadow-[0_28px_34px_rgba(0,0,0,0.42)]"
+              />
             </div>
             <div className="relative h-[250px] w-[205px] rounded-[24px] border border-emerald-300/20 bg-[#17382d]/92 p-4 shadow-[0_28px_80px_-40px_rgba(16,185,129,0.5)] backdrop-blur-xl">
-              <Image src="/brand/powersa-packshot-2.png" alt="Powersa ürün grubu" fill sizes="205px" className="object-contain p-4 drop-shadow-[0_32px_38px_rgba(0,0,0,0.46)]" />
+              <Image
+                src="/brand/powersa-packshot-2.png"
+                alt="Powersa ürün grubu"
+                fill
+                sizes="205px"
+                loading="eager"
+                quality={80}
+                className="object-contain p-4 drop-shadow-[0_32px_38px_rgba(0,0,0,0.46)]"
+              />
             </div>
           </div>
         </div>

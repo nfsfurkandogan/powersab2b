@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useSession } from "@/components/auth/session-provider";
 import {
   createPosExpense,
   getCurrentPosSession,
@@ -35,6 +36,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_POINT_EXPENSE_CATEGORY = "Masraf";
+const BATUM_CURRENCY_LABEL = "GEL";
+const DEFAULT_CURRENCY_LABEL = "TL";
 
 const expenseSchema = z.object({
   amount: z.number().gt(0),
@@ -43,11 +46,11 @@ const expenseSchema = z.object({
 
 type ExpenseFormValues = z.infer<typeof expenseSchema>;
 
-function formatCurrency(value: number | string): string {
+function formatCurrency(value: number | string, currencyLabel = DEFAULT_CURRENCY_LABEL): string {
   const amount = typeof value === "number" ? value : Number(value);
 
   return Number.isFinite(amount)
-    ? `GEL ${amount.toLocaleString("tr-TR", {
+    ? `${currencyLabel} ${amount.toLocaleString("tr-TR", {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       })}`
@@ -110,9 +113,84 @@ function expenseSyncTone(expense: PosExpenseDto): string {
   return "border-[#faee56]/50 text-[#faee56]";
 }
 
-function sessionScopeLabel(session: PosExpenseDto["cashbox"] | null | undefined): string {
+function normalizeBranchText(value: string | null | undefined): string {
+  return (value ?? "").trim().toLocaleUpperCase("tr-TR");
+}
+
+function hasUserRole(user: ReturnType<typeof useSession>["user"], role: string): boolean {
+  return Array.isArray(user?.roles) && user.roles.some((item) => item.slug === role);
+}
+
+function titleCaseBranch(value: string | null | undefined): string {
+  const trimmed = value?.trim();
+
+  if (!trimmed) {
+    return "Point";
+  }
+
+  const knownLabels: Record<string, string> = {
+    ERZURUM: "Erzurum",
+    TRABZON: "Trabzon",
+    SAMSUN: "Samsun",
+    BATUM: "Batum",
+    HIZLI: "Hızlı",
+    "HİZLİ": "Hızlı",
+    SATIS: "Satış",
+    "SATIŞ": "Satış",
+    KASASI: "Kasası",
+  };
+
+  return trimmed
+    .split(/(\s+|[-/])/u)
+    .map((part) => {
+      if (part.trim() === "" || part === "-" || part === "/") {
+        return part;
+      }
+
+      const normalized = normalizeBranchText(part);
+      if (knownLabels[normalized]) {
+        return knownLabels[normalized];
+      }
+
+      const lower = part.toLocaleLowerCase("tr-TR");
+      return `${lower.charAt(0).toLocaleUpperCase("tr-TR")}${lower.slice(1)}`;
+    })
+    .join("");
+}
+
+function resolveExpenseScope(
+  user: ReturnType<typeof useSession>["user"],
+  cashbox: PosExpenseDto["cashbox"] | null | undefined
+) {
+  const userSignals = [
+    user?.branch_name,
+    user?.branch_code,
+    user?.region_code,
+  ];
+  const cashboxSignals = [
+    cashbox?.name,
+    cashbox?.code,
+  ];
+  const isElevatedUser = hasUserRole(user, "admin") || hasUserRole(user, "dealer_admin");
+  const signals = isElevatedUser ? userSignals : [...userSignals, ...cashboxSignals];
+  const isBatum = signals.some((value) => normalizeBranchText(value).includes("BATUM"));
+  const branchSource = signals.find((value) => {
+    const normalized = normalizeBranchText(value);
+    return normalized.includes("ERZURUM") || normalized.includes("TRABZON") || normalized.includes("SAMSUN") || normalized.includes("BATUM");
+  });
+  const branchLabel = isBatum ? "Batum" : titleCaseBranch(branchSource ?? user?.branch_name ?? user?.branch_code);
+
+  return {
+    branchLabel,
+    scopeKey: isBatum ? "batum" : normalizeBranchText(branchLabel).toLocaleLowerCase("tr-TR"),
+    currencyLabel: isBatum ? BATUM_CURRENCY_LABEL : DEFAULT_CURRENCY_LABEL,
+    countryLabel: isBatum ? "Gürcistan" : "Türkiye",
+  };
+}
+
+function sessionScopeLabel(session: PosExpenseDto["cashbox"] | null | undefined, branchLabel: string): string {
   if (!session) {
-    return "Batum kasası hazırlanıyor";
+    return `${branchLabel} kasası hazırlanıyor`;
   }
 
   const code = session.code?.trim();
@@ -121,7 +199,7 @@ function sessionScopeLabel(session: PosExpenseDto["cashbox"] | null | undefined)
     return `${code} / ${name}`;
   }
 
-  return code || name || "Batum point kasası";
+  return code || name || `${branchLabel} point kasası`;
 }
 
 function ExpenseStat({
@@ -161,6 +239,7 @@ function ExpenseStat({
 
 export function PointExpensesPage() {
   const pointSessionBootstrapAttemptedRef = useRef(false);
+  const { user } = useSession();
 
   const form = useForm<ExpenseFormValues>({
     resolver: zodResolver(expenseSchema),
@@ -189,7 +268,8 @@ export function PointExpensesPage() {
 
   const currentSession = currentSessionQuery.data?.data ?? null;
   const currentCashbox = currentSession?.cashbox ?? null;
-  const scopeLabel = sessionScopeLabel(currentCashbox);
+  const expenseScope = resolveExpenseScope(user, currentCashbox);
+  const scopeLabel = sessionScopeLabel(currentCashbox, expenseScope.branchLabel);
 
   useEffect(() => {
     if (currentSession) {
@@ -261,7 +341,7 @@ export function PointExpensesPage() {
       category: DEFAULT_POINT_EXPENSE_CATEGORY,
       note: values.note?.trim() || undefined,
       meta: {
-        scope: "batum",
+        scope: expenseScope.scopeKey,
         cashbox_code: currentSession.cashbox.code ?? null,
         cashbox_name: currentSession.cashbox.name ?? null,
       },
@@ -297,15 +377,15 @@ export function PointExpensesPage() {
                     </span>
                   ) : null}
                 </div>
-                <h1 className="mt-3 text-3xl font-black tracking-tight text-[var(--point-text)] xl:text-4xl">Batum Masraf</h1>
+                <h1 className="mt-3 text-3xl font-black tracking-tight text-[var(--point-text)] xl:text-4xl">{expenseScope.branchLabel} Masraf</h1>
                 <p className="mt-2 max-w-3xl text-sm font-semibold leading-6 text-[var(--point-muted-strong)]">
-                  Açık Batum point kasasına masraf ekleyin, gün sonu toplamını ve Logo aktarım durumunu aynı ekranda takip edin.
+                  Açık {expenseScope.branchLabel} point kasasına masraf ekleyin, gün sonu toplamını ve Logo aktarım durumunu aynı ekranda takip edin.
                 </p>
                 {currentSession ? (
                   <div className="mt-4 flex flex-wrap gap-2 text-xs font-black text-[var(--point-muted-strong)]">
                     <span className="inline-flex items-center gap-2 rounded-full border border-[var(--point-border)] bg-[var(--point-control)] px-3 py-2">
                       <MapPin className="h-3.5 w-3.5" />
-                      Batum kapsamı
+                      {expenseScope.branchLabel} kapsamı
                     </span>
                     <span className="inline-flex items-center gap-2 rounded-full border border-[var(--point-border)] bg-[var(--point-control)] px-3 py-2">
                       <Building2 className="h-3.5 w-3.5" />
@@ -317,8 +397,8 @@ export function PointExpensesPage() {
             </div>
 
             <div className="point-admin-soft rounded-[16px] border p-4">
-              <p className="text-[11px] font-black uppercase tracking-[0.13em] text-[var(--point-muted-strong)]">Batum Masraf Toplamı</p>
-              <p className="mt-2 truncate text-3xl font-black text-[#faee56]">{formatCurrency(expenseTotal)}</p>
+              <p className="text-[11px] font-black uppercase tracking-[0.13em] text-[var(--point-muted-strong)]">{expenseScope.branchLabel} Masraf Toplamı</p>
+              <p className="mt-2 truncate text-3xl font-black text-[#faee56]">{formatCurrency(expenseTotal, expenseScope.currencyLabel)}</p>
               <p className="mt-2 flex items-center gap-2 text-xs font-bold text-[var(--point-muted)]">
                 <Clock className="h-4 w-4" />
                 Gün sonu ile dinamik güncellenir.
@@ -337,7 +417,7 @@ export function PointExpensesPage() {
                   <RefreshCcw className="h-4 w-4" /> Yenile
                 </Button>
                 <Button asChild className="point-yellow-action-button h-11 rounded-[14px] font-black">
-                  <Link href="/pos#point-sales">
+                  <Link href="/pos">
                     <Wallet className="h-4 w-4" /> Satış
                   </Link>
                 </Button>
@@ -356,8 +436,8 @@ export function PointExpensesPage() {
           />
           <ExpenseStat
             label="Masraf Toplamı"
-            value={formatCurrency(expenseTotal)}
-            detail="Sadece Batum kasa oturumu"
+            value={formatCurrency(expenseTotal, expenseScope.currencyLabel)}
+            detail={`Sadece ${expenseScope.branchLabel} kasa oturumu`}
             icon={<Banknote className="h-5 w-5" />}
             tone="yellow"
           />
@@ -373,11 +453,11 @@ export function PointExpensesPage() {
           <section className="point-admin-panel rounded-[22px] border p-5">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div>
-                <p className="text-lg font-black text-[var(--point-text)]">Batum masraf ekranı için point oturumu hazırlanıyor.</p>
+                <p className="text-lg font-black text-[var(--point-text)]">{expenseScope.branchLabel} masraf ekranı için point oturumu hazırlanıyor.</p>
                 <p className="mt-1 text-sm font-semibold text-[var(--point-muted)]">Oturum hazırlandığında yalnızca bu kasaya masraf girişi aktif olur.</p>
               </div>
               <Button asChild className="point-yellow-action-button h-12 rounded-[14px] px-5 font-black">
-                <Link href="/pos#point-sales">Hızlı Satışa Dön</Link>
+                <Link href="/pos">Hızlı Satışa Dön</Link>
               </Button>
             </div>
           </section>
@@ -389,14 +469,14 @@ export function PointExpensesPage() {
                   <PlusCircle className="h-5 w-5" />
                 </span>
                 <div>
-                  <p className="text-[11px] font-black uppercase tracking-[0.13em] text-[var(--point-muted-strong)]">Batum Masraf Kaydı</p>
+                  <p className="text-[11px] font-black uppercase tracking-[0.13em] text-[var(--point-muted-strong)]">{expenseScope.branchLabel} Masraf Kaydı</p>
                   <h2 className="text-xl font-black text-[var(--point-text)]">Yeni masraf</h2>
                 </div>
               </div>
 
               <form className="space-y-4" onSubmit={submit}>
                 <label className="block">
-                  <span className="mb-2 block text-sm font-black text-[var(--point-muted-strong)]">Tutar (GEL)</span>
+                  <span className="mb-2 block text-sm font-black text-[var(--point-muted-strong)]">Tutar ({expenseScope.currencyLabel})</span>
                   <Input
                     type="number"
                     min={0}
@@ -410,7 +490,7 @@ export function PointExpensesPage() {
                 <label className="block">
                   <span className="mb-2 block text-sm font-black text-[var(--point-muted-strong)]">Açıklama</span>
                   <Input
-                    placeholder="Batum masraf notu"
+                    placeholder={`${expenseScope.branchLabel} masraf notu`}
                     {...form.register("note")}
                     disabled={createExpenseMutation.isPending}
                     className="h-14 rounded-[14px] text-base font-semibold"
@@ -424,7 +504,7 @@ export function PointExpensesPage() {
                   </div>
                   <div className="point-admin-soft rounded-[14px] border p-3">
                     <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[var(--point-muted)]">Kasa</p>
-                    <p className="mt-1 truncate text-lg font-black text-[var(--point-text)]">{currentSession.cashbox.code ?? "BATUM"}</p>
+                    <p className="mt-1 truncate text-lg font-black text-[var(--point-text)]">{currentSession.cashbox.code ?? expenseScope.branchLabel}</p>
                   </div>
                 </div>
 
@@ -438,7 +518,7 @@ export function PointExpensesPage() {
             <section className="point-admin-panel rounded-[18px] border p-4 shadow-[0_20px_45px_-35px_rgba(0,0,0,0.7)]">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-[11px] font-black uppercase tracking-[0.13em] text-[var(--point-muted-strong)]">Batum Masrafları</p>
+                  <p className="text-[11px] font-black uppercase tracking-[0.13em] text-[var(--point-muted-strong)]">{expenseScope.branchLabel} Masrafları</p>
                   <h2 className="text-xl font-black text-[var(--point-text)]">Kasa hareketleri</h2>
                 </div>
                 <span className="rounded-full border border-[#faee56]/45 bg-[#3b3719]/50 px-3 py-1 text-xs font-black text-[#faee56]">
@@ -476,8 +556,8 @@ export function PointExpensesPage() {
                           </p>
                         </div>
                         <div className="rounded-[12px] border border-[#faee56]/30 bg-[#3b3719]/40 px-3 py-2 text-right">
-                          <p className="whitespace-nowrap text-lg font-black text-[#faee56]">{formatCurrency(expense.amount)}</p>
-                          <p className="mt-1 text-[10px] font-black uppercase tracking-[0.1em] text-[var(--point-muted)]">Batum</p>
+                          <p className="whitespace-nowrap text-lg font-black text-[#faee56]">{formatCurrency(expense.amount, expense.currency === "GEL" ? BATUM_CURRENCY_LABEL : DEFAULT_CURRENCY_LABEL)}</p>
+                          <p className="mt-1 text-[10px] font-black uppercase tracking-[0.1em] text-[var(--point-muted)]">{expense.currency === "GEL" ? "Batum" : expenseScope.branchLabel}</p>
                         </div>
                       </div>
                     </div>

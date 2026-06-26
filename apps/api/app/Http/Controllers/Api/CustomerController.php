@@ -41,6 +41,23 @@ class CustomerController extends Controller
             $baseQuery->where('customers.source_system', (string) $validated['source_system']);
         }
 
+        if (! empty($validated['specode4'])) {
+            $specode4Values = array_values(
+                array_unique([
+                    trim((string) $validated['specode4']),
+                    strtolower(trim((string) $validated['specode4'])),
+                    strtoupper(trim((string) $validated['specode4'])),
+                ])
+            );
+
+            $baseQuery->where(function ($builder) use ($specode4Values): void {
+                $builder
+                    ->whereIn('customers.meta->integrations->logo->payload->specode4', $specode4Values)
+                    ->orWhereIn('customers.meta->integrations->logo->payload->raw->specode4', $specode4Values)
+                    ->orWhereIn('customers.meta->integrations->logo->payload->raw->SPECODE4', $specode4Values);
+            });
+        }
+
         if ($search !== '') {
             $baseQuery->where(function ($builder) use ($search) {
                 $builder->where('customers.code', 'like', "{$search}%")
@@ -90,6 +107,7 @@ class CustomerController extends Controller
             $query
                 ->select([
                     'customers.id',
+                    'customers.dealer_id',
                     'customers.code',
                     'customers.name',
                     'customers.city',

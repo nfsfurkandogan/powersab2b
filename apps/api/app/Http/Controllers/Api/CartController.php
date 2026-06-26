@@ -7,6 +7,7 @@ use App\Http\Requests\Cart\ShowCartRequest;
 use App\Models\Cart;
 use App\Models\Customer;
 use App\Models\User;
+use App\Support\Cart\CartLogoIntegrationSummary;
 use App\Support\Warehouse\CartWarehouseOptions;
 use Illuminate\Http\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
@@ -103,6 +104,7 @@ class CartController extends Controller
             ],
             'items' => $items,
             'warehouse_options' => app(CartWarehouseOptions::class)->forCartItems($cart->items),
+            'logo_integration' => app(CartLogoIntegrationSummary::class)->forCart($cart),
             'totals' => $totals,
         ];
     }

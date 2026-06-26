@@ -145,7 +145,33 @@ function formatHeaderRate(value: string | null | undefined): string | null {
     return null;
   }
 
-  const numeric = Number(value);
+  const compact = value.trim().replace(/\s+/g, "");
+
+  if (!compact) {
+    return null;
+  }
+
+  const hasComma = compact.includes(",");
+  const hasDot = compact.includes(".");
+  let normalized = compact;
+
+  if (hasComma && hasDot) {
+    const lastComma = compact.lastIndexOf(",");
+    const lastDot = compact.lastIndexOf(".");
+
+    if (lastComma > lastDot) {
+      // tr-TR style with dot thousand separators.
+      normalized = compact.replace(/\./g, "").replace(",", ".");
+    } else {
+      // en-US style with comma thousand separators.
+      normalized = compact.replace(/,/g, "");
+    }
+  } else if (hasComma) {
+    // default comma decimal fallback (46,3557 -> 46.3557).
+    normalized = compact.replace(",", ".");
+  }
+
+  const numeric = Number(normalized);
 
   if (!Number.isFinite(numeric)) {
     return null;
@@ -251,7 +277,7 @@ const SIDEBAR_ITEMS: NavItem[] = [
     icon: Gauge,
     emojiAsset: "/apple-icons/sidebar/kontrol-paneli.webp",
     tileGradient: "from-[#f0c78c] to-[#cc8b45]",
-    allowedRoles: ["admin", "dealer_admin", "salesperson", "customer"],
+    allowedRoles: ["admin", "dealer_admin", "salesperson", "customer", "cashier", "point"],
   },
   {
     href: "/search",
@@ -353,12 +379,12 @@ const SIDEBAR_ITEMS: NavItem[] = [
     allowedRoles: ["admin", "dealer_admin", "salesperson"],
   },
   {
-    href: "/pos#point-sales",
+    href: "/pos",
     label: "Hızlı Satış",
     permissionKey: "pos",
     icon: ReceiptText,
     emojiAsset: "/dashboard-icons/fixed/hizli_satis_pos.webp",
-    tileGradient: "from-[#f3b8cb] to-[#da83a3]",
+    tileGradient: "from-[#faee56] via-[#72bf82] to-[#1f6b45]",
     allowedRoles: ["admin", "cashier", "point"],
   },
   {
@@ -740,6 +766,10 @@ function canAccessNavItem(item: NavItem, roleSlugs: string[], menuPermissions: S
     return true;
   }
 
+  if (item.permissionKey === "dashboard" && isPosOnlyRole(roleSlugs)) {
+    return true;
+  }
+
   if (roleSlugs.includes("admin")) {
     return item.allowedRoles === undefined || item.allowedRoles.includes("admin");
   }
@@ -801,6 +831,29 @@ function normalizeHeaderBranchLabel(value: string | null | undefined): string {
   return trimmed
     .toLocaleLowerCase("tr-TR")
     .replace(/\b\p{L}/gu, (letter) => letter.toLocaleUpperCase("tr-TR"));
+}
+
+function formatPointBranchHeaderLabel(value: string | null | undefined): string {
+  const branchLabel = normalizeHeaderBranchLabel(value);
+  const normalized = branchLabel.toLocaleUpperCase("tr-TR");
+
+  if (normalized === "POINT") {
+    return "Point Şubesi";
+  }
+
+  if (normalized.includes("ŞUBE")) {
+    return branchLabel;
+  }
+
+  if (normalized.includes("BATUM")) {
+    return `${branchLabel} Şubesi`;
+  }
+
+  if (normalized.includes("MERKEZ")) {
+    return `${branchLabel} Şubesi`;
+  }
+
+  return `${branchLabel} Merkez Şubesi`;
 }
 
 function isPathAllowed(pathname: string, items: NavItem[]) {
@@ -979,7 +1032,7 @@ function getPageMeta(
   if (pathname.startsWith("/pos")) {
     return isPosOnlyRole(roleSlugs)
       ? { title: "Hızlı Satış", subtitle: "Point bayi için hızlı satış ekranı" }
-      : { title: "Hızlı Satış", subtitle: "Perakende satış ve ödeme ekranı" };
+      : { title: "Hızlı Satış", subtitle: "Kompakt satış, kaydet ve yazdır ekranı" };
   }
 
   return { title: "Powersa B2B", subtitle: "Operasyon paneli" };
@@ -1060,18 +1113,20 @@ function SidebarAppIcon({
           </>
         )}
         {useSidebarAsset && renderedAsset ? (
-          // Dengelenmiş PNG seti kare canvas olmadan, ikonları ortalı tutar.
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
+          <Image
             src={renderedAsset}
             alt={`${label} ikonu`}
+            width={92}
+            height={92}
             className={cn(
               "relative z-[2] h-[92px] w-[92px] object-contain",
               darkMode
                 ? "[filter:drop-shadow(0_12px_14px_rgba(0,0,0,0.3))]"
                 : "[filter:drop-shadow(0_10px_12px_rgba(32,70,52,0.18))]"
             )}
+            quality={80}
             loading="eager"
+            decoding="async"
           />
         ) : emojiAsset ? (
             <Image
@@ -1103,6 +1158,7 @@ function SidebarMenu({
   onToggleCollapsed,
   onReorderItems,
   reorderEnabled,
+  onLogout,
 }: {
   pathname: string;
   currentHash: string;
@@ -1115,6 +1171,7 @@ function SidebarMenu({
   onToggleCollapsed: () => void;
   onReorderItems: (draggedHref: string, targetHref: string) => void;
   reorderEnabled: boolean;
+  onLogout: () => void;
 }) {
   const lightDashboardSidebar = dashboardRoute && !darkMode;
   const [draggingHref, setDraggingHref] = useState<string | null>(null);
@@ -1153,6 +1210,7 @@ function SidebarMenu({
               alt="Güçsa Powersa Filter Logo"
               width={910}
               height={883}
+              sizes="180px"
               className={cn(
                 "h-auto w-full object-contain",
                 darkMode
@@ -1324,6 +1382,21 @@ function SidebarMenu({
           <p className={cn("mt-1 text-[18px] font-extrabold leading-6 tracking-tight", lightDashboardSidebar ? "text-[var(--foreground)]" : "text-white")}>{panelTitle}</p>
           <p className={cn("mt-1.5 text-[12px] leading-[1.3]", lightDashboardSidebar ? "text-[var(--muted-foreground)]" : "text-[color-mix(in_oklab,var(--sidebar-foreground)_78%,var(--sidebar-primary))]")}>Ana sayfaya dön</p>
         </Link>
+        <button
+          type="button"
+          onClick={onLogout}
+          className={cn(
+            "mt-2 flex w-full items-center justify-center gap-2 rounded-[18px] border px-3 py-3 text-[13px] font-extrabold transition hover:-translate-y-0.5",
+            lightDashboardSidebar
+              ? "border-red-200 bg-red-50 text-red-700 hover:border-red-300 hover:bg-red-100"
+              : "border-red-300/20 bg-[linear-gradient(180deg,rgba(127,29,29,0.52)_0%,rgba(69,10,10,0.55)_100%)] text-red-100 shadow-[0_20px_28px_-22px_rgba(0,0,0,0.8),inset_0_1px_0_rgba(255,255,255,0.05)] hover:border-red-200/40 hover:text-white"
+          )}
+          aria-label="Çıkış yap"
+          title="Çıkış yap"
+        >
+          <LogOut className="h-4 w-4" />
+          Çıkış Yap
+        </button>
       </div>
     </div>
   );
@@ -1356,12 +1429,14 @@ function DashboardTopDockIcon({
         />
         <span className="absolute inset-[6px] rounded-[24px] bg-[radial-gradient(circle_at_50%_4%,rgba(255,255,255,0.34)_0%,rgba(255,255,255,0.06)_34%,rgba(255,255,255,0)_70%)]" />
         {/* Yeni sidebar ikonları kendi cam kutusuyla geldiği için direkt yüklenir. */}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
+        <Image
           src={item.emojiAsset}
           alt={`${item.label} ikonu`}
+          width={72}
+          height={72}
           className="relative z-[2] h-[72px] w-[72px] object-contain drop-shadow-[0_16px_18px_rgba(0,0,0,0.5)]"
           loading="eager"
+          decoding="async"
         />
       </span>
       <span
@@ -1623,7 +1698,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       typeof window !== "undefined" &&
       window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "1"
   );
-  const roleSlugs = useMemo(() => user?.roles.map((role) => role.slug) ?? [], [user?.roles]);
+  const roleSlugs = useMemo(() => (Array.isArray(user?.roles) ? user.roles.map((role) => role.slug) : []), [user?.roles]);
   const sidebarOrderSection = pathname.startsWith("/moderator") ? "moderator" : "main";
   const sidebarOrderKey = useMemo(
     () => sidebarOrderStorageKey(user?.id, sidebarOrderSection),
@@ -1731,6 +1806,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         });
 
       const scopedItems = items;
+
+      if (posOnlyRole) {
+        return scopedItems;
+      }
 
       return isModeratorRoute ? sortModeratorNavItemsByPriority(scopedItems) : sortNavItemsForPath(scopedItems, pathname);
     },
@@ -1938,6 +2017,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     warehouseStandaloneMode,
   ]);
 
+  const loginRedirectHref = useMemo(() => {
+    const next = pathname ? `&next=${encodeURIComponent(pathname)}` : "";
+    return `/login?v=20260605-login-fast${next}`;
+  }, [pathname]);
+
+  useEffect(() => {
+    if (status !== "guest") {
+      return;
+    }
+
+    router.replace(loginRedirectHref);
+  }, [loginRedirectHref, router, status]);
+
   const pageMeta = useMemo(() => getPageMeta(pathname, roleSlugs, selectedCustomer, user), [pathname, roleSlugs, selectedCustomer, user]);
   const isDashboardRoute = pathname.startsWith("/dashboard");
   const isSearchRoute = pathname.startsWith("/search");
@@ -1957,13 +2049,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const dashboardCustomerDisplayTitle = selectedCustomer
     ? dashboardCustomerTitle.toLocaleUpperCase("tr-TR")
     : dashboardCustomerTitle;
-  const assignedSalesperson = selectedCustomer?.salesperson ?? null;
-  const assignedSalespersonName = assignedSalesperson?.name?.trim() || "Plasiyer atanmadı";
-  const assignedSalespersonDisplayName = assignedSalespersonName.toLocaleUpperCase("tr-TR");
-  const assignedSalespersonPhone = assignedSalesperson?.phone?.trim() || "Telefon yok";
-  const salespersonAvatarStyle: CSSProperties | undefined = assignedSalesperson?.avatar_url
-    ? { backgroundImage: `url(${assignedSalesperson.avatar_url})` }
-    : undefined;
+  const pointBranchHeaderLabel = formatPointBranchHeaderLabel(user?.branch_name ?? user?.branch_code);
+  const showPointBranchHeaderProfile = posOnlyRole && !isAdminDashboardRoute;
+  const currentUserName = user?.name?.trim() || "Kullanıcı";
+  const currentUserDisplayName = currentUserName.toLocaleUpperCase("tr-TR");
+  const currentUserPhone = user?.phone?.trim() || "Telefon yok";
   const userAvatarStyle: CSSProperties | undefined = user?.avatar_url
     ? { backgroundImage: `url(${user.avatar_url})` }
     : undefined;
@@ -2101,6 +2191,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className="app-shell-root min-h-screen bg-[var(--background)] text-[var(--foreground)]" style={shellStyle}>
         <main className="flex min-h-screen items-center justify-center px-4 text-center text-sm font-semibold text-[var(--muted-foreground)]">
           Müşteri seçimi açılıyor...
+        </main>
+      </div>
+    );
+  }
+
+  if (status === "guest") {
+    return (
+      <div className="app-shell-root min-h-screen bg-[var(--background)] text-[var(--foreground)]" style={shellStyle}>
+        <main className="flex min-h-screen items-center justify-center px-4 text-center text-sm font-semibold text-[var(--muted-foreground)]">
+          Giriş ekranı açılıyor...
         </main>
       </div>
     );
@@ -2276,6 +2376,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               onToggleCollapsed={toggleSidebar}
               onReorderItems={handleSidebarItemsReorder}
               reorderEnabled={sidebarReorderEnabled}
+              onLogout={() => {
+                void logout().then(() => router.replace("/login?v=20260605-login-fast"));
+              }}
             />
           )}
         </aside>
@@ -2384,28 +2487,45 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </div>
 
               <div className="dashboard-header-actions">
-                {!isAdminDashboardRoute && assignedSalesperson ? (
+                {showPointBranchHeaderProfile ? (
+                  <div className="dashboard-header-profile">
+                    <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[linear-gradient(135deg,var(--brand-primary)_0%,var(--brand-accent)_100%)] text-[12px] font-black text-white">
+                      {initialsFromName(pointBranchHeaderLabel)}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-[10px] font-black uppercase tracking-[0.12em] text-[var(--muted-foreground)]">
+                        Şube
+                      </span>
+                      <span className="dashboard-header-profile-name">
+                        {pointBranchHeaderLabel.toLocaleUpperCase("tr-TR")}
+                      </span>
+                      <span className="mt-0.5 flex items-center gap-1 text-[12px] font-bold leading-none text-[var(--brand-primary)]">
+                        Point B2B
+                      </span>
+                    </span>
+                  </div>
+                ) : !isAdminDashboardRoute && user ? (
                   <div className="dashboard-header-profile">
                     <span
                       className={cn(
                         "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[linear-gradient(135deg,var(--brand-primary)_0%,var(--brand-accent)_100%)] bg-cover bg-center text-[12px] font-black text-white",
-                        assignedSalesperson.avatar_url && "text-transparent"
+                        user.avatar_url && "text-transparent"
                       )}
-                      style={salespersonAvatarStyle}
-                      aria-label={`${assignedSalespersonName} profil resmi`}
+                      style={userAvatarStyle}
+                      aria-label={`${currentUserName} profil resmi`}
                     >
-                      {initialsFromName(assignedSalespersonName)}
+                      {initialsFromName(currentUserName)}
                     </span>
                     <span className="min-w-0">
                       <span className="block truncate text-[10px] font-black uppercase tracking-[0.12em] text-[var(--muted-foreground)]">
-                        Plasiyer
+                        {panelTitle}
                       </span>
                       <span className="dashboard-header-profile-name">
-                        {assignedSalespersonDisplayName}
+                        {currentUserDisplayName}
                       </span>
                       <span className="mt-0.5 flex items-center gap-1 text-[12px] font-bold leading-none text-[var(--brand-primary)]">
                         <PhoneCall className="h-3 w-3 shrink-0" />
-                        <span className="truncate">{assignedSalespersonPhone}</span>
+                        <span className="truncate">{currentUserPhone}</span>
                       </span>
                     </span>
                   </div>

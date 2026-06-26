@@ -10,6 +10,15 @@ return [
         'pos_expense_sync_key' => env('LOGO_POS_EXPENSE_SYNC_KEY', env('LOGO_COLLECTION_SYNC_KEY', env('LOGO_CUSTOMER_SYNC_KEY', ''))),
         'order_sync_key' => env('LOGO_ORDER_SYNC_KEY', env('LOGO_COLLECTION_SYNC_KEY', env('LOGO_CUSTOMER_SYNC_KEY', ''))),
         'shipment_sync_key' => env('LOGO_SHIPMENT_SYNC_KEY', env('LOGO_ORDER_SYNC_KEY', env('LOGO_COLLECTION_SYNC_KEY', env('LOGO_CUSTOMER_SYNC_KEY', '')))),
+        'shipments' => [
+            'immediate_export' => [
+                'enabled' => env('LOGO_SHIPMENT_IMMEDIATE_EXPORT_ENABLED', false),
+                'url' => env('LOGO_SHIPMENT_IMMEDIATE_EXPORT_URL', ''),
+                'token' => env('LOGO_SHIPMENT_IMMEDIATE_EXPORT_TOKEN', ''),
+                'timeout' => (float) env('LOGO_SHIPMENT_IMMEDIATE_EXPORT_TIMEOUT', 10.0),
+            ],
+        ],
+        'purchase_receipt_sync_key' => env('LOGO_PURCHASE_RECEIPT_SYNC_KEY', env('LOGO_SHIPMENT_SYNC_KEY', env('LOGO_ORDER_SYNC_KEY', env('LOGO_COLLECTION_SYNC_KEY', env('LOGO_CUSTOMER_SYNC_KEY', ''))))),
         'return_sync_key' => env('LOGO_RETURN_SYNC_KEY', env('LOGO_ORDER_SYNC_KEY', env('LOGO_COLLECTION_SYNC_KEY', env('LOGO_CUSTOMER_SYNC_KEY', '')))),
         'write' => [
             'enabled' => env('LOGO_WRITE_ENABLED', false),
@@ -30,6 +39,10 @@ return [
     'pos' => [
         'point_cashbox_code' => env('POS_POINT_CASHBOX_CODE', '100.01.007'),
         'point_cashbox_name' => env('POS_POINT_CASHBOX_NAME', 'ERZURUM POINT KASASI'),
+        'erzurum_point_cashbox_code' => env('POS_ERZURUM_POINT_CASHBOX_CODE', env('POS_POINT_CASHBOX_CODE', '100.01.007')),
+        'erzurum_point_cashbox_name' => env('POS_ERZURUM_POINT_CASHBOX_NAME', env('POS_POINT_CASHBOX_NAME', 'ERZURUM POINT KASASI')),
+        'batum_point_cashbox_code' => env('POS_BATUM_POINT_CASHBOX_CODE', '100.01.002'),
+        'batum_point_cashbox_name' => env('POS_BATUM_POINT_CASHBOX_NAME', 'BATUM POINT KASASI'),
     ],
     'ownership' => [
         'customers' => [
@@ -63,6 +76,11 @@ return [
             'b2b_to_logo' => true,
         ],
         'orders' => [
+            'master' => 'b2b',
+            'logo_to_b2b' => false,
+            'b2b_to_logo' => true,
+        ],
+        'purchase_receipts' => [
             'master' => 'b2b',
             'logo_to_b2b' => false,
             'b2b_to_logo' => true,

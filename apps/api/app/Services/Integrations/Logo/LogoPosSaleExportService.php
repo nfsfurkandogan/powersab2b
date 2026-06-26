@@ -12,7 +12,9 @@ use Illuminate\Validation\ValidationException;
 
 class LogoPosSaleExportService
 {
-    private const POINT_CURRENCY = 'GEL';
+    private const ERZURUM_POINT_CURRENCY = 'TRY';
+
+    private const BATUM_POINT_CURRENCY = 'GEL';
 
     public function __construct(
         private readonly IntegrationSyncStateService $syncState
@@ -148,6 +150,7 @@ class LogoPosSaleExportService
         $customer = $sale->customer;
         $cashbox = $sale->posSession?->cashbox;
         $cashboxPayload = $this->normalizeCashboxPayload($cashbox?->id, $cashbox?->code, $cashbox?->name);
+        $currency = $this->pointCurrency($cashboxPayload['code'] ?? $cashbox?->code, $cashboxPayload['name'] ?? $cashbox?->name);
 
         return [
             'pos_sale_id' => $sale->id,
@@ -164,18 +167,11 @@ class LogoPosSaleExportService
             'discount_total' => number_format((float) $sale->discount_total, 2, '.', ''),
             'vat_total' => number_format((float) $sale->vat_total, 2, '.', ''),
             'grand_total' => number_format((float) $sale->grand_total, 2, '.', ''),
-            'currency' => self::POINT_CURRENCY,
+            'currency' => $currency,
             'cashbox_id' => $cashboxPayload['id'] ?? null,
             'cashbox_code' => $cashboxPayload['code'] ?? null,
             'cashbox_name' => $cashboxPayload['name'] ?? null,
-            'logo' => [
-                'trcode' => data_get($sale->meta_json, 'integrations.logo.trcode'),
-                'branch' => data_get($sale->meta_json, 'integrations.logo.branch'),
-                'department' => data_get($sale->meta_json, 'integrations.logo.department'),
-                'source_index' => data_get($sale->meta_json, 'integrations.logo.source_index'),
-                'warehouse_no' => data_get($sale->meta_json, 'integrations.logo.warehouse_no'),
-                'target_tables' => ['STFICHE', 'STLINE', 'INVOICE', 'PAYTRANS'],
-            ],
+            'logo' => $this->logoPayload($sale),
             'sync_status' => $state->status,
             'sync_error' => $state->last_error,
             'items' => $this->transformItems($sale->items),
@@ -183,7 +179,7 @@ class LogoPosSaleExportService
                 ->map(fn ($payment): array => [
                     'method' => $payment->method,
                     'amount' => number_format((float) $payment->amount, 2, '.', ''),
-                    'currency' => self::POINT_CURRENCY,
+                    'currency' => $currency,
                     'meta' => $payment->meta_json ?? [],
                 ])
                 ->values()
@@ -195,6 +191,42 @@ class LogoPosSaleExportService
                 'cashbox' => $cashboxPayload,
             ],
         ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function logoPayload(PosSale $sale): array
+    {
+        $payload = [
+            'branch' => data_get($sale->meta_json, 'integrations.logo.branch'),
+            'department' => data_get($sale->meta_json, 'integrations.logo.department'),
+            'source_index' => data_get($sale->meta_json, 'integrations.logo.source_index'),
+            'warehouse_no' => data_get($sale->meta_json, 'integrations.logo.warehouse_no'),
+        ];
+
+        if ($sale->document_type === 'delivery') {
+            return array_filter([
+                ...$payload,
+                'document_target' => 'sales_dispatch_note',
+                'document_label' => 'Satış İrsaliyesi',
+                'trcode' => 8,
+                'stock_trcode' => 8,
+                'iocode' => 4,
+                'target_tables' => ['STFICHE', 'STLINE'],
+            ], fn ($value): bool => $value !== null);
+        }
+
+        return array_filter([
+            ...$payload,
+            'document_target' => 'sales_invoice',
+            'document_label' => 'Satış Faturası',
+            'trcode' => 8,
+            'invoice_trcode' => 8,
+            'stock_trcode' => 8,
+            'iocode' => 4,
+            'target_tables' => ['INVOICE', 'STFICHE', 'STLINE'],
+        ], fn ($value): bool => $value !== null);
     }
 
     /**
@@ -277,13 +309,15 @@ class LogoPosSaleExportService
             return null;
         }
 
-        if ($this->isLocalPointCashboxCode($normalizedCode)) {
-            $normalizedCode = $this->nullableString(config('integrations.pos.point_cashbox_code')) ?? $normalizedCode;
-            $normalizedName = $this->nullableString(config('integrations.pos.point_cashbox_name')) ?? $normalizedName;
+        $isLocalPointCashbox = $this->isLocalPointCashboxCode($normalizedCode);
+
+        if ($isLocalPointCashbox) {
+            $normalizedCode = $this->pointLogoCashboxCode($normalizedCode, $normalizedName) ?? $normalizedCode;
+            $normalizedName = $this->pointLogoCashboxName($normalizedCode, $normalizedName) ?? $normalizedName;
         }
 
         return [
-            'id' => is_numeric($id) ? (int) $id : null,
+            'id' => $isLocalPointCashbox ? null : (is_numeric($id) ? (int) $id : null),
             'code' => $normalizedCode,
             'name' => $normalizedName,
         ];
@@ -292,5 +326,40 @@ class LogoPosSaleExportService
     private function isLocalPointCashboxCode(?string $code): bool
     {
         return $code !== null && str_starts_with($code, 'POINT-');
+    }
+
+    private function pointLogoCashboxCode(?string $code, ?string $name): ?string
+    {
+        if ($this->isBatumCashbox($code, $name)) {
+            return $this->nullableString(config('integrations.pos.batum_point_cashbox_code'));
+        }
+
+        return $this->nullableString(config('integrations.pos.erzurum_point_cashbox_code'))
+            ?? $this->nullableString(config('integrations.pos.point_cashbox_code'));
+    }
+
+    private function pointLogoCashboxName(?string $code, ?string $name): ?string
+    {
+        if ($this->isBatumCashbox($code, $name)) {
+            return $this->nullableString(config('integrations.pos.batum_point_cashbox_name'));
+        }
+
+        return $this->nullableString(config('integrations.pos.erzurum_point_cashbox_name'))
+            ?? $this->nullableString(config('integrations.pos.point_cashbox_name'));
+    }
+
+    private function pointCurrency(?string $code, ?string $name): string
+    {
+        return $this->isBatumCashbox($code, $name) ? self::BATUM_POINT_CURRENCY : self::ERZURUM_POINT_CURRENCY;
+    }
+
+    private function isBatumCashbox(?string $code, ?string $name): bool
+    {
+        $haystack = mb_strtoupper(trim(($code ?? '').' '.($name ?? '')), 'UTF-8');
+        $normalizedCode = mb_strtoupper(trim((string) $code), 'UTF-8');
+        $batumCashboxCode = mb_strtoupper(trim((string) config('integrations.pos.batum_point_cashbox_code')), 'UTF-8');
+
+        return str_contains($haystack, 'BATUM')
+            || ($batumCashboxCode !== '' && $normalizedCode === $batumCashboxCode);
     }
 }

@@ -180,17 +180,22 @@ class ProductFilterOptionsController extends Controller
         $metaOptions = $this->emptyMetaOptions();
         $targetKeys = $onlyKeys ?? array_keys($metaOptions);
 
-        $products = Product::query()
-            ->select(['products.id', 'products.meta', 'brands.name as option_brand_name'])
-            ->leftJoin('brands', 'brands.id', '=', 'products.brand_id')
+        $needsBrandFallback = $onlyKeys === null || in_array('specode5', $targetKeys, true);
+        $query = Product::query()
+            ->select(['products.id', 'products.meta'])
             ->where('products.is_active', true)
             ->whereNotNull('meta')
             ->where(function (Builder $query): void {
                 $this->applyLogoProductFilter($query);
-            })
-            ->get();
+            });
 
-        foreach ($products as $product) {
+        if ($needsBrandFallback) {
+            $query
+                ->addSelect('brands.name as option_brand_name')
+                ->leftJoin('brands', 'brands.id', '=', 'products.brand_id');
+        }
+
+        foreach ($query->lazyById(500, 'products.id', 'id') as $product) {
             if (! is_array($product->meta)) {
                 continue;
             }
@@ -199,7 +204,7 @@ class ProductFilterOptionsController extends Controller
                 $this->pushMetaOption($metaOptions, $key, $this->firstMetaValue($product->meta, $this->metaValuePaths($key)));
             }
 
-            if ($onlyKeys === null || in_array('specode5', $onlyKeys, true)) {
+            if ($needsBrandFallback) {
                 $this->pushMetaOption($metaOptions, 'specode5', $product->option_brand_name ?? null);
             }
         }

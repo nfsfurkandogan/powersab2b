@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { zodResolver } from "@hookform/resolvers/zod";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useForm, useWatch } from "react-hook-form";
 import { z } from "zod";
@@ -14,7 +15,6 @@ import {
   CreditCard,
   History,
   Loader2,
-  MessageCircle,
   Minus,
   PackageSearch,
   Plus,
@@ -89,12 +89,16 @@ import { cn } from "@/lib/utils";
 
 const QUICK_SEARCH_LIMIT = 20;
 const CUSTOMER_LIMIT = 50;
-const POINT_DISPLAY_CURRENCY_LABEL = "GEL";
-const POINT_LEDGER_CURRENCY = "GEL";
+const BATUM_POINT_DISPLAY_CURRENCY_LABEL = "GEL";
+const ERZURUM_POINT_DISPLAY_CURRENCY_LABEL = "TL";
+const BATUM_POINT_LEDGER_CURRENCY = "GEL";
+const ERZURUM_POINT_LEDGER_CURRENCY = "TRY";
 const DEFAULT_VAT_RATE = 20;
+const RECEIPT_VAT_RATE_LABEL = "%20";
 const POINT_ANONYMOUS_CUSTOMER_CODE = "POINT-CARISI-OLMAYAN";
 const POINT_RESET_AFTER_SALE_STORAGE_KEY = "powersa:point-pos-reset-after-sale";
 const POS_SAVE_AND_PRINT_LABEL = "Kaydet ve Yazdır";
+const ERZURUM_POINT_SPECIAL_CODE = "D";
 const POS_SALE_TYPE_OPTIONS: Array<{ value: PosSaleType; label: string }> = [
   { value: "cash", label: "Nakit" },
   { value: "card", label: "Kredi Kartı" },
@@ -134,6 +138,10 @@ function normalizePointStockText(value: string | null | undefined): string {
     .toLocaleLowerCase("tr-TR")
     .replace(/[._-]+/g, " ")
     .replace(/\s+/g, " ");
+}
+
+function includesBatum(value?: string | number | null): boolean {
+  return String(value ?? "").trim().toLocaleUpperCase("tr-TR").includes("BATUM");
 }
 
 function productPointStockLocations(product: ProductSearchItem): PointStockLocation[] {
@@ -265,6 +273,29 @@ type PosCartItem = {
   vat_rate: number;
 };
 
+type ReceiptPrintSaleItem = {
+  sku?: string | null;
+  name?: string | null;
+  qty: string | number;
+  unit_price: string | number;
+  line_total: string | number;
+};
+
+type ReceiptPrintSale = {
+  document_type: PosDocumentType;
+  receipt_no: string;
+  created_at: string;
+  subtotal: string | number;
+  discount_total: string | number;
+  vat_total: string | number;
+  grand_total: string | number;
+  customer: {
+    title?: string | null;
+    code?: string | null;
+  };
+  items: ReceiptPrintSaleItem[];
+};
+
 function createEmptyPointCartItemsBySaleType(): Record<PosSaleType, PosCartItem[]> {
   return {
     cash: [],
@@ -295,22 +326,22 @@ function getMinimumEditablePriceCents(originalUnitPriceCents: number): number {
   return Math.round(originalUnitPriceCents * 0.9);
 }
 
-function formatCurrency(value: number | string): string {
+function formatPointAmount(value: number | string, currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL): string {
   const amount = typeof value === "number" ? value : Number(value);
 
   return Number.isFinite(amount)
-    ? `${POINT_DISPLAY_CURRENCY_LABEL} ${amount.toLocaleString("tr-TR", {
+    ? `${currencyLabel} ${amount.toLocaleString("tr-TR", {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       })}`
     : "-";
 }
 
-function formatPointCurrencyNumber(value: number | string): string {
-  const formatted = formatCurrency(value);
+function formatPointAmountNumber(value: number | string, currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL): string {
+  const formatted = formatPointAmount(value, currencyLabel);
 
-  return formatted.startsWith(`${POINT_DISPLAY_CURRENCY_LABEL} `)
-    ? formatted.slice(POINT_DISPLAY_CURRENCY_LABEL.length + 1)
+  return formatted.startsWith(`${currencyLabel} `)
+    ? formatted.slice(currencyLabel.length + 1)
     : formatted;
 }
 
@@ -323,12 +354,16 @@ function toPointLedgerAmount(value: string | number): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function formatPointLedgerAmount(value: string | number, currency: string): string {
+function formatPointLedgerAmount(
+  value: string | number,
+  currency: string,
+  currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL
+): string {
   const amount = toPointLedgerAmount(value);
   const normalizedCurrency = currency.trim().toUpperCase();
 
   if (normalizedCurrency === "TRY" || normalizedCurrency === "GEL" || normalizedCurrency === "LARI") {
-    return formatCurrency(amount);
+    return formatPointAmount(amount, currencyLabel);
   }
 
   return `${normalizedCurrency} ${amount.toLocaleString("tr-TR", {
@@ -475,9 +510,8 @@ function isVatIncludedPointCustomer(customer: CustomerListItem | null | undefine
   return haystack.includes("SATIS") && (haystack.includes("NAKIT") || haystack.includes("KREDI"));
 }
 
-function normalizeVatRate(value: string | number | null | undefined): number {
-  const parsed = typeof value === "number" ? value : Number(value ?? DEFAULT_VAT_RATE);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_VAT_RATE;
+function normalizeVatRate(_value?: string | number | null): number {
+  return DEFAULT_VAT_RATE;
 }
 
 function grossCentsFromNet(netCents: number, vatRate: number): number {
@@ -496,12 +530,16 @@ function netPriceCentsFromDisplay(displayUnitPriceCents: number, vatRate: number
   return includesVat ? netCentsFromGross(displayUnitPriceCents, vatRate) : displayUnitPriceCents;
 }
 
-function formatPointProductDisplayPrice(product: ProductSearchItem, includesVat: boolean): string {
+function formatPointProductDisplayPrice(
+  product: ProductSearchItem,
+  includesVat: boolean,
+  currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL
+): string {
   const parsedNetPrice = Number(product.net_price ?? 0);
   const unitNetPriceCents = toCents(Number.isFinite(parsedNetPrice) ? parsedNetPrice : 0);
   const vatRate = normalizeVatRate(product.vat_rate);
 
-  return formatCurrency(fromCents(displayPriceCents(unitNetPriceCents, vatRate, includesVat)));
+  return formatPointAmount(fromCents(displayPriceCents(unitNetPriceCents, vatRate, includesVat)), currencyLabel);
 }
 
 function getPointSaleContextLabel(saleType: PosSaleType): string {
@@ -516,22 +554,16 @@ function getPointSaleContextLabel(saleType: PosSaleType): string {
   return "BATUM PERAKENDE NAKİT SATIŞ";
 }
 
-function normalizeWhatsAppPhoneForUrl(phone?: string | null): string {
-  const digits = (phone ?? "").replace(/\D/g, "");
-
-  if (digits.startsWith("00")) {
-    return digits.slice(2);
+function getNonBatumPointSaleContextLabel(saleType: PosSaleType): string {
+  if (saleType === "card") {
+    return "Kredi Kartı Satış";
   }
 
-  if (digits.startsWith("0") && digits.length === 11) {
-    return `90${digits.slice(1)}`;
+  if (saleType === "transfer") {
+    return "Depo (Sipariş)";
   }
 
-  if (digits.length === 10) {
-    return `90${digits}`;
-  }
-
-  return digits;
+  return "Nakit Satış";
 }
 
 function resolvePointDefaultCustomerId(
@@ -564,7 +596,12 @@ function resolvePointDefaultCustomerId(
   return fallback?.customer.id ?? normalized[0].customer.id;
 }
 
-function resolveSaleTotals(items: PosCartItem[], rawDiscountCents: number, pricesIncludeVat = false) {
+function resolveSaleTotals(
+  items: PosCartItem[],
+  rawDiscountCents: number,
+  pricesIncludeVat = false,
+  applyVat = true
+) {
   const normalizedItems = items.map((item) => {
     const displayedLineTotalCents = displayPriceCents(item.unit_price_cents, item.vat_rate, pricesIncludeVat) * item.qty;
     const lineTotalCents = pricesIncludeVat
@@ -597,9 +634,10 @@ function resolveSaleTotals(items: PosCartItem[], rawDiscountCents: number, price
     remainingDiscount -= lineDiscountCents;
 
     const taxBaseCents = Math.max(0, item.line_total_cents - lineDiscountCents);
-    const lineVatCents = pricesIncludeVat && discountTotalCents === 0
+    const effectiveVatRate = applyVat ? item.vat_rate : 0;
+    const lineVatCents = pricesIncludeVat && applyVat && discountTotalCents === 0
       ? Math.max(0, item.displayed_line_total_cents - taxBaseCents)
-      : Math.round(taxBaseCents * (item.vat_rate / 100));
+      : Math.round(taxBaseCents * (effectiveVatRate / 100));
 
     vatTotalCents += lineVatCents;
 
@@ -608,10 +646,11 @@ function resolveSaleTotals(items: PosCartItem[], rawDiscountCents: number, price
       line_discount_cents: lineDiscountCents,
       line_vat_cents: lineVatCents,
       tax_base_cents: taxBaseCents,
+      vat_rate: effectiveVatRate,
     };
   });
 
-  const grandTotalCents = pricesIncludeVat && discountTotalCents === 0
+  const grandTotalCents = pricesIncludeVat && applyVat && discountTotalCents === 0
     ? normalizedItems.reduce((sum, item) => sum + item.displayed_line_total_cents, 0)
     : subtotalCents - discountTotalCents + vatTotalCents;
 
@@ -637,103 +676,276 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 }
 
-function formatReceiptAmount(value: string | number): string {
+function formatReceiptAmount(value: string | number, currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL): string {
   const amount = typeof value === "number" ? value : Number(value);
 
-  return Number.isFinite(amount)
-    ? `${POINT_DISPLAY_CURRENCY_LABEL} ${amount.toLocaleString("tr-TR", {
+  if (!Number.isFinite(amount)) {
+    return "-";
+  }
+
+  const formatted = amount.toLocaleString("tr-TR", {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
-      })}`
-    : "-";
+      });
+  const suffix = currencyLabel === ERZURUM_POINT_DISPLAY_CURRENCY_LABEL ? "₺" : currencyLabel;
+
+  return `${formatted} ${suffix}`;
 }
 
-function openReceiptPrintWindow(sale: PosSaleDto) {
+function formatReceiptDate(value: string): string {
+  const parsed = new Date(value);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleDateString("tr-TR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
+}
+
+function generatePointReceiptNo(): string {
+  const now = new Date();
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  const timestamp = [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds()),
+  ].join("");
+  const suffix = Math.random().toString(36).slice(2, 7).toUpperCase().padEnd(5, "X");
+
+  return `POS-${timestamp}-${suffix}`;
+}
+
+function escapeReceiptText(value: string | number | null | undefined): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function printHtmlDocument(html: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const frame = window.document.createElement("iframe");
+  frame.setAttribute("aria-hidden", "true");
+  frame.style.position = "fixed";
+  frame.style.right = "0";
+  frame.style.bottom = "0";
+  frame.style.width = "0";
+  frame.style.height = "0";
+  frame.style.border = "0";
+  frame.style.opacity = "0";
+  frame.style.pointerEvents = "none";
+
+  const cleanup = () => {
+    window.setTimeout(() => {
+      frame.remove();
+    }, 250);
+  };
+
+  frame.onload = () => {
+    const printWindow = frame.contentWindow;
+
+    if (!printWindow) {
+      cleanup();
+      toast.error("Yazdırma penceresi hazırlanamadı.");
+      return;
+    }
+
+    printWindow.focus();
+    printWindow.print();
+    cleanup();
+  };
+
+  window.document.body.appendChild(frame);
+  const printDocument = frame.contentDocument;
+
+  if (!printDocument) {
+    cleanup();
+    toast.error("Yazdırma penceresi hazırlanamadı.");
+    return;
+  }
+
+  printDocument.open();
+  printDocument.write(html);
+  printDocument.close();
+}
+
+function openReceiptPrintWindow(
+  sale: ReceiptPrintSale,
+  currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL,
+  selectedCustomer?: CustomerListItem | null
+) {
   if (typeof window === "undefined") {
     return;
   }
 
   const documentLabel = sale.document_type === "delivery" ? "Sevk İrsaliyesi" : "POS Fişi";
+  const receiptTitle = sale.receipt_no ? `${documentLabel} - ${sale.receipt_no}` : documentLabel;
+  const customerTitle = selectedCustomer?.title ?? sale.customer.title ?? sale.customer.code ?? "-";
+  const customerAddress = [
+    selectedCustomer?.district,
+    selectedCustomer?.city,
+  ].filter(Boolean).join(" / ");
+  const receiptSubtotal = Math.max(0, Number(sale.subtotal) - Number(sale.discount_total));
 
   const lines = sale.items
     .map(
       (item) => `
-        <tr>
-          <td>${item.sku ?? "-"}</td>
-          <td>${item.name ?? "-"}</td>
-          <td style="text-align:right;">${item.qty}</td>
-          <td style="text-align:right;">${formatReceiptAmount(item.unit_price)}</td>
-          <td style="text-align:right;">${formatReceiptAmount(item.line_total)}</td>
-        </tr>
+        <div class="table-row">
+          <div class="sku">${escapeReceiptText(item.sku ?? item.name ?? "-")}</div>
+          <div class="qty">${escapeReceiptText(item.qty)}</div>
+          <div class="price">${formatReceiptAmount(item.unit_price, currencyLabel)}</div>
+          <div class="line-total">${formatReceiptAmount(item.line_total, currencyLabel)}</div>
+        </div>
       `
     )
     .join("");
 
-  const popup = window.open("", "_blank", "width=440,height=780");
-  if (!popup) {
-    toast.error("Yazdırma penceresi engellendi. Tarayıcı popup izni verin.");
-    return;
-  }
-
-  popup.document.write(`
+  printHtmlDocument(`
     <html>
       <head>
-        <title>${documentLabel} - ${sale.receipt_no}</title>
+        <title>${escapeReceiptText(receiptTitle)}</title>
         <style>
-          body { font-family: Arial, sans-serif; padding: 16px; color: #111827; }
-          h1 { margin: 0; font-size: 16px; }
-          p { margin: 6px 0; font-size: 12px; }
-          table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
-          th, td { border-bottom: 1px solid #e5e7eb; padding: 6px 0; }
-          .totals { margin-top: 14px; border-top: 1px dashed #4b5563; padding-top: 8px; }
-          .totals p { display: flex; justify-content: space-between; }
-          .grand { font-weight: 700; font-size: 14px; }
+          @page { size: 90mm 110mm portrait; margin: 0; }
+          * { box-sizing: border-box; }
+          html {
+            width: 90mm;
+            min-width: 90mm;
+            max-width: 90mm;
+            height: 110mm;
+            min-height: 110mm;
+            max-height: 110mm;
+            margin: 0;
+            background: #fff;
+          }
+          body {
+            width: 90mm;
+            min-width: 90mm;
+            max-width: 90mm;
+            height: 110mm;
+            min-height: 110mm;
+            max-height: 110mm;
+            margin: 0;
+            padding: 0;
+            color: #111;
+            background: #fff;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 10.8px;
+            font-weight: 900;
+            line-height: 1.22;
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+            user-select: none;
+          }
+          .receipt {
+            position: relative;
+            width: 90mm;
+            height: 110mm;
+            margin: 0 auto;
+            padding: 7mm 7mm 5mm;
+            overflow: hidden;
+            user-select: none;
+          }
+          .top { display: grid; grid-template-columns: minmax(0,1fr) 28mm; column-gap: 4mm; align-items: start; }
+          .customer { min-height: 14mm; font-size: 12.4px; font-weight: 900; line-height: 1.18; letter-spacing: 0.01em; text-transform: uppercase; word-break: break-word; }
+          .meta { padding-top: 0.4mm; text-align: left; font-size: 10.6px; font-weight: 900; line-height: 1.5; white-space: nowrap; }
+          .meta div:empty { display: none; }
+          .address { min-height: 8mm; margin-top: 8mm; padding-bottom: 1.6mm; border-bottom: 1px dashed #111; white-space: pre-line; text-transform: uppercase; }
+          .items-table { width: 100%; margin-top: 3.2mm; }
+          .table-head, .table-row { display: grid; grid-template-columns: 29mm 8mm 18mm 21mm; column-gap: 0; align-items: baseline; }
+          .table-head { border-bottom: 1.5px solid #111; padding-bottom: 1mm; font-size: 10.4px; font-weight: 900; }
+          .table-row { padding: 1mm 0 0.8mm; font-size: 11.8px; font-weight: 900; line-height: 1.1; }
+          .table-row + .table-row { border-top: 1px dotted #999; }
+          .sku { overflow-wrap: anywhere; }
+          .qty { text-align: right; }
+          .price { padding-left: 1.8mm; text-align: right; white-space: nowrap; }
+          .line-total { padding-left: 2.4mm; text-align: right; white-space: nowrap; }
+          .bottom { position: absolute; right: 7mm; bottom: 5mm; left: 33mm; display: block; }
+          .totals { display: grid; gap: 1.1mm; border-top: 1.5px solid #111; padding-top: 1.5mm; font-weight: 900; }
+          .total-line { display: grid; grid-template-columns: 1fr 20mm; gap: 3mm; white-space: nowrap; }
+          .total-line span:last-child { text-align: right; }
+          .grand { border-top: 1.5px solid #111; margin-top: 0.6mm; padding-top: 1mm; font-size: 11.5px; font-weight: 900; }
+          @media screen {
+            html { width: 100%; height: 100%; min-width: 0; max-width: none; min-height: 100%; max-height: none; }
+            body { width: 100%; height: auto; min-width: 0; max-width: none; min-height: 100%; max-height: none; display: flex; justify-content: center; align-items: flex-start; background: #d7d9dd; padding: 14px 0; overflow: auto; }
+            .receipt { flex: 0 0 auto; background: #fff; box-shadow: 0 0 0 1px #c9ccd2, 0 18px 42px rgba(15, 23, 42, 0.18); }
+          }
+          @media print {
+            @page { size: 90mm 110mm portrait; margin: 0; }
+            html, body {
+              width: 90mm !important;
+              min-width: 90mm !important;
+              max-width: 90mm !important;
+              height: 110mm !important;
+              min-height: 110mm !important;
+              max-height: 110mm !important;
+              margin: 0 !important;
+              overflow: hidden !important;
+              background: #fff;
+            }
+            body { padding: 0; }
+            .receipt {
+              width: 90mm !important;
+              min-width: 90mm !important;
+              max-width: 90mm !important;
+              height: 110mm !important;
+              min-height: 110mm !important;
+              max-height: 110mm !important;
+              box-shadow: none;
+              margin: 0;
+            }
+          }
         </style>
       </head>
       <body>
-        <h1>POWERSA ${documentLabel}</h1>
-        <p><strong>Belge No:</strong> ${sale.receipt_no}</p>
-        <p><strong>Tarih:</strong> ${new Date(sale.created_at).toLocaleString("tr-TR")}</p>
-        <p><strong>Satış Tipi:</strong> ${sale.sale_type.toUpperCase()}</p>
-        <p><strong>Belge:</strong> ${sale.document_type.toUpperCase()}</p>
-        <p><strong>Cari:</strong> ${sale.customer.title ?? sale.customer.code ?? "-"}</p>
-        <table>
-          <thead>
-            <tr>
-              <th>SKU</th>
-              <th>Ürün</th>
-              <th style="text-align:right;">Adet</th>
-              <th style="text-align:right;">Birim</th>
-              <th style="text-align:right;">Tutar</th>
-            </tr>
-          </thead>
-          <tbody>${lines}</tbody>
-        </table>
-        <div class="totals">
-          <p><span>Ara Toplam</span><span>${formatReceiptAmount(sale.subtotal)}</span></p>
-          <p><span>İskonto</span><span>${formatReceiptAmount(sale.discount_total)}</span></p>
-          <p><span>KDV</span><span>${formatReceiptAmount(sale.vat_total)}</span></p>
-          <p class="grand"><span>Genel Toplam</span><span>${formatReceiptAmount(sale.grand_total)}</span></p>
+        <div class="receipt">
+          <div class="top">
+            <div class="customer">${escapeReceiptText(customerTitle)}</div>
+            <div class="meta">
+              <div>${formatReceiptDate(sale.created_at)}</div>
+              <div>${escapeReceiptText(sale.receipt_no)}</div>
+            </div>
+          </div>
+          <div class="address">${escapeReceiptText(customerAddress)}</div>
+          <div class="items-table">
+            <div class="table-head">
+              <div class="sku">Stok Kodu</div>
+              <div class="qty">Adet</div>
+              <div class="price">Fiyat</div>
+              <div class="line-total">Tutar</div>
+            </div>
+            <div>${lines}</div>
+          </div>
+          <div class="bottom">
+            <div class="totals">
+              <div class="total-line"><span>Toplam</span><span>${formatReceiptAmount(receiptSubtotal, currencyLabel)}</span></div>
+              <div class="total-line"><span>KDV (${RECEIPT_VAT_RATE_LABEL})</span><span>${formatReceiptAmount(sale.vat_total, currencyLabel)}</span></div>
+              <div class="total-line grand"><span>Genel Toplam</span><span>${formatReceiptAmount(sale.grand_total, currencyLabel)}</span></div>
+            </div>
+          </div>
         </div>
       </body>
     </html>
   `);
-  popup.document.close();
-  popup.focus();
-  popup.print();
 }
 
-function openLinePrintWindow(item: PosCartItem) {
+function openLinePrintWindow(item: PosCartItem, currencyLabel = BATUM_POINT_DISPLAY_CURRENCY_LABEL) {
   if (typeof window === "undefined") {
     return;
   }
 
-  const popup = window.open("", "_blank", "width=360,height=260");
-  if (!popup) {
-    return;
-  }
-
-  popup.document.write(`
+  printHtmlDocument(`
     <html>
       <head>
         <title>Ürün Etiketi</title>
@@ -749,19 +961,16 @@ function openLinePrintWindow(item: PosCartItem) {
         <div class="meta">SKU: ${item.sku}</div>
         <div class="meta">OEM: ${item.oem ?? "-"}</div>
         <div class="meta">Stok: ${item.available_total}</div>
-        <div class="price">${formatCurrency(item.unit_price_cents / 100)}</div>
+        <div class="price">${formatPointAmount(item.unit_price_cents / 100, currencyLabel)}</div>
       </body>
     </html>
   `);
-  popup.document.close();
-  popup.focus();
-  popup.print();
 }
 
 export function PosPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const { user, logout, selectCustomer: syncContextCustomer } = useSession();
+  const { user, selectCustomer: syncContextCustomer } = useSession();
   const quickInputRef = useRef<HTMLInputElement | null>(null);
   const pointProductCodeInputRef = useRef<HTMLInputElement | null>(null);
   const pointQtyInputRef = useRef<HTMLInputElement | null>(null);
@@ -781,10 +990,20 @@ export function PosPage() {
     hasPosMenuPermission && !roleSlugs.some((role) => role === "admin" || role === "dealer_admin" || role === "cashier");
   const usePointSpecificPosFlow = true;
   const isPointRole = usePointSpecificPosFlow && (hasPointRole || hasStandalonePosMenuAccess);
+  const isBatumPointFlowByUser = useMemo(
+    () =>
+      [
+        user?.branch_code,
+        user?.branch_name,
+        user?.region_code,
+        user?.region_name,
+      ].some(includesBatum),
+    [user?.branch_code, user?.branch_name, user?.region_code, user?.region_name]
+  );
   const visiblePointProductStockColumns = useMemo(() => {
     const permittedColumns = visiblePointStockColumns(featurePermissionSet, roleSlugs);
 
-    if (!isPointRole) {
+    if (!isPointRole || !isBatumPointFlowByUser) {
       return permittedColumns;
     }
 
@@ -792,11 +1011,15 @@ export function PosPage() {
     const scopedColumns = POINT_BATUM_PRODUCT_STOCK_COLUMNS.filter((column) => permittedKeys.has(column.key));
 
     return scopedColumns.length > 0 ? scopedColumns : POINT_BATUM_PRODUCT_STOCK_COLUMNS;
-  }, [featurePermissionSet, isPointRole, roleSlugs]);
+  }, [featurePermissionSet, isPointRole, isBatumPointFlowByUser, roleSlugs]);
   const canAccessPos =
     hasPointRole ||
     hasPosMenuPermission ||
     roleSlugs.some((role) => role === "admin" || role === "dealer_admin" || role === "cashier");
+  const isErzurumPointFlow = canAccessPos && !isBatumPointFlowByUser;
+  const erzurumPointCustomerParams = isErzurumPointFlow
+    ? { specode4: ERZURUM_POINT_SPECIAL_CODE }
+    : null;
 
   const [quickQuery, setQuickQuery] = useState("");
   const [activeQuickIndex, setActiveQuickIndex] = useState(0);
@@ -823,12 +1046,12 @@ export function PosPage() {
   const [customerDialogOpen, setCustomerDialogOpen] = useState(false);
   const [customerQuery, setCustomerQuery] = useState("");
   const [manualCustomerOverride, setManualCustomerOverride] = useState(() => consumePointResetAfterSaleFlag());
-  const [pointDocumentManualOverride, setPointDocumentManualOverride] = useState(false);
 
   const [paymentDialogOpen, setPaymentDialogOpen] = useState(false);
   const [pointLedgerDialogOpen, setPointLedgerDialogOpen] = useState(false);
   const [closeSessionDialogOpen, setCloseSessionDialogOpen] = useState(false);
   const [posActionDialog, setPosActionDialog] = useState<PosActionDialog | null>(null);
+  const [pointSaveResult, setPointSaveResult] = useState<PosSaleDto | null>(null);
 
   const [movementProduct, setMovementProduct] = useState<PosCartItem | null>(null);
 
@@ -935,25 +1158,43 @@ export function PosPage() {
   });
 
   const pointCustomersQuery = useQuery({
-    queryKey: ["pos", isPointRole ? "dealer-customers" : "point-customers"],
+    queryKey: [
+      "pos",
+      isPointRole || isErzurumPointFlow ? "dealer-customers" : "point-customers",
+      isErzurumPointFlow ? `special-customer:${ERZURUM_POINT_SPECIAL_CODE}` : "no-special-customer",
+    ],
     queryFn: () =>
       listPosCustomers(
-        isPointRole
-          ? { limit: CUSTOMER_LIMIT }
+        isPointRole || isErzurumPointFlow
+          ? {
+              limit: CUSTOMER_LIMIT,
+              ...(erzurumPointCustomerParams ?? {}),
+            }
           : { q: "POINT", limit: CUSTOMER_LIMIT }
       ),
     staleTime: 120_000,
     enabled: canAccessPos,
   });
+  const effectivePosDealerId =
+    user?.dealer_id ??
+    pointCustomersQuery.data?.data.find((customer) => customer.id === selectedCustomerId)?.dealer_id ??
+    pointCustomersQuery.data?.data[0]?.dealer_id ??
+    undefined;
 
   const customerSearchQuery = useInfiniteQuery({
-    queryKey: ["pos", "customers", debouncedCustomerQuery],
+    queryKey: [
+      "pos",
+      "customers",
+      debouncedCustomerQuery,
+      isErzurumPointFlow ? `special-customer:${ERZURUM_POINT_SPECIAL_CODE}` : "no-special-customer",
+    ],
     initialPageParam: null as string | null,
     queryFn: ({ pageParam }) =>
       listPosCustomers({
         q: debouncedCustomerQuery || undefined,
         cursor: pageParam ?? undefined,
         limit: CUSTOMER_LIMIT,
+        ...(erzurumPointCustomerParams ?? {}),
       }),
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     enabled: canAccessPos && customerDialogOpen,
@@ -965,6 +1206,7 @@ export function PosPage() {
     queryFn: () =>
       searchPosProductsQuick({
         q: debouncedQuickQuery,
+        dealer_id: effectivePosDealerId,
         in_stock: false,
         limit: QUICK_SEARCH_LIMIT,
       }),
@@ -977,6 +1219,7 @@ export function PosPage() {
     queryFn: () =>
       searchPosProductsQuick({
         q: debouncedPointProductDialogQuery.trim(),
+        dealer_id: effectivePosDealerId,
         in_stock: false,
         limit: QUICK_SEARCH_LIMIT,
       }),
@@ -1078,9 +1321,15 @@ export function PosPage() {
   const createSaleMutation = useMutation({
     mutationFn: createPosSale,
     onSuccess: (response) => {
-      toast.success(
-        `${response.data.document_type === "delivery" ? "İrsaliye hazır" : "Satış tamamlandı"}: ${response.data.receipt_no} · ${formatLogoOutboundStatus(response.data.logo_sync_status)}`
-      );
+      const shouldPrintAfterSave = pointPrintAfterSaveRef.current;
+
+      if (isPointRole) {
+        toast.success("Satış kaydedildi. Gün sonu raporuna işlendi.");
+      } else {
+        toast.success(
+          `${response.data.document_type === "delivery" ? "İrsaliye hazır" : "Satış tamamlandı"}: ${response.data.receipt_no} · ${formatLogoOutboundStatus(response.data.logo_sync_status)}`
+        );
+      }
       setCartItems([]);
       setPointCartItemsBySaleType(createEmptyPointCartItemsBySaleType());
       setDiscountInput("0");
@@ -1097,17 +1346,12 @@ export function PosPage() {
       notifyPosDayEndRefresh("sale", response.data.session.id);
       void queryClient.invalidateQueries({ queryKey: ["pos", "day-end"] });
       void queryClient.invalidateQueries({ queryKey: ["pos", "session", "current"] });
-      if (isPointRole) {
-        if (pointPrintAfterSaveRef.current) {
-          openReceiptPrintWindow(response.data);
-        }
 
-        pointPrintAfterSaveRef.current = false;
-        reloadPointPosAfterSale();
-        return;
+      if (shouldPrintAfterSave) {
+        openReceiptPrintWindow(response.data, pointDisplayCurrencyLabel, selectedCustomer);
       }
 
-      openReceiptPrintWindow(response.data);
+      pointPrintAfterSaveRef.current = false;
     },
     onError: (error) => {
       const message = error instanceof Error ? error.message : "POS satış kaydı başarısız";
@@ -1253,7 +1497,37 @@ export function PosPage() {
 
   const selectedCustomer = selectedCustomerId ? customersById[selectedCustomerId] ?? null : null;
   const selectedCustomerIsAnonymous = isPointRole && isAnonymousPointCustomer(selectedCustomer);
-  const pointPriceIncludesVat = isPointRole && isVatIncludedPointCustomer(selectedCustomer);
+  const isBatumPointFlow = isPointRole && (
+    isBatumPointFlowByUser ||
+    Boolean(
+      selectedCustomer &&
+        ([
+          selectedCustomer.branch_code,
+          selectedCustomer.branch_name,
+          selectedCustomer.region_code,
+          selectedCustomer.region_name,
+          selectedCustomer.title,
+        ].some(includesBatum) || selectedCustomer.code?.trim().startsWith("120-00-") === true)
+    )
+  );
+  const pointSaleAppliesVat = Boolean(selectedCustomer) && !selectedCustomerIsAnonymous;
+  const pointPriceIncludesVat = pointSaleAppliesVat && isVatIncludedPointCustomer(selectedCustomer);
+  const pointDisplayCurrencyLabel = isBatumPointFlow
+    ? BATUM_POINT_DISPLAY_CURRENCY_LABEL
+    : ERZURUM_POINT_DISPLAY_CURRENCY_LABEL;
+  const pointLedgerCurrency = isBatumPointFlow ? BATUM_POINT_LEDGER_CURRENCY : ERZURUM_POINT_LEDGER_CURRENCY;
+  const formatCurrency = useCallback(
+    (value: number | string) => formatPointAmount(value, pointDisplayCurrencyLabel),
+    [pointDisplayCurrencyLabel]
+  );
+  const formatPointCurrencyNumber = useCallback(
+    (value: number | string) => formatPointAmountNumber(value, pointDisplayCurrencyLabel),
+    [pointDisplayCurrencyLabel]
+  );
+  const formatPointLedgerCurrency = useCallback(
+    (value: string | number, currency: string) => formatPointLedgerAmount(value, currency, pointDisplayCurrencyLabel),
+    [pointDisplayCurrencyLabel]
+  );
   const pointLedgerQuery = useQuery({
     queryKey: ["pos", "point-ledger", selectedCustomer?.id ?? null],
     queryFn: () => {
@@ -1336,26 +1610,17 @@ export function PosPage() {
           {row.reference_no ?? "-"}
         </TableCell>
         <TableCell className="whitespace-nowrap text-right font-black text-red-200">
-          {toPointLedgerAmount(row.debit) > 0 ? formatPointLedgerAmount(row.debit, row.currency) : "-"}
+          {toPointLedgerAmount(row.debit) > 0 ? formatPointLedgerCurrency(row.debit, row.currency) : "-"}
         </TableCell>
         <TableCell className="whitespace-nowrap text-right font-black text-[#91d39a]">
-          {toPointLedgerAmount(row.credit) > 0 ? formatPointLedgerAmount(row.credit, row.currency) : "-"}
+          {toPointLedgerAmount(row.credit) > 0 ? formatPointLedgerCurrency(row.credit, row.currency) : "-"}
         </TableCell>
         <TableCell className="whitespace-nowrap text-right font-black text-white">
-          {formatPointLedgerAmount(row.balance_after, row.currency)}
+          {formatPointLedgerCurrency(row.balance_after, row.currency)}
         </TableCell>
       </TableRow>
     ));
   };
-
-  useEffect(() => {
-    if (isPointRole && !pointDocumentManualOverride && documentType !== "delivery") {
-      posForm.setValue("document_type", "delivery", {
-        shouldDirty: false,
-        shouldValidate: true,
-      });
-    }
-  }, [documentType, isPointRole, pointDocumentManualOverride, posForm]);
 
   useEffect(() => {
     if (!selectedCustomerIsAnonymous || saleType !== "transfer") {
@@ -1382,10 +1647,25 @@ export function PosPage() {
     () => quickSearchQuery.data?.data ?? [],
     [quickSearchQuery.data?.data]
   );
-  const pointProductDialogProducts = useMemo(
-    () => pointProductDialogSearchQuery.data?.data ?? [],
-    [pointProductDialogSearchQuery.data?.data]
-  );
+  const pointProductDialogProducts = useMemo(() => {
+    const products = pointProductDialogSearchQuery.data?.data ?? [];
+    const query = debouncedPointProductDialogQuery.trim();
+
+    if (!isLikelyPointStockCodeQuery(query)) {
+      return products;
+    }
+
+    return [...products].sort((left, right) => {
+      const leftExact = productMatchesPointStockCode(left, query);
+      const rightExact = productMatchesPointStockCode(right, query);
+
+      if (leftExact === rightExact) {
+        return 0;
+      }
+
+      return leftExact ? -1 : 1;
+    });
+  }, [debouncedPointProductDialogQuery, pointProductDialogSearchQuery.data?.data]);
   const pointProductDialogGridTemplate = useMemo(
     () => `150px minmax(240px,1fr) ${visiblePointProductStockColumns.map(() => "112px").join(" ")} 110px`,
     [visiblePointProductStockColumns]
@@ -1407,15 +1687,18 @@ export function PosPage() {
   }, [discountInput]);
 
   const totals = useMemo(
-    () => resolveSaleTotals(visibleCartItems, rawDiscountCents, pointPriceIncludesVat),
-    [pointPriceIncludesVat, visibleCartItems, rawDiscountCents]
+    () => resolveSaleTotals(visibleCartItems, rawDiscountCents, pointPriceIncludesVat, pointSaleAppliesVat),
+    [pointPriceIncludesVat, pointSaleAppliesVat, visibleCartItems, rawDiscountCents]
   );
   const cartLineCount = visibleCartItems.length;
   const cartQtyTotal = useMemo(
     () => visibleCartItems.reduce((sum, item) => sum + item.qty, 0),
     [visibleCartItems]
   );
-  const pointSaleContextLabel = useMemo(() => getPointSaleContextLabel(saleType), [saleType]);
+  const pointSaleContextLabel = useMemo(
+    () => (isBatumPointFlow ? getPointSaleContextLabel(saleType) : getNonBatumPointSaleContextLabel(saleType)),
+    [isBatumPointFlow, saleType]
+  );
   const pointDisplayedProductName = pointDraftProduct?.name ?? "";
   const pointDisplayedProductShelf = pointDraftProduct?.shelf_address ?? null;
   const pointDisplayedProductStock = pointDraftProduct?.available_total ?? null;
@@ -1749,19 +2032,6 @@ export function PosPage() {
     setPaymentDialogOpen(true);
   }, [canSubmitSale, paymentForm, totals.grandTotalCents]);
 
-  const openDayEndPage = useCallback(() => {
-    if (!canAccessPosDayEnd) {
-      toast.error("Gün Sonu için yetkiniz yok.");
-      return;
-    }
-
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    window.location.assign("/pos/day-end");
-  }, [canAccessPosDayEnd]);
-
   const submitExpense = expenseForm.handleSubmit(async (values) => {
     if (!canAccessPosExpenses) {
       toast.error("Masraf kaydı için yetkiniz yok.");
@@ -1809,7 +2079,7 @@ export function PosPage() {
       payload: {
         method: values.method,
         amount: values.amount,
-        currency: POINT_LEDGER_CURRENCY,
+        currency: pointLedgerCurrency,
         date: new Date().toISOString().slice(0, 10),
         note: values.note?.trim() || undefined,
         reference_no: values.reference_no?.trim() || undefined,
@@ -1874,7 +2144,17 @@ export function PosPage() {
       return;
     }
 
-    if (!currentSession) {
+    const currentSessionResult = await currentSessionQuery.refetch();
+    let effectiveCurrentSession = currentSessionResult.data?.data ?? currentSession;
+
+    if (!effectiveCurrentSession && isPointRole) {
+      const openedSession = await openSessionMutation.mutateAsync({
+        opening_cash: 0,
+      });
+      effectiveCurrentSession = openedSession.data;
+    }
+
+    if (!effectiveCurrentSession || effectiveCurrentSession.status !== "open") {
       toast.error("Açık POS oturumu yok.");
       return;
     }
@@ -1914,7 +2194,7 @@ export function PosPage() {
     }
 
     await createSaleMutation.mutateAsync({
-      pos_session_id: currentSession.id,
+      pos_session_id: effectiveCurrentSession.id,
       customer_id: resolved.data.customer_id,
       sale_type: resolved.data.sale_type,
       document_type: resolved.data.document_type,
@@ -1925,7 +2205,7 @@ export function PosPage() {
         qty: item.qty,
         unit_price: Number(fromCents(item.unit_price_cents)),
         line_total: Number(fromCents(item.line_total_cents)),
-        vat_rate: item.vat_rate,
+        vat_rate: pointSaleAppliesVat ? item.vat_rate : 0,
       })),
       payments: [
         {
@@ -1937,80 +2217,59 @@ export function PosPage() {
     });
   });
 
-  const submitSaleAndPrintDirectly = useCallback(() => {
+  const printPointDraftDirectly = useCallback(() => {
     if (!canSubmitSale) {
       toast.error("Önce oturum, cari ve ürün satırlarını tamamlayın.");
       return;
     }
 
-    pointPrintAfterSaveRef.current = true;
-    paymentForm.reset({
-      cash_received: totals.grandTotalCents / 100,
-      reference_note: "",
-    });
+    const receiptNo = pointReceiptNoInput.trim() || generatePointReceiptNo();
+    if (pointReceiptNoInput.trim() === "") {
+      setPointReceiptNoInput(receiptNo);
+    }
 
-    void submitSale();
-  }, [canSubmitSale, paymentForm, submitSale, totals.grandTotalCents]);
+    const draftSale: ReceiptPrintSale = {
+      document_type: documentType,
+      receipt_no: receiptNo,
+      created_at: new Date().toISOString(),
+      subtotal: fromCents(totals.subtotalCents),
+      discount_total: fromCents(totals.discountTotalCents),
+      vat_total: fromCents(totals.vatTotalCents),
+      grand_total: fromCents(totals.grandTotalCents),
+      customer: {
+        title: selectedCustomer?.title ?? null,
+        code: selectedCustomer?.code ?? null,
+      },
+      items: visibleCartItems.map((item) => ({
+        sku: item.sku,
+        name: item.name,
+        qty: item.qty,
+        unit_price: fromCents(item.unit_price_cents),
+        line_total: fromCents(item.unit_price_cents * item.qty),
+      })),
+    };
 
-  const submitPointDeliveryDirectly = useCallback(() => {
+    openReceiptPrintWindow(draftSale, pointDisplayCurrencyLabel, selectedCustomer);
+  }, [canSubmitSale, documentType, pointDisplayCurrencyLabel, pointReceiptNoInput, selectedCustomer, totals.discountTotalCents, totals.grandTotalCents, totals.subtotalCents, totals.vatTotalCents, visibleCartItems]);
+
+  const submitPointSaleDirectly = useCallback(async () => {
     if (!canSubmitSale) {
       toast.error("Önce oturum, cari ve ürün satırlarını tamamlayın.");
       return;
     }
 
-    posForm.setValue("document_type", "delivery", {
-      shouldDirty: true,
-      shouldValidate: true,
-    });
     pointPrintAfterSaveRef.current = false;
     paymentForm.reset({
       cash_received: totals.grandTotalCents / 100,
       reference_note: "",
     });
 
-    void submitSale();
-  }, [canSubmitSale, paymentForm, posForm, submitSale, totals.grandTotalCents]);
+    await submitSale();
 
-  const openPointCartWhatsApp = useCallback(() => {
-    if (visibleCartItems.length === 0) {
-      pointProductCodeInputRef.current?.focus();
-      return;
+    if (typeof window !== "undefined" && window.location.pathname !== "/pos") {
+      window.history.replaceState(null, "", "/pos");
     }
-
-    const itemLines = visibleCartItems.map((item, index) => {
-      const lineTotal = displayPriceCents(item.unit_price_cents, item.vat_rate, pointPriceIncludesVat) * item.qty;
-      return `${index + 1}. ${item.sku} - ${item.name} | ${item.qty} adet | ${formatCurrency(fromCents(lineTotal))}`;
-    });
-    const customerLines = selectedCustomer
-      ? [`Cari: ${selectedCustomer.title}`, `Kod: ${selectedCustomer.code}`]
-      : ["Cari: -"];
-    const message = [
-      pointSaleContextLabel,
-      pointClockLabel,
-      ...customerLines,
-      "",
-      ...itemLines,
-      "",
-      `Toplam KDV Dahil: ${formatCurrency(fromCents(totals.grandTotalCents))}`,
-    ].join("\n");
-    const phone = normalizeWhatsAppPhoneForUrl(selectedCustomer?.phone);
-    const url = `https://wa.me/${phone ? phone : ""}?text=${encodeURIComponent(message)}`;
-    const popup = window.open(url, "_blank", "noopener,noreferrer");
-
-    if (!popup) {
-      toast.error("WhatsApp penceresi açılamadı. Tarayıcı popup iznini kontrol edin.");
-      return;
-    }
-
-    popup.opener = null;
-  }, [
-    pointClockLabel,
-    pointPriceIncludesVat,
-    pointSaleContextLabel,
-    selectedCustomer,
-    totals.grandTotalCents,
-    visibleCartItems,
-  ]);
+  }, [canSubmitSale, paymentForm, submitSale, totals.grandTotalCents]);
 
   const handleOpenSession = openSessionForm.handleSubmit(async (values) => {
     await openSessionMutation.mutateAsync(values);
@@ -2124,15 +2383,16 @@ export function PosPage() {
     try {
       const response = await searchPosProductsQuick({
         q: rawQuery,
+        dealer_id: effectivePosDealerId,
         in_stock: false,
-        limit: 10,
+        limit: 5,
+        code_only: true,
       });
 
-      const match =
-        response.data.find((product) => productMatchesPointStockCode(product, rawQuery)) ?? response.data[0] ?? null;
+      const match = response.data.find((product) => productMatchesPointStockCode(product, rawQuery)) ?? null;
 
       if (!match) {
-        toast.error("Ürün bulunamadı.");
+        toast.error("Yazılan stok koduyla tam eşleşen ürün bulunamadı.");
         return;
       }
 
@@ -2143,7 +2403,7 @@ export function PosPage() {
     } finally {
       setPointProductLookupPending(false);
     }
-  }, [pointProductCodeInput, pointProductLookupPending, selectPointDraftProduct]);
+  }, [effectivePosDealerId, pointProductCodeInput, pointProductLookupPending, selectPointDraftProduct]);
 
   const addPointDraftLine = useCallback(() => {
     if (!pointDraftProduct) {
@@ -2203,12 +2463,18 @@ export function PosPage() {
       unique.set(customer.id, customer);
     }
 
+    if (debouncedCustomerQuery.trim() === "") {
+      for (const customer of pointCustomers) {
+        unique.set(customer.id, customer);
+      }
+    }
+
     for (const customer of searchCustomers) {
       unique.set(customer.id, customer);
     }
 
     return Array.from(unique.values());
-  }, [customerDialogOpen, rememberedCustomers, searchCustomers]);
+  }, [customerDialogOpen, debouncedCustomerQuery, pointCustomers, rememberedCustomers, searchCustomers]);
 
   useEffect(() => {
     if (!customerDialogOpen || !customerSearchQuery.hasNextPage || customerSearchQuery.isFetchingNextPage) {
@@ -2771,8 +3037,10 @@ export function PosPage() {
                         <RefreshCcw className="h-6 w-6" /> Yenile
                       </Button>
                       {canAccessPosDayEnd ? (
-                        <Button variant="outline" className={posLargeButtonClassName} onClick={openDayEndPage}>
-                          <Printer className="h-6 w-6" /> Gün Sonu
+                        <Button asChild variant="outline" className={posLargeButtonClassName}>
+                          <Link href="/pos/day-end">
+                            <Printer className="h-6 w-6" /> Gün Sonu
+                          </Link>
                         </Button>
                       ) : null}
                       <Button
@@ -3636,7 +3904,7 @@ export function PosPage() {
                                   size="icon"
                                   variant="outline"
                                   title="Satır yazdır"
-                                  onClick={() => openLinePrintWindow(item)}
+                                  onClick={() => openLinePrintWindow(item, pointDisplayCurrencyLabel)}
                                 >
                                   <Printer className="h-3.5 w-3.5" />
                                 </Button>
@@ -3922,51 +4190,62 @@ export function PosPage() {
     <div className="space-y-3 xl:space-y-4">
 	            <div className="space-y-3 xl:space-y-4">
         <section className="point-panel rounded-[18px] border p-3 xl:p-4">
-          <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-center 2xl:grid-cols-[minmax(0,1fr)_430px]">
+          <div
+            className={cn(
+              "grid gap-3 xl:items-center",
+              isBatumPointFlowByUser
+                ? "xl:grid-cols-[minmax(0,1fr)_360px] 2xl:grid-cols-[minmax(0,1fr)_430px]"
+                : "xl:grid-cols-1"
+            )}
+          >
             <div className="min-w-0">
               <p className="text-[10px] font-black uppercase tracking-[0.18em] text-[var(--point-muted-strong)] xl:text-xs">
-                Batum POS
+                {isBatumPointFlowByUser ? "Batum POS" : "Erzurum Hızlı Satış"}
               </p>
               <h1 className="mt-1 truncate text-2xl font-black tracking-tight text-white xl:text-3xl 2xl:text-4xl">
-                {pointSaleContextLabel}
+                {isBatumPointFlowByUser ? pointSaleContextLabel : "ERZURUM HIZLI SATIŞ"}
               </h1>
               <p className="mt-1 text-xs font-bold text-[var(--point-muted-strong)] xl:text-sm">
-                Ürün aramada sadece Erz. Depo ve Batum stokları gösterilir. Fiyat alanı Batum satışında KDV dahil çalışır.
+                {isBatumPointFlowByUser
+                  ? "Ürün aramada sadece Erz. Depo ve Batum stokları gösterilir. Fiyat alanı Batum satışında KDV dahil çalışır."
+                  : "Cari seç, stok kodunu okut, sepete ekle. Kaydet satış irsaliyesi oluşturur; Yazdır fiş çıktısı alır."}
               </p>
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              {POINT_ANONYMOUS_SALE_TYPE_OPTIONS.map((option) => {
-                const isSelected = saleType === option.value;
+            {isBatumPointFlowByUser ? (
+              <div className="grid grid-cols-2 gap-2">
+                {POINT_ANONYMOUS_SALE_TYPE_OPTIONS.map((option) => {
+                  const isSelected = saleType === option.value;
 
-                return (
-                  <Button
-                    key={option.value}
-                    type="button"
-                    variant="outline"
-                    className={cn(
-                      "h-12 rounded-[14px] text-sm font-black xl:h-14 xl:text-base",
-                      isSelected
-                        ? "point-yellow-action-button"
-                        : "point-secondary-button text-[var(--point-muted-strong)]"
-                    )}
-                    onClick={() => {
-                      if (option.value !== saleType) {
-                        setPointCartPriceInputs({});
-                        setActivePointCartProductId(null);
-                      }
+                  return (
+                    <Button
+                      key={option.value}
+                      type="button"
+                      variant="outline"
+                      className={cn(
+                        "h-12 rounded-[14px] text-sm font-black xl:h-14 xl:text-base",
+                        isSelected
+                          ? "point-yellow-action-button"
+                          : "point-secondary-button text-[var(--point-muted-strong)]"
+                      )}
+                      onClick={() => {
+                        if (option.value !== saleType) {
+                          setPointCartPriceInputs({});
+                          setActivePointCartProductId(null);
+                        }
 
-                      posForm.setValue("sale_type", option.value, {
-                        shouldDirty: true,
-                        shouldValidate: true,
-                      });
-                    }}
-                  >
-                    {option.value === "cash" ? <Wallet className="h-4 w-4" /> : <CreditCard className="h-4 w-4" />}
-                    {option.label}
-                  </Button>
-                );
-              })}
-            </div>
+                        posForm.setValue("sale_type", option.value, {
+                          shouldDirty: true,
+                          shouldValidate: true,
+                        });
+                      }}
+                    >
+                      {option.value === "cash" ? <Wallet className="h-4 w-4" /> : <CreditCard className="h-4 w-4" />}
+                      {option.label}
+                    </Button>
+                  );
+                })}
+              </div>
+            ) : null}
           </div>
         </section>
         <section className="point-panel point-customer-panel rounded-[18px] border p-2">
@@ -4046,7 +4325,7 @@ export function PosPage() {
         </section>
 
         <section className="point-panel point-product-panel rounded-[18px] border p-3 xl:p-4">
-          <div className="point-product-entry-grid grid gap-3 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)_96px_118px] xl:items-end 2xl:grid-cols-[minmax(0,480px)_minmax(0,1fr)_128px_150px] 2xl:gap-4">
+          <div className="point-product-entry-grid grid gap-3 xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)_96px_118px_132px] xl:items-end 2xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)_128px_150px_160px] 2xl:gap-4">
             <label className="block">
               <span className="mb-1 flex h-4 items-center text-xs font-semibold text-[var(--point-muted-strong)] xl:mb-2 xl:h-5 xl:text-sm">Stok Kodu</span>
               <div className="grid h-12 grid-cols-[minmax(0,1fr)_46px] overflow-hidden rounded-[14px] border border-[var(--point-border)] bg-[var(--point-control)] xl:h-14 xl:grid-cols-[minmax(0,1fr)_52px] 2xl:h-16 2xl:grid-cols-[minmax(0,1fr)_58px]">
@@ -4060,6 +4339,14 @@ export function PosPage() {
                     }
 
                     event.preventDefault();
+
+                    if (
+                      pointDraftProduct &&
+                      productMatchesPointStockCode(pointDraftProduct, pointProductCodeInput)
+                    ) {
+                      addPointDraftLine();
+                      return;
+                    }
 
                     void lookupPointProduct();
                   }}
@@ -4193,6 +4480,16 @@ export function PosPage() {
                 />
               </div>
             </div>
+
+            <Button
+              type="button"
+              onClick={addPointDraftLine}
+              disabled={!pointDraftProduct}
+              className="point-yellow-action-button h-12 rounded-[14px] text-sm font-black disabled:border-[var(--point-border)] disabled:bg-[var(--point-control-strong)] disabled:text-[var(--point-muted)] disabled:shadow-none xl:h-14 xl:text-base 2xl:h-16 2xl:text-lg"
+            >
+              <Plus className="h-4 w-4 xl:h-5 xl:w-5" />
+              Sepete Ekle
+            </Button>
           </div>
         </section>
       </div>
@@ -4312,7 +4609,7 @@ export function PosPage() {
         </div>
       </section>
 
-      <footer className="point-panel point-sales-footer grid gap-2 rounded-[18px] border p-2 lg:grid-cols-4 xl:grid-cols-[78px_92px_112px_126px_104px_104px_118px_minmax(214px,1.4fr)] 2xl:grid-cols-[86px_104px_130px_142px_126px_126px_136px_minmax(248px,1.35fr)] 2xl:gap-3 2xl:rounded-[22px] 2xl:p-3">
+      <footer className="point-panel point-sales-footer grid gap-2 rounded-[18px] border p-2 sm:grid-cols-2 lg:grid-cols-[78px_92px_112px_126px_104px_104px] xl:grid-cols-[78px_92px_112px_126px_104px_104px_minmax(214px,1.4fr)] 2xl:grid-cols-[86px_104px_130px_142px_126px_126px_minmax(248px,1.35fr)] 2xl:gap-3 2xl:rounded-[22px] 2xl:p-3">
         <div className="grid h-full min-h-[58px] gap-1.5 xl:min-h-[64px] xl:gap-2 2xl:min-h-[78px]">
           {[
             { value: "delivery" as PosDocumentType, label: "İrsaliye" },
@@ -4332,7 +4629,6 @@ export function PosPage() {
                     : "point-secondary-button text-[var(--point-muted-strong)]"
                 )}
                 onClick={() => {
-                  setPointDocumentManualOverride(true);
                   posForm.setValue("document_type", option.value, {
                     shouldDirty: true,
                     shouldValidate: true,
@@ -4411,7 +4707,7 @@ export function PosPage() {
               pointProductCodeInputRef.current?.focus();
               return;
             }
-            submitSaleAndPrintDirectly();
+            printPointDraftDirectly();
           }}
           aria-disabled={createSaleMutation.isPending}
         >
@@ -4437,39 +4733,29 @@ export function PosPage() {
               pointProductCodeInputRef.current?.focus();
               return;
             }
-            submitPointDeliveryDirectly();
+            void submitPointSaleDirectly();
           }}
           disabled={createSaleMutation.isPending}
         >
           <Check className="h-4 w-4 xl:h-5 xl:w-5 2xl:h-6 2xl:w-6" />
           Kaydet
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          className="point-secondary-button h-full min-h-[58px] rounded-[14px] px-1.5 text-sm font-black xl:min-h-[64px] xl:px-2 xl:text-base 2xl:min-h-[72px] 2xl:text-lg"
-          onClick={openPointCartWhatsApp}
-          disabled={visibleCartItems.length === 0}
-        >
-          <MessageCircle className="h-4 w-4 text-[#72bf82] xl:h-5 xl:w-5 2xl:h-6 2xl:w-6" />
-          WhatsApp
-        </Button>
-        <div className="point-total-card grid min-h-[58px] min-w-0 gap-1 rounded-[14px] border px-2 py-1.5 xl:min-h-[64px] xl:gap-1.5 2xl:min-h-[72px] 2xl:rounded-[16px] 2xl:px-3 2xl:py-2">
+        <div className="point-total-card col-span-full grid min-h-[58px] min-w-0 gap-1 rounded-[14px] border px-2 py-1.5 xl:col-span-1 xl:min-h-[64px] xl:gap-1.5 2xl:min-h-[72px] 2xl:rounded-[16px] 2xl:px-3 2xl:py-2">
           <div className="grid min-w-0 grid-cols-[minmax(58px,0.75fr)_auto_minmax(86px,1fr)] items-center gap-1.5 rounded-[10px] bg-black/10 px-1.5 py-1 text-[11px] font-black xl:grid-cols-[minmax(64px,0.78fr)_auto_minmax(96px,1fr)] xl:text-xs 2xl:grid-cols-[minmax(72px,0.86fr)_auto_minmax(112px,1fr)] 2xl:gap-2 2xl:px-2 2xl:py-1.5 2xl:text-sm">
             <span className="text-[var(--point-muted-strong)]">KDV Hariç</span>
-            <span className="text-white">{POINT_DISPLAY_CURRENCY_LABEL}</span>
+            <span className="text-white">{pointDisplayCurrencyLabel}</span>
             <span className="truncate text-right text-white">
               {formatPointCurrencyNumber(fromCents(totals.subtotalCents - totals.discountTotalCents))}
             </span>
           </div>
           <div className="grid min-w-0 grid-cols-[minmax(58px,0.75fr)_auto_minmax(86px,1fr)] items-center gap-1.5 rounded-[10px] bg-black/10 px-1.5 py-1 text-[11px] font-black xl:grid-cols-[minmax(64px,0.78fr)_auto_minmax(96px,1fr)] xl:text-xs 2xl:grid-cols-[minmax(72px,0.86fr)_auto_minmax(112px,1fr)] 2xl:gap-2 2xl:px-2 2xl:py-1.5 2xl:text-sm">
             <span className="text-[var(--point-muted-strong)]">KDV</span>
-            <span className="text-[#faee56]">{POINT_DISPLAY_CURRENCY_LABEL}</span>
+            <span className="text-[#faee56]">{pointDisplayCurrencyLabel}</span>
             <span className="truncate text-right text-[#faee56]">{formatPointCurrencyNumber(fromCents(totals.vatTotalCents))}</span>
           </div>
           <div className="grid min-w-0 grid-cols-[minmax(58px,0.75fr)_auto_minmax(86px,1fr)] items-center gap-1.5 px-1.5 pt-0.5 xl:grid-cols-[minmax(64px,0.78fr)_auto_minmax(96px,1fr)] 2xl:grid-cols-[minmax(72px,0.86fr)_auto_minmax(112px,1fr)] 2xl:gap-2 2xl:px-2">
             <span className="text-[9px] font-black uppercase tracking-[0.12em] text-[#f4e84d] xl:text-[10px] 2xl:text-[11px]">KDV Dahil</span>
-            <span className="text-sm font-black text-white xl:text-base 2xl:text-lg">{POINT_DISPLAY_CURRENCY_LABEL}</span>
+            <span className="text-sm font-black text-white xl:text-base 2xl:text-lg">{pointDisplayCurrencyLabel}</span>
             <span className="truncate text-right text-xl font-black tracking-tight text-white xl:text-2xl 2xl:text-3xl">
               {formatPointCurrencyNumber(fromCents(totals.grandTotalCents))}
             </span>
@@ -4497,7 +4783,54 @@ export function PosPage() {
 
   return (
     <div className="space-y-4">
-      {pointQuickSalesShell(pointRetailContentV2)}
+      {pointQuickSalesShell(
+        pointRetailContentV2
+      )}
+
+      <Dialog open={pointSaveResult !== null} onOpenChange={(open) => !open && setPointSaveResult(null)}>
+        <DialogContent className="max-w-[min(480px,calc(100vw-32px))] rounded-[28px] border-[#2f7650] bg-[#071018] p-0 text-[#edf7ef] shadow-[0_34px_110px_-42px_rgba(0,0,0,0.95)]">
+          <div className="border-b border-[#244838] bg-[linear-gradient(135deg,rgba(47,118,80,0.38)_0%,rgba(250,238,86,0.08)_58%,rgba(7,16,24,1)_100%)] px-6 py-5">
+            <DialogHeader className="text-left">
+              <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-2xl border border-[#62d58c]/50 bg-[#143923] text-[#7cf6a3] shadow-[0_20px_44px_-28px_rgba(124,246,163,0.9)]">
+                <Check className="h-8 w-8" />
+              </div>
+              <DialogTitle className="text-3xl font-black tracking-tight text-white">Gönderildi</DialogTitle>
+              <DialogDescription className="text-base font-bold text-[#c2d3c6]">
+                Satış kaydedildi, ödeme kasaya işlendi.
+              </DialogDescription>
+            </DialogHeader>
+          </div>
+          <div className="grid gap-3 px-6 py-5 text-sm font-black">
+            <div className="flex items-center justify-between rounded-2xl border border-[#203a30] bg-black/18 px-4 py-3">
+              <span className="text-[#9eb1a3]">Fiş No</span>
+              <span className="text-right text-white">{pointSaveResult?.receipt_no ?? "-"}</span>
+            </div>
+            <div className="flex items-center justify-between rounded-2xl border border-[#203a30] bg-black/18 px-4 py-3">
+              <span className="text-[#9eb1a3]">Kasa</span>
+              <span className="text-right text-white">{pointSaveResult?.session.cashbox.name ?? pointSaveResult?.session.cashbox.code ?? "-"}</span>
+            </div>
+            <div className="flex items-center justify-between rounded-2xl border border-[#203a30] bg-black/18 px-4 py-3">
+              <span className="text-[#9eb1a3]">Tutar</span>
+              <span className="text-right text-[#faee56]">
+                {formatPointAmount(pointSaveResult?.grand_total ?? 0, pointDisplayCurrencyLabel)}
+              </span>
+            </div>
+            <div className="flex items-center justify-between rounded-2xl border border-[#203a30] bg-black/18 px-4 py-3">
+              <span className="text-[#9eb1a3]">Logo</span>
+              <span className="text-right text-white">{formatLogoOutboundStatus(pointSaveResult?.logo_sync_status)}</span>
+            </div>
+          </div>
+          <DialogFooter className="border-t border-[#203a30] px-6 py-4">
+            <Button
+              type="button"
+              className="h-12 w-full rounded-2xl bg-[#f0cd35] text-base font-black text-black hover:bg-[#ffe36b]"
+              onClick={() => setPointSaveResult(null)}
+            >
+              Tamam
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={posActionDialog !== null} onOpenChange={(open) => !open && setPosActionDialog(null)}>
         <DialogContent className="max-h-[calc(100vh-32px)] max-w-[min(1180px,calc(100vw-28px))] overflow-hidden rounded-[30px] p-0">
@@ -4539,8 +4872,10 @@ export function PosPage() {
                       <RefreshCcw className="h-6 w-6" /> Yenile
                     </Button>
                     {canAccessPosDayEnd ? (
-                      <Button variant="outline" className="h-20 rounded-[22px] text-lg font-black" onClick={openDayEndPage}>
-                        <Printer className="h-6 w-6" /> Gün Sonu
+                      <Button asChild variant="outline" className="h-20 rounded-[22px] text-lg font-black">
+                        <Link href="/pos/day-end">
+                          <Printer className="h-6 w-6" /> Gün Sonu
+                        </Link>
                       </Button>
                     ) : null}
                     <Button
@@ -4937,8 +5272,11 @@ export function PosPage() {
                             </div>
                           </div>
                           <div className="min-w-0 max-lg:order-first max-lg:col-span-2">
+                            <p className="mb-2 truncate text-base font-black text-[#faee56] lg:hidden">{product.sku}</p>
                             <p className="truncate text-base font-black text-white">{product.name}</p>
-                            <p className="mt-1 truncate text-xs font-bold text-[#8fa394]">{formatPointProductDisplayPrice(product, pointPriceIncludesVat)}</p>
+                            <p className="mt-1 truncate text-xs font-bold text-[#8fa394]">
+                              {formatPointProductDisplayPrice(product, pointPriceIncludesVat, pointDisplayCurrencyLabel)}
+                            </p>
                           </div>
                           {stockRows.map((row) => (
                             <div key={`${product.id}-${row.key}`} className="hidden text-right lg:block">

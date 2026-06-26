@@ -126,6 +126,7 @@ class LogoProductSyncApiTest extends TestCase
                             'raw' => [
                                 'LOGICALREF' => 2001,
                                 'CODE' => 'SKU-1001',
+                                'NAME4' => 'PWS-3A760',
                                 'IMAGE' => 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK1sAAAAASUVORK5CYII=',
                             ],
                         ],
@@ -225,6 +226,14 @@ class LogoProductSyncApiTest extends TestCase
             'source' => 'logo',
         ]);
 
+        $this->assertDatabaseHas('product_code_aliases', [
+            'product_id' => $existingProduct->id,
+            'code' => 'PWS-3A760',
+            'normalized_code' => 'PWS3A760',
+            'code_type' => 'other',
+            'source' => 'logo',
+        ]);
+
         $newProduct = Product::query()->where('sku', 'SKU-1002')->firstOrFail();
 
         $this->assertSame('Aciklama 2 Hava Filtresi', $newProduct->name);
@@ -314,6 +323,54 @@ class LogoProductSyncApiTest extends TestCase
         $this->assertDatabaseMissing('brands', [
             'name' => 'CITROEN',
         ]);
+    }
+
+    public function test_logo_product_sync_resolves_existing_product_from_integration_state_external_ref(): void
+    {
+        $product = Product::query()->create([
+            'sku' => 'OLD-CS0040',
+            'name' => 'Eski Logo Urunu',
+            'unit' => 'adet',
+            'vat_rate' => 20,
+            'is_active' => true,
+            'meta' => [],
+        ]);
+
+        DB::table('integration_sync_states')->insert([
+            'system' => 'logo',
+            'domain' => 'products',
+            'direction' => 'inbound',
+            'entity_type' => Product::class,
+            'entity_id' => $product->id,
+            'external_ref' => 'CS0040-REF',
+            'status' => 'synced',
+            'last_synced_at' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $response = $this
+            ->withHeader('X-Integration-Key', 'test-sync-key')
+            ->postJson('/api/integrations/logo/products/sync', [
+                'records' => [
+                    [
+                        'external_ref' => 'CS0040-REF',
+                        'sku' => 'NEW-CS0040',
+                        'name' => 'Guncel Logo Urunu',
+                    ],
+                ],
+            ]);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('summary.created', 0)
+            ->assertJsonPath('summary.updated', 1);
+
+        $product->refresh();
+
+        $this->assertSame('NEW-CS0040', $product->sku);
+        $this->assertSame('Guncel Logo Urunu', $product->name);
+        $this->assertSame(1, Product::query()->count());
     }
 
     public function test_logo_product_sync_accepts_negative_real_stock(): void
@@ -409,6 +466,66 @@ class LogoProductSyncApiTest extends TestCase
         ]);
     }
 
+    public function test_logo_product_sync_uses_warehouse_totals_when_logo_header_stock_is_zero(): void
+    {
+        $product = Product::query()->create([
+            'sku' => '0451103336',
+            'name' => 'CLIO 1.4',
+            'unit' => 'adet',
+            'vat_rate' => 20,
+            'is_active' => true,
+            'meta' => [
+                'integrations' => [
+                    'logo' => [
+                        'external_ref' => '4',
+                    ],
+                ],
+            ],
+        ]);
+
+        $response = $this
+            ->withHeader('X-Integration-Key', 'test-sync-key')
+            ->postJson('/api/integrations/logo/products/sync', [
+                'records' => [
+                    [
+                        'external_ref' => '4',
+                        'sku' => '0451103336',
+                        'name' => 'CLIO 1.4',
+                        'available_total' => 0,
+                        'reserved_total' => 0,
+                        'meta' => [
+                            'logo_stock' => [
+                                'available_total' => 0,
+                                'reserved_total' => 0,
+                                'warehouses' => [
+                                    [
+                                        'warehouse_code' => '1',
+                                        'onhand_total' => 7,
+                                        'reserved_total' => 1,
+                                    ],
+                                    [
+                                        'warehouse_code' => '2',
+                                        'available_total' => 3,
+                                        'reserved_total' => 2,
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ]);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('summary.stock_synced', 1);
+
+        $this->assertDatabaseHas('stock_summary', [
+            'product_id' => $product->id,
+            'available_total' => 10,
+            'reserved_total' => 3,
+        ]);
+    }
+
     public function test_logo_product_sync_stock_only_updates_only_stock_payload(): void
     {
         $product = Product::query()->create([
@@ -424,6 +541,24 @@ class LogoProductSyncApiTest extends TestCase
                         'payload' => [
                             'logo_name2' => 'PICK-UP D22 2.5DI 2002>',
                             'specode5' => 'WUNDER',
+                            'logo_stock' => [
+                                'warehouses' => [
+                                    [
+                                        'invenno' => 0,
+                                        'warehouse_code' => '0',
+                                        'available_total' => 6,
+                                        'shelf_key' => '25',
+                                        'shelf_address' => 'RAF-25-A1',
+                                    ],
+                                    [
+                                        'invenno' => 1,
+                                        'warehouse_code' => '1',
+                                        'available_total' => 61,
+                                        'shelf_key' => '61',
+                                        'shelf_address' => 'RAF-61-B4',
+                                    ],
+                                ],
+                            ],
                         ],
                     ],
                 ],
@@ -464,6 +599,7 @@ class LogoProductSyncApiTest extends TestCase
                                         'warehouse_code' => '1',
                                         'warehouse_name' => 'ERZURUM DEP',
                                         'available_total' => 42,
+                                        'shelf_address' => null,
                                     ],
                                 ],
                             ],
@@ -489,11 +625,103 @@ class LogoProductSyncApiTest extends TestCase
             42,
             $product->meta['integrations']['logo']['payload']['logo_stock']['warehouses'][1]['available_total']
         );
+        $this->assertSame(
+            'RAF-25-A1',
+            $product->meta['integrations']['logo']['payload']['logo_stock']['warehouses'][0]['shelf_address']
+        );
+        $this->assertSame(
+            '25',
+            $product->meta['integrations']['logo']['payload']['logo_stock']['warehouses'][0]['shelf_key']
+        );
+        $this->assertSame(
+            'RAF-61-B4',
+            $product->meta['integrations']['logo']['payload']['logo_stock']['warehouses'][1]['shelf_address']
+        );
+        $this->assertSame(
+            '61',
+            $product->meta['integrations']['logo']['payload']['logo_stock']['warehouses'][1]['shelf_key']
+        );
 
         $this->assertDatabaseHas('stock_summary', [
             'product_id' => $product->id,
             'available_total' => 58,
             'reserved_total' => 1,
         ]);
+    }
+
+    public function test_logo_product_sync_stock_only_preserves_existing_warehouse_payload_when_incoming_has_no_breakdown(): void
+    {
+        $product = Product::query()->create([
+            'sku' => 'CS 0040',
+            'name' => 'CLIO 1.4 - 1.5DCI - 1.6 1998>',
+            'unit' => 'adet',
+            'vat_rate' => 20,
+            'is_active' => true,
+            'meta' => [
+                'integrations' => [
+                    'logo' => [
+                        'external_ref' => '1609',
+                        'payload' => [
+                            'logo_stock' => [
+                                'warehouses' => [
+                                    [
+                                        'invenno' => 0,
+                                        'warehouse_code' => '0',
+                                        'warehouse_name' => 'ERZURUM POINT',
+                                        'available_total' => 4,
+                                        'shelf_key' => '25',
+                                        'shelf_address' => 'RAF-25-A1',
+                                    ],
+                                    [
+                                        'invenno' => 1,
+                                        'warehouse_code' => '1',
+                                        'warehouse_name' => 'ERZURUM DEPO',
+                                        'available_total' => 12,
+                                        'shelf_key' => '61',
+                                        'shelf_address' => 'RAF-61-B4',
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $response = $this
+            ->withHeader('X-Integration-Key', 'test-sync-key')
+            ->postJson('/api/integrations/logo/products/sync', [
+                'mode' => 'stock_only',
+                'records' => [
+                    [
+                        'external_ref' => '1609',
+                        'sku' => 'CS 0040',
+                        'available_total' => 58,
+                        'reserved_total' => 1,
+                        'meta' => [
+                            'logo_stock' => [
+                                'available_total' => 58,
+                                'reserved_total' => 1,
+                                'warehouses' => [],
+                            ],
+                        ],
+                    ],
+                ],
+            ]);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('summary.updated', 1)
+            ->assertJsonPath('summary.stock_synced', 1);
+
+        $product->refresh();
+
+        $logoStock = $product->meta['integrations']['logo']['payload']['logo_stock'];
+
+        $this->assertSame(58, $logoStock['available_total']);
+        $this->assertSame(1, $logoStock['reserved_total']);
+        $this->assertCount(2, $logoStock['warehouses']);
+        $this->assertSame('RAF-25-A1', $logoStock['warehouses'][0]['shelf_address']);
+        $this->assertSame('RAF-61-B4', $logoStock['warehouses'][1]['shelf_address']);
     }
 }

@@ -356,6 +356,12 @@ export type ModeratorOverviewResponse = {
   customers: ModeratorCustomerRecord[];
 };
 
+export type ModeratorOverviewParams = {
+  include_customers?: boolean;
+  customer_limit?: number;
+  customer_q?: string;
+};
+
 export type CustomerUserRecord = {
   id: number;
   code: string;
@@ -400,6 +406,7 @@ export type CursorResponse<T> = {
   total_count?: number;
   current_page?: number;
   total_pages?: number;
+  search_backend?: string;
 };
 
 export type ProductPreviousPurchase = {
@@ -425,6 +432,7 @@ export type ProductSearchItem = {
   description?: string | null;
   image_url?: string | null;
   image_data_url?: string | null;
+  logo_synced_at?: string | null;
   brand: {
     id: number | null;
     name: string | null;
@@ -527,6 +535,7 @@ export type ProductFilterOptionsResponse = {
 
 export type CustomerListItem = {
   id: number;
+  dealer_id: number | null;
   code: string;
   title: string;
   city: string | null;
@@ -590,6 +599,17 @@ export type CartResponse = {
   } | null;
   items: CartItemDto[];
   warehouse_options?: CartWarehouseOption[];
+  logo_integration?: {
+    customer_ready: boolean;
+    customer_source_system: string | null;
+    customer_external_ref: string | null;
+    customer_last_synced_at: string | null;
+    items_total: number;
+    items_ready: number;
+    items_missing: number;
+    latest_product_synced_at: string | null;
+    order_will_queue: boolean;
+  };
   totals: {
     total: string;
     discount_total: string;
@@ -658,6 +678,7 @@ export type OrderCreateResponse = {
       currency: string;
       logo_stock?: {
         available_total: number;
+        erzurum_depo_available_total?: number | null;
         reserved_total: number;
         updated_at: string | null;
       };
@@ -749,8 +770,11 @@ export type OrderDetailResponse = {
       tax_rate: string;
       line_total: string;
       currency: string;
+      barcode?: string | null;
+      shelf_address?: string | null;
       logo_stock?: {
         available_total: number;
+        erzurum_depo_available_total?: number | null;
         reserved_total: number;
         updated_at: string | null;
       };
@@ -1008,6 +1032,14 @@ export type CustomerCardSalesperson = {
   };
 };
 
+export type CreatedCustomerCardCustomer = {
+  id: number;
+  code: string;
+  name: string;
+  sync_status: string | null;
+  logo_queue_status: string | null;
+};
+
 export type CustomerCardRequestListResponse = CursorResponse<CustomerCardRequestListItem> & {
   summary?: {
     total_count: number;
@@ -1028,6 +1060,9 @@ export type CollectionMethodFilter = "cash" | "transfer" | "check" | "note" | "c
 
 export type LedgerEntryDto = {
   id: number;
+  source_system?: string | null;
+  source_reference?: string | null;
+  last_synced_at?: string | null;
   date: string;
   type: LedgerEntryType;
   debit: string;
@@ -1109,6 +1144,14 @@ export type CustomerCollectionsResponse = {
     count: number;
     total_amount: string;
   }>;
+  logo_sync?: {
+    draft: number;
+    pending: number;
+    reviewing: number;
+    synced: number;
+    failed: number;
+    latest_synced_at: string | null;
+  };
   data: CollectionRecord[];
   meta: {
     current_page: number;
@@ -1163,6 +1206,11 @@ export type PosSessionDto = {
   opened_by: {
     id: number | null;
     name: string | null;
+    dealer_id?: number | null;
+    branch_code?: string | null;
+    branch_name?: string | null;
+    region_code?: string | null;
+    region_name?: string | null;
   };
   created_at: string;
   updated_at: string;
@@ -1545,6 +1593,8 @@ export type WarehouseShipmentState = {
       id: number | null;
       order_no: string | null;
       status: string | null;
+      currency?: string | null;
+      grand_total?: string | number | null;
       customer: {
         id: number | null;
         code: string | null;
@@ -1583,6 +1633,31 @@ export type WarehouseShipmentState = {
   }>;
   message?: string;
   gonderilen_tutar?: string;
+};
+
+export type PurchaseReceiptItemPayload = {
+  product_code?: string | null;
+  product_name: string;
+  expected_quantity: number;
+  accepted_quantity: number;
+  note?: string | null;
+};
+
+export type PurchaseReceiptRecord = {
+  id: number;
+  receipt_no: string;
+  document_no: string | null;
+  supplier_name: string | null;
+  warehouse_code: string | null;
+  warehouse_name: string | null;
+  received_at: string | null;
+  note: string | null;
+  status: string;
+  logo_sync_status?: string | null;
+  logo_sync_error?: string | null;
+  logo_external_ref?: string | null;
+  logo_last_synced_at?: string | null;
+  items: Array<PurchaseReceiptItemPayload & { id: number }>;
 };
 
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -1892,6 +1967,7 @@ export async function listPosCustomers(params?: {
   cursor?: string;
   limit?: number;
   source_system?: "logo" | "b2b";
+  specode4?: string;
 }) {
   return apiFetch<CursorResponse<CustomerListItem>>(
     `/api/pos/customers${toSearch({ source_system: "logo", ...(params ?? {}) })}`
@@ -1925,6 +2001,7 @@ export async function searchPosProductsQuick(params: {
   limit?: number;
   dealer_id?: number;
   in_stock?: boolean;
+  code_only?: boolean;
 }) {
   return apiFetch<{
     data: ProductSearchItem[];
@@ -2099,14 +2176,14 @@ export async function createCustomerCardRequest(payload: {
   address?: string;
   note?: string;
 }) {
-  return apiFetch<{ data: CustomerCardRequestListItem; customer: { id: number; code: string; name: string } | null }>("/api/customer-card-requests", {
+  return apiFetch<{ data: CustomerCardRequestListItem; customer: CreatedCustomerCardCustomer | null }>("/api/customer-card-requests", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function convertCustomerCardRequestToCustomer(customerCardRequestId: number) {
-  return apiFetch<{ data: CustomerCardRequestListItem; customer: { id: number; code: string; name: string } }>(
+  return apiFetch<{ data: CustomerCardRequestListItem; customer: CreatedCustomerCardCustomer }>(
     `/api/customer-card-requests/${customerCardRequestId}/convert`,
     {
       method: "POST",
@@ -2158,8 +2235,8 @@ export async function getAdminDashboardOverview() {
   return apiFetch<AdminDashboardOverview>("/api/admin/dashboard/overview");
 }
 
-export async function getModeratorOverview() {
-  return apiFetch<ModeratorOverviewResponse>("/api/moderator/overview");
+export async function getModeratorOverview(params?: ModeratorOverviewParams) {
+  return apiFetch<ModeratorOverviewResponse>(`/api/moderator/overview${toSearch(params ?? {})}`);
 }
 
 export async function listCustomerUsers(params?: { q?: string; limit?: number }) {
@@ -2411,6 +2488,7 @@ export async function sendCustomerCollections(customerId: number, collectionIds:
 
 export async function getReportCustomerBalances(params?: {
   dealer_id?: number;
+  customer_id?: number;
   q?: string;
   date_to?: string;
   has_balance?: boolean;
@@ -2456,6 +2534,7 @@ export async function getReportCollections(params?: {
 
 export async function getReportSales(params?: {
   dealer_id?: number;
+  customer_id?: number;
   date_from?: string;
   date_to?: string;
   breakdown?: "product" | "brand" | "customer";
@@ -2508,6 +2587,12 @@ export async function getReportRun(runId: number) {
 
 export async function getCurrentPosSession(params?: { cashbox_id?: number }) {
   return apiFetch<{ data: PosSessionDto | null }>(`/api/pos/sessions/current${toSearch(params ?? {})}`);
+}
+
+export async function getCurrentPosSessions(params?: { cashbox_id?: number }) {
+  return apiFetch<{ data: PosSessionDto[] }>(
+    `/api/pos/sessions/current${toSearch({ ...(params ?? {}), all: true })}`
+  );
 }
 
 export async function openPosSession(payload: { cashbox_id?: number; opening_cash: number }) {
@@ -2619,6 +2704,7 @@ export async function deletePosSale(posSaleId: number) {
 }
 
 export async function listPosSales(params?: {
+  q?: string;
   pos_session_id?: number;
   cashbox_id?: number;
   status?: PosSaleStatus;
@@ -2678,6 +2764,22 @@ export async function createWarehouseShipment(payload: {
   });
 }
 
+export async function createPurchaseReceipt(payload: {
+  dealer_id?: number | null;
+  document_no?: string | null;
+  supplier_name?: string | null;
+  warehouse_code?: string | null;
+  warehouse_name?: string | null;
+  received_at: string;
+  note?: string | null;
+  items: PurchaseReceiptItemPayload[];
+}) {
+  return apiFetch<{ data: PurchaseReceiptRecord; message?: string }>("/api/purchase-receipts", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function getWarehouseShipment(shipmentId: number | string) {
   return apiFetch<{ data: WarehouseShipmentState }>(`/api/warehouse/shipments/${shipmentId}`);
 }
@@ -2703,6 +2805,44 @@ export async function returnWarehouseShipmentItem(
     `/api/warehouse/shipments/${shipmentId}/return-item`,
     {
       method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export async function returnAllWarehouseShipmentItems(shipmentId: number | string) {
+  return apiFetch<{ data: WarehouseShipmentState }>(`/api/warehouse/shipments/${shipmentId}/return-all`, {
+    method: "POST",
+  });
+}
+
+export async function addWarehouseShipmentItem(
+  shipmentId: number | string,
+  payload: {
+    product_id: number;
+    quantity: number;
+    unit_net_price?: number | string | null;
+    tax_rate?: number | string | null;
+  }
+) {
+  return apiFetch<{ data: WarehouseShipmentState }>(
+    `/api/warehouse/shipments/${shipmentId}/add-item`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export async function updateWarehouseShipmentItemQuantity(
+  shipmentId: number | string,
+  itemId: number,
+  payload: { quantity: number }
+) {
+  return apiFetch<{ data: WarehouseShipmentState }>(
+    `/api/warehouse/shipments/${shipmentId}/items/${itemId}/quantity`,
+    {
+      method: "PATCH",
       body: JSON.stringify(payload),
     }
   );

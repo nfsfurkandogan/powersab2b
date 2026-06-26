@@ -212,7 +212,7 @@ export default function LoginPageClient() {
       const user = await login(values);
       const next = nextOverride ?? readNextParam();
 
-      const roleSlugs = user.roles.map((role) => role.slug);
+      const roleSlugs = Array.isArray(user.roles) ? user.roles.map((role) => role.slug) : [];
       const target = resolvePostLoginPath({
         roleSlugs,
         menuPermissions: user.menu_permissions ?? [],
@@ -267,6 +267,7 @@ export default function LoginPageClient() {
                     alt="Güçsa Powersa Filter Logo"
                     width={910}
                     height={883}
+                    sizes="304px"
                     className="mx-auto h-auto w-full max-w-[19rem] object-contain [filter:drop-shadow(0_24px_22px_rgba(0,0,0,0.42))]"
                     priority
                   />

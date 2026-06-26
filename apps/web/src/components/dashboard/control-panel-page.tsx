@@ -11,18 +11,13 @@ import {
   BarChart3,
   Box,
   Building2,
-  CalendarRange,
   CheckCircle2,
-  ClipboardList,
   CreditCard,
   FileText,
   HandCoins,
   Loader2,
-  PackageCheck,
-  RefreshCcw,
   ShieldCheck,
   ShoppingCart,
-  SlidersHorizontal,
   TrendingUp,
   Truck,
   UserRound,
@@ -57,6 +52,49 @@ type SupplierDebtRow = {
   debt: number;
   balance: number;
   lastSyncedAt: string | null;
+};
+
+type DailyTrendPoint = {
+  label: string;
+  value: number;
+};
+
+type RecentTransactionRow = {
+  id: string;
+  date: string | null;
+  type: string;
+  related: string;
+  amount: number;
+  tone: string;
+};
+
+type SyncStateRow = {
+  domain: string;
+  direction: string;
+  records: number;
+  syncedRecords: number;
+  failedRecords: number;
+  pendingRecords: number;
+  latestStatus: string | null;
+  lastSyncedAt: string | null;
+  lastActivityAt: string | null;
+  lastError: string | null;
+  lastErrorAt: string | null;
+  statusCounts: Record<string, number>;
+};
+
+type SyncGapRow = {
+  key: string;
+  title: string;
+  flow: string;
+  status: string;
+  expectedCount: number;
+  syncedCount: number;
+  missingCount: number;
+  staleCount: number;
+  lastSyncedAt: string | null;
+  lastActivityAt: string | null;
+  detail: string;
 };
 
 const ADMIN_BANNER_IMAGES = [
@@ -257,6 +295,311 @@ function formatMoneyCompact(value: number): string {
   return `${value.toLocaleString("tr-TR", { maximumFractionDigits: 0 })} ₺`;
 }
 
+function formatShortDate(value: string | null): string {
+  if (!value) {
+    return "-";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("tr-TR", {
+    day: "2-digit",
+    month: "short",
+  }).format(date);
+}
+
+function formatDateTimeShort(value: string | null): string {
+  if (!value) {
+    return "Logo sync bekleniyor";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Logo sync tarihi okunamadı";
+  }
+
+  return new Intl.DateTimeFormat("tr-TR", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function getDailyTrendRows(payload: ReportPayload, key: string, countKey: string): DailyTrendPoint[] {
+  return getDataArray(payload, key)
+    .map((row) => {
+      const date = typeof row.date === "string" ? row.date : null;
+      const value = toNumber(row.total) ?? 0;
+      const count = Math.max(0, Math.round(toNumber(row[countKey]) ?? 0));
+
+      if (!date || value <= 0) {
+        return null;
+      }
+
+      return {
+        label: `${formatShortDate(date)} · ${formatCount(count)} kayıt`,
+        value,
+      };
+    })
+    .filter((entry): entry is DailyTrendPoint => entry !== null)
+    .slice(-5);
+}
+
+function formatMovementType(type: string | null, direction: string | null): string {
+  if (direction === "credit") {
+    return "Tahsilat";
+  }
+
+  if (direction === "debit") {
+    return "Satış";
+  }
+
+  const map: Record<string, string> = {
+    payment: "Tahsilat",
+    credit: "Tahsilat",
+    invoice: "Satış",
+    debit: "Borç",
+    refund: "İade",
+  };
+
+  return type ? (map[type] ?? titleCase(type)) : "Hareket";
+}
+
+function getRecentTransactionRows(payload: ReportPayload): RecentTransactionRow[] {
+  return getDataArray(payload, "recent_movements")
+    .map((row, index) => {
+      const customer = isRecord(row.customer) ? row.customer : null;
+      const related =
+        (typeof customer?.title === "string" && customer.title.trim().length > 0 ? customer.title : null) ??
+        (typeof row.description === "string" && row.description.trim().length > 0 ? row.description : null) ??
+        (typeof row.reference_no === "string" && row.reference_no.trim().length > 0 ? row.reference_no : null) ??
+        "Logo hareketi";
+      const direction = typeof row.direction === "string" ? row.direction : null;
+      const type = formatMovementType(typeof row.type === "string" ? row.type : null, direction);
+      const amount = Math.abs(toNumber(row.amount) ?? 0);
+
+      if (amount <= 0) {
+        return null;
+      }
+
+      return {
+        id: `${row.id ?? index}-${type}-${related}`,
+        date: typeof row.date === "string" ? row.date : null,
+        type,
+        related,
+        amount,
+        tone: direction === "credit" ? "bg-emerald-400" : direction === "debit" ? "bg-sky-400" : "bg-violet-400",
+      };
+    })
+    .filter((entry): entry is RecentTransactionRow => entry !== null)
+    .slice(0, 6);
+}
+
+function getSyncRows(payload: ReportPayload): SyncStateRow[] {
+  return getDataArray(payload, "sync")
+    .map((row) => {
+      const domain = typeof row.domain === "string" ? row.domain : null;
+      const direction = typeof row.direction === "string" ? row.direction : null;
+
+      if (!domain || !direction) {
+        return null;
+      }
+
+      return {
+        domain,
+        direction,
+        records: Math.max(0, Math.round(toNumber(row.records) ?? 0)),
+        syncedRecords: Math.max(0, Math.round(toNumber(row.synced_records) ?? 0)),
+        failedRecords: Math.max(0, Math.round(toNumber(row.failed_records) ?? 0)),
+        pendingRecords: Math.max(0, Math.round(toNumber(row.pending_records) ?? 0)),
+        latestStatus: typeof row.latest_status === "string" ? row.latest_status : null,
+        lastSyncedAt: typeof row.last_synced_at === "string" ? row.last_synced_at : null,
+        lastActivityAt: typeof row.last_activity_at === "string" ? row.last_activity_at : null,
+        lastError: typeof row.last_error === "string" && row.last_error.trim().length > 0 ? row.last_error : null,
+        lastErrorAt: typeof row.last_error_at === "string" ? row.last_error_at : null,
+        statusCounts: isRecord(row.status_counts)
+          ? Object.fromEntries(
+              Object.entries(row.status_counts)
+                .map<[string, number]>(([key, value]) => [key, Math.max(0, Math.round(toNumber(value) ?? 0))])
+                .filter(([, value]) => value > 0)
+            )
+          : {},
+      };
+    })
+    .filter((entry): entry is SyncStateRow => entry !== null)
+    .sort((a, b) => {
+      const aTime = new Date(a.lastActivityAt ?? a.lastSyncedAt ?? 0).getTime();
+      const bTime = new Date(b.lastActivityAt ?? b.lastSyncedAt ?? 0).getTime();
+
+      return bTime - aTime;
+    });
+}
+
+function getSyncGapRows(payload: ReportPayload): SyncGapRow[] {
+  return getDataArray(payload, "sync_gaps")
+    .map((row) => {
+      const key = typeof row.key === "string" ? row.key : null;
+      const title = typeof row.title === "string" ? row.title : null;
+      const flow = typeof row.flow === "string" ? row.flow : null;
+
+      if (!key || !title || !flow) {
+        return null;
+      }
+
+      return {
+        key,
+        title,
+        flow,
+        status: typeof row.status === "string" ? row.status : "unknown",
+        expectedCount: Math.max(0, Math.round(toNumber(row.expected_count) ?? 0)),
+        syncedCount: Math.max(0, Math.round(toNumber(row.synced_count) ?? 0)),
+        missingCount: Math.max(0, Math.round(toNumber(row.missing_count) ?? 0)),
+        staleCount: Math.max(0, Math.round(toNumber(row.stale_count) ?? 0)),
+        lastSyncedAt: typeof row.last_synced_at === "string" ? row.last_synced_at : null,
+        lastActivityAt: typeof row.last_activity_at === "string" ? row.last_activity_at : null,
+        detail: typeof row.detail === "string" && row.detail.trim().length > 0 ? row.detail : "Detay bekleniyor.",
+      };
+    })
+    .filter((entry): entry is SyncGapRow => entry !== null)
+    .sort((a, b) => {
+      const severityDiff = syncGapSeverityRank(a.status) - syncGapSeverityRank(b.status);
+
+      if (severityDiff !== 0) {
+        return severityDiff;
+      }
+
+      return (b.missingCount + b.staleCount) - (a.missingCount + a.staleCount);
+    });
+}
+
+function formatSyncDomainLabel(row: SyncStateRow): string {
+  const domains: Record<string, string> = {
+    customers: "Cari",
+    ledger: "Cari Hareket",
+    collections: "Tahsilat",
+    "pos-sales": "POS Satış",
+    "pos-expenses": "POS Masraf",
+    orders: "Sipariş",
+    products: "Ürün",
+    "product-stocks": "Stok",
+    documents: "Belge",
+  };
+
+  const direction = row.direction === "outbound" ? "yazma" : "okuma";
+
+  return `${domains[row.domain] ?? titleCase(row.domain)} ${direction}`;
+}
+
+function formatSyncDirectionLabel(direction: string): string {
+  if (direction === "outbound") {
+    return "B2B -> Logo";
+  }
+
+  if (direction === "inbound") {
+    return "Logo -> B2B";
+  }
+
+  return titleCase(direction);
+}
+
+function formatSyncStatusLabel(status: string | null): string {
+  const map: Record<string, string> = {
+    synced: "Başarılı",
+    failed: "Hatalı",
+    error: "Hatalı",
+    pending: "Bekliyor",
+    queued: "Kuyrukta",
+    processing: "İşleniyor",
+    unknown: "Bilinmiyor",
+  };
+
+  return status ? map[status] ?? titleCase(status) : "Bilinmiyor";
+}
+
+function syncStatusClassName(status: string | null): string {
+  if (status === "failed" || status === "error") {
+    return "border-red-400/40 bg-red-400/12 text-red-100";
+  }
+
+  if (status === "pending" || status === "queued" || status === "processing") {
+    return "border-amber-300/40 bg-amber-300/12 text-amber-100";
+  }
+
+  if (status === "synced") {
+    return "border-emerald-300/40 bg-emerald-300/12 text-emerald-100";
+  }
+
+  return "border-slate-500/40 bg-slate-500/12 text-slate-200";
+}
+
+function formatSyncStatusCounts(row: SyncStateRow): string {
+  const parts = [
+    row.syncedRecords > 0 ? `${formatCount(row.syncedRecords)} başarılı` : null,
+    row.pendingRecords > 0 ? `${formatCount(row.pendingRecords)} bekliyor` : null,
+    row.failedRecords > 0 ? `${formatCount(row.failedRecords)} hatalı` : null,
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" · ") : `${formatCount(row.records)} kayıt`;
+}
+
+function syncGapSeverityRank(status: string): number {
+  if (status === "critical") {
+    return 0;
+  }
+
+  if (status === "warning") {
+    return 1;
+  }
+
+  if (status === "ok") {
+    return 2;
+  }
+
+  return 3;
+}
+
+function formatSyncGapStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    critical: "Acil",
+    warning: "Eksik var",
+    ok: "Tamam",
+    unknown: "Bilinmiyor",
+  };
+
+  return labels[status] ?? titleCase(status);
+}
+
+function syncGapStatusClassName(status: string): string {
+  if (status === "critical") {
+    return "border-red-400/45 bg-red-400/14 text-red-100";
+  }
+
+  if (status === "warning") {
+    return "border-amber-300/45 bg-amber-300/14 text-amber-100";
+  }
+
+  if (status === "ok") {
+    return "border-emerald-300/40 bg-emerald-300/12 text-emerald-100";
+  }
+
+  return "border-slate-500/40 bg-slate-500/12 text-slate-200";
+}
+
+function formatSyncGapIssue(row: SyncGapRow): string {
+  const parts = [
+    row.missingCount > 0 ? `${formatCount(row.missingCount)} eksik` : null,
+    row.staleCount > 0 ? `${formatCount(row.staleCount)} eski` : null,
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" · ") : "Eksik yok";
+}
+
 function AdminBrandBanner() {
   return (
     <section className="admin-brand-banner">
@@ -280,6 +623,156 @@ function AdminBrandBanner() {
         ))}
       </div>
     </section>
+  );
+}
+
+function LogoBridgeDetails({ rows, gaps, loading }: { rows: SyncStateRow[]; gaps: SyncGapRow[]; loading: boolean }) {
+  const latestActivity = rows[0]?.lastActivityAt ?? rows[0]?.lastSyncedAt ?? null;
+  const gapIssueCount = gaps.filter((row) => row.status !== "ok").length;
+
+  return (
+    <Card className="admin-report-card border-emerald-400/25 bg-[linear-gradient(180deg,rgba(9,30,33,0.98)_0%,rgba(7,17,27,0.98)_100%)] text-slate-100">
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <span>
+            <CardTitle className="flex items-center gap-2 text-xl font-black">
+              <ShieldCheck className="h-5 w-5 text-emerald-300" />
+              Logo Köprü Detayı
+            </CardTitle>
+            <p className="mt-1 text-sm font-semibold text-slate-400">
+              Logo okuma ve yazma hareketlerinin son durumu
+            </p>
+          </span>
+          <span className="rounded-full border border-emerald-300/30 bg-emerald-300/10 px-3 py-1.5 text-xs font-black text-emerald-100">
+            Son hareket: {formatDateTimeShort(latestActivity)}
+          </span>
+          <span className={`rounded-full border px-3 py-1.5 text-xs font-black ${gapIssueCount > 0 ? "border-amber-300/40 bg-amber-300/12 text-amber-100" : "border-emerald-300/30 bg-emerald-300/10 text-emerald-100"}`}>
+            Eksik takip: {formatCount(gapIssueCount)}
+          </span>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4 pt-0">
+        {loading && rows.length === 0 ? (
+          <div className="flex min-h-[120px] items-center justify-center gap-2 rounded-[14px] border border-slate-700/75 bg-slate-950/30 text-sm font-black text-slate-300">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Logo köprü durumu yükleniyor
+          </div>
+        ) : rows.length > 0 ? (
+          <div className="overflow-x-auto rounded-[14px] border border-slate-700/80">
+            <table className="min-w-[940px] w-full border-collapse text-left">
+              <thead className="bg-white/[0.055] text-[0.68rem] font-black uppercase tracking-[0.1em] text-slate-400">
+                <tr>
+                  <th className="px-4 py-3">İşlem</th>
+                  <th className="px-4 py-3">Akış</th>
+                  <th className="px-4 py-3">Durum</th>
+                  <th className="px-4 py-3 text-right">Kayıt</th>
+                  <th className="px-4 py-3">Son İşlem</th>
+                  <th className="px-4 py-3">Son Başarılı Sync</th>
+                  <th className="px-4 py-3">Hata</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-700/70">
+                {rows.map((row) => (
+                  <tr key={`${row.domain}-${row.direction}`} className="bg-slate-950/18 text-sm font-semibold text-slate-200">
+                    <td className="px-4 py-3">
+                      <span className="block font-black text-white">{formatSyncDomainLabel(row)}</span>
+                      <span className="mt-1 block text-xs text-slate-500">{row.domain}</span>
+                    </td>
+                    <td className="px-4 py-3 text-slate-300">{formatSyncDirectionLabel(row.direction)}</td>
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-black ${syncStatusClassName(row.latestStatus)}`}>
+                        {row.latestStatus === "synced" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
+                        {formatSyncStatusLabel(row.latestStatus)}
+                      </span>
+                      <span className="mt-1 block text-xs text-slate-500">{formatSyncStatusCounts(row)}</span>
+                    </td>
+                    <td className="px-4 py-3 text-right font-black text-slate-100">{formatCount(row.records)}</td>
+                    <td className="px-4 py-3 text-slate-300">{formatDateTimeShort(row.lastActivityAt)}</td>
+                    <td className="px-4 py-3 text-slate-300">{formatDateTimeShort(row.lastSyncedAt)}</td>
+                    <td className="max-w-[260px] px-4 py-3">
+                      {row.lastError ? (
+                        <span className="block text-red-100">
+                          <span className="block truncate font-black">{row.lastError}</span>
+                          <span className="mt-1 block text-xs text-red-200/70">{formatDateTimeShort(row.lastErrorAt)}</span>
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">Hata yok</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="rounded-[14px] border border-slate-700/75 bg-slate-950/30 px-4 py-8 text-center text-sm font-semibold text-slate-400">
+            Logo okuma/yazma durumu bekleniyor.
+          </div>
+        )}
+        <div className="overflow-hidden rounded-[14px] border border-slate-700/80 bg-slate-950/20">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-700/75 px-4 py-3">
+            <span>
+              <span className="block text-sm font-black text-white">Eksik / Takip Gerekenler</span>
+              <span className="mt-1 block text-xs font-semibold text-slate-500">Logo entegrasyonunda eşleşmeyen, rafı boş kalan veya zamanı eskiyen kayıtlar</span>
+            </span>
+            <span className="rounded-full border border-slate-600/70 bg-white/5 px-2.5 py-1 text-xs font-black text-slate-300">
+              {formatCount(gaps.length)} kontrol
+            </span>
+          </div>
+          {loading && gaps.length === 0 ? (
+            <div className="flex min-h-[86px] items-center justify-center gap-2 text-sm font-black text-slate-300">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Eksik analizi yükleniyor
+            </div>
+          ) : gaps.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-[980px] w-full border-collapse text-left">
+                <thead className="bg-white/[0.04] text-[0.68rem] font-black uppercase tracking-[0.1em] text-slate-400">
+                  <tr>
+                    <th className="px-4 py-3">Konu</th>
+                    <th className="px-4 py-3">Akış</th>
+                    <th className="px-4 py-3">Durum</th>
+                    <th className="px-4 py-3 text-right">Eksik</th>
+                    <th className="px-4 py-3 text-right">Kapsam</th>
+                    <th className="px-4 py-3">Son Sync</th>
+                    <th className="px-4 py-3">Detay</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-700/70">
+                  {gaps.map((row) => (
+                    <tr key={row.key} className="text-sm font-semibold text-slate-200">
+                      <td className="px-4 py-3">
+                        <span className="block font-black text-white">{row.title}</span>
+                        <span className="mt-1 block text-xs text-slate-500">{row.key}</span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-300">{row.flow}</td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-black ${syncGapStatusClassName(row.status)}`}>
+                          {row.status === "ok" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
+                          {formatSyncGapStatusLabel(row.status)}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right font-black text-slate-100">{formatSyncGapIssue(row)}</td>
+                      <td className="px-4 py-3 text-right text-slate-300">
+                        {formatCount(row.syncedCount)} / {formatCount(row.expectedCount)}
+                      </td>
+                      <td className="px-4 py-3 text-slate-300">{formatDateTimeShort(row.lastSyncedAt ?? row.lastActivityAt)}</td>
+                      <td className="max-w-[360px] px-4 py-3 text-slate-300">
+                        <span className="block truncate">{row.detail}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="px-4 py-8 text-center text-sm font-semibold text-slate-400">
+              Eksik analiz kaydı bekleniyor.
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -556,7 +1049,6 @@ export function ControlPanelPage() {
 
   const [dateFrom, setDateFrom] = useState(toDateInputValue(lastMonth));
   const [dateTo, setDateTo] = useState(toDateInputValue(now));
-  const [trendMode, setTrendMode] = useState<"amount" | "count">("amount");
 
   const reportsQuery = useQuery({
     queryKey: ["control-panel", { dateFrom, dateTo }],
@@ -586,6 +1078,7 @@ export function ControlPanelPage() {
       supplierDebtTotal: Math.max(0, toNumber(logoSummary?.logo_supplier_debt_total) ?? 0),
       supplierCount: Math.max(0, Math.round(toNumber(logoSummary?.logo_suppliers_total) ?? 0)),
       customerCount: Math.max(0, toNumber(logoSummary?.logo_customers_total) ?? 0),
+      activeCustomerCount: Math.max(0, toNumber(logoSummary?.logo_active_customers_total) ?? 0),
       productCount: Math.max(0, toNumber(logoSummary?.logo_products_total) ?? 0),
       stockedProductCount: Math.max(0, toNumber(logoSummary?.logo_stocked_products_total) ?? 0),
       logoLastSyncedAt: typeof logoSummary?.logo_last_synced_at === "string" ? logoSummary.logo_last_synced_at : null,
@@ -659,41 +1152,30 @@ export function ControlPanelPage() {
     [reportsQuery.data?.logoDashboard]
   );
 
-  const orderCount = Math.max(metrics.salesCount, Math.round(metrics.openOrderTotal > 0 ? metrics.openOrderTotal / 1000 : 0));
-  const collectionTrend = [0.48, 0.62, 0.78, 0.84, 0.96].map((ratio) =>
-    Math.max(8, Math.round((metrics.collectedTotal || 32000) * ratio))
+  const collectionTrend = useMemo(
+    () => getDailyTrendRows(reportsQuery.data?.logoDashboard ?? null, "daily_breakdown", "collection_count"),
+    [reportsQuery.data?.logoDashboard]
   );
-  const salesTrend = [0.22, 0.52, 0.64, 0.38, 0.92].map((ratio) =>
-    Math.max(6, Math.round((metrics.salesTotal || 78500) * ratio))
+  const salesTrend = useMemo(
+    () => getDailyTrendRows(reportsQuery.data?.logoDashboard ?? null, "daily_sales_breakdown", "sales_count"),
+    [reportsQuery.data?.logoDashboard]
   );
-  const maxCollectionTrend = Math.max(...collectionTrend, 1);
-  const maxSalesTrend = Math.max(...salesTrend, 1);
-  const recentTransactions = [
-    {
-      type: "Tahsilat",
-      related: topCollectionMethod?.label ? `${topCollectionMethod.label} tahsilat` : "ABC Otomotiv",
-      amount: metrics.collectedTotal > 0 ? Math.round(metrics.collectedTotal / Math.max(metrics.collectedCount, 1)) : 3250,
-      tone: "bg-emerald-400",
-    },
-    {
-      type: "Sipariş",
-      related: topSalesCustomer?.name ?? "Yılmaz Fiat Ltd.",
-      amount: metrics.openOrderTotal > 0 ? metrics.openOrderTotal : 1875,
-      tone: "bg-sky-400",
-    },
-    {
-      type: "Satış",
-      related: topSalesCustomer?.name ?? "Metro Servis",
-      amount: metrics.salesTotal > 0 ? Math.round(metrics.salesTotal / Math.max(metrics.salesCount, 1)) : 2450,
-      tone: "bg-violet-400",
-    },
-    {
-      type: "İade",
-      related: topSupplierDebt?.title ?? "Özkan Otomotiv",
-      amount: -680,
-      tone: "bg-orange-400",
-    },
-  ];
+  const maxCollectionTrend = Math.max(...collectionTrend.map((row) => row.value), 1);
+  const maxSalesTrend = Math.max(...salesTrend.map((row) => row.value), 1);
+  const recentTransactions = useMemo(
+    () => getRecentTransactionRows(reportsQuery.data?.logoDashboard ?? null),
+    [reportsQuery.data?.logoDashboard]
+  );
+  const syncRows = useMemo(
+    () => getSyncRows(reportsQuery.data?.logoDashboard ?? null),
+    [reportsQuery.data?.logoDashboard]
+  );
+  const syncGapRows = useMemo(
+    () => getSyncGapRows(reportsQuery.data?.logoDashboard ?? null),
+    [reportsQuery.data?.logoDashboard]
+  );
+  const financeScale = Math.max(metrics.totalReceivable, metrics.collectedTotal, metrics.openOrderTotal, metrics.salesTotal, 1);
+  const logoSyncedLabel = formatDateTimeShort(metrics.logoLastSyncedAt);
 
   return (
     <div className="admin-control-panel mx-auto w-full max-w-[1620px] space-y-4 text-slate-100">
@@ -724,6 +1206,8 @@ export function ControlPanelPage() {
             width={520}
             height={520}
             priority
+            quality={80}
+            sizes="(max-width: 768px) 220px, (max-width: 1200px) 320px, 520px"
             className="absolute bottom-[-66px] right-[1%] z-0 hidden h-[335px] w-[335px] object-contain drop-shadow-[0_18px_26px_rgba(0,0,0,0.38)] md:block xl:right-[3%]"
           />
         </div>
@@ -731,14 +1215,16 @@ export function ControlPanelPage() {
         <div className="admin-shortcut-group rounded-[15px] border border-slate-700/70 bg-[linear-gradient(180deg,rgba(20,32,44,0.78)_0%,rgba(10,20,31,0.9)_100%)] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
           <div className="mb-2 flex items-center justify-between gap-3 px-1">
             <p className="text-xs font-black uppercase tracking-[0.12em] text-slate-300">Hızlı Yönetim</p>
-            <span className="rounded-full border border-slate-600/70 bg-white/5 px-2 py-1 text-[0.68rem] font-black text-slate-400">4 modül</span>
+            <span className="rounded-full border border-slate-600/70 bg-white/5 px-2 py-1 text-[0.68rem] font-black text-slate-400">
+              Logo: {logoSyncedLabel}
+            </span>
           </div>
           <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
             {[
-              { href: "/warehouse", title: "Şubeler", value: "5 aktif", icon: Building2, tone: "text-emerald-200 bg-emerald-300/12 border-emerald-300/20" },
-              { href: "/search", title: "Ürün Grupları", value: "12 grup", icon: Box, tone: "text-yellow-200 bg-yellow-300/12 border-yellow-300/20" },
+              { href: "/warehouse", title: "Şubeler", value: "Ambar ve sevkiyat", icon: Building2, tone: "text-emerald-200 bg-emerald-300/12 border-emerald-300/20" },
+              { href: "/search", title: "Stoklu Ürün", value: `${formatCount(Math.round(metrics.stockedProductCount))} kayıt`, icon: Box, tone: "text-yellow-200 bg-yellow-300/12 border-yellow-300/20" },
               { href: "/customers", title: "Müşteriler", value: `${formatCount(Math.round(metrics.customerCount))} kayıt`, icon: Users, tone: "text-violet-200 bg-violet-300/12 border-violet-300/20" },
-              { href: "/orders", title: "Siparişler", value: `${formatCount(orderCount)} bekleyen`, icon: ShoppingCart, tone: "text-orange-200 bg-orange-300/12 border-orange-300/20" },
+              { href: "/orders", title: "Sipariş", value: formatMoneyCompact(metrics.openOrderTotal), icon: ShoppingCart, tone: "text-orange-200 bg-orange-300/12 border-orange-300/20" },
             ].map((item) => {
               const Icon = item.icon;
 
@@ -771,41 +1257,45 @@ export function ControlPanelPage() {
             title: "Cari Bakiye Durumu",
             subtitle: "Toplam cari bakiye",
             value: formatMoneyCompact(metrics.totalReceivable),
-            note: `${formatCount(Math.round(metrics.customerCount))} cari · 38 vadesi geçen`,
+            note: `${formatCount(Math.round(metrics.customerCount))} Logo carisi · sync ${logoSyncedLabel}`,
             icon: CreditCard,
             accent: "emerald",
             className: "border-emerald-300/30 bg-[linear-gradient(135deg,rgba(8,70,52,0.54)_0%,rgba(9,22,29,0.96)_100%)] text-emerald-200",
             bar: "from-emerald-400 via-emerald-400 to-red-400",
+            progress: Math.max(4, Math.round((metrics.totalReceivable / financeScale) * 100)),
           },
           {
             title: "Tahsilat Toplamı",
             subtitle: "Bu ay tahsilat",
             value: formatMoneyCompact(metrics.collectedTotal),
-            note: "Hedefin göre %72",
+            note: `${formatCount(metrics.collectedCount)} tahsilat hareketi${topCollectionMethod ? ` · ${topCollectionMethod.label}` : ""}`,
             icon: HandCoins,
             accent: "amber",
             className: "border-yellow-300/30 bg-[linear-gradient(135deg,rgba(82,58,18,0.52)_0%,rgba(13,20,26,0.96)_100%)] text-yellow-200",
             bar: "from-amber-300 to-amber-400",
+            progress: Math.max(4, Math.round((metrics.collectedTotal / financeScale) * 100)),
           },
           {
             title: "Sipariş Durumu",
-            subtitle: "Toplam sipariş",
-            value: formatCount(orderCount),
-            note: "32 onay bekliyor",
+            subtitle: "Logo sipariş bakiyesi",
+            value: formatMoneyCompact(metrics.openOrderTotal),
+            note: "Logo carilerindeki açık sipariş bakiyesi",
             icon: ShoppingCart,
             accent: "sky",
             className: "border-sky-300/30 bg-[linear-gradient(135deg,rgba(11,76,117,0.5)_0%,rgba(9,21,32,0.96)_100%)] text-sky-200",
             bar: "from-sky-400 to-cyan-300",
+            progress: Math.max(4, Math.round((metrics.openOrderTotal / financeScale) * 100)),
           },
           {
             title: "Satış Toplamı",
             subtitle: "Bu ay toplam satış",
             value: formatMoneyCompact(metrics.salesTotal),
-            note: "Geçen aya göre %18 ↑",
+            note: `${formatCount(metrics.salesCount)} Logo satış hareketi${topSalesCustomer ? ` · ${topSalesCustomer.name}` : ""}`,
             icon: BarChart3,
             accent: "violet",
             className: "border-violet-300/30 bg-[linear-gradient(135deg,rgba(71,52,130,0.5)_0%,rgba(16,20,34,0.96)_100%)] text-fuchsia-200",
             bar: "from-violet-400 to-fuchsia-300",
+            progress: Math.max(4, Math.round((metrics.salesTotal / financeScale) * 100)),
           },
         ].map((card) => {
           const Icon = card.icon;
@@ -823,7 +1313,7 @@ export function ControlPanelPage() {
               </div>
               <p className="mt-5 text-[2.65rem] font-black leading-none tracking-tight">{card.value}</p>
               <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-700/70">
-                <div className={`h-full w-[74%] rounded-full bg-gradient-to-r ${card.bar}`} />
+                <div className={`h-full rounded-full bg-gradient-to-r ${card.bar}`} style={{ width: `${Math.min(100, card.progress)}%` }} />
               </div>
               <p className="mt-3 text-sm font-semibold text-slate-300">{card.note}</p>
             </article>
@@ -837,23 +1327,31 @@ export function ControlPanelPage() {
             <div className="mb-5 flex items-start justify-between gap-3">
               <div>
                 <h3 className="text-xl font-black">Tahsilat Raporu</h3>
-                <p className="text-sm font-semibold text-slate-400">Aylık tahsilat performansı</p>
+                <p className="text-sm font-semibold text-slate-400">Logo günlük tahsilat hareketleri</p>
               </div>
-              <span className="rounded-[10px] border border-slate-700 px-3 py-2 text-xs font-black">Bu Ay</span>
+              <span className="rounded-[10px] border border-slate-700 px-3 py-2 text-xs font-black">{formatCount(metrics.collectedCount)} kayıt</span>
             </div>
-            <div className="flex h-[154px] items-end gap-5 border-b border-slate-700/80 px-4">
-              {collectionTrend.map((value, index) => (
-                <div className="flex flex-1 flex-col items-center gap-2" key={`${value}-${index}`}>
-                  <span
-                    className="w-full rounded-t-[4px] bg-[linear-gradient(180deg,#4ade80_0%,rgba(34,197,94,0.35)_100%)] shadow-[0_0_22px_rgba(74,222,128,0.16)]"
-                    style={{ height: `${Math.max(20, (value / maxCollectionTrend) * 126)}px` }}
-                  />
+            {collectionTrend.length > 0 ? (
+              <>
+                <div className="flex h-[154px] items-end gap-5 border-b border-slate-700/80 px-4">
+                  {collectionTrend.map((row) => (
+                    <div className="flex flex-1 flex-col items-center gap-2" key={row.label}>
+                      <span
+                        className="w-full rounded-t-[4px] bg-[linear-gradient(180deg,#4ade80_0%,rgba(34,197,94,0.35)_100%)] shadow-[0_0_22px_rgba(74,222,128,0.16)]"
+                        style={{ height: `${Math.max(18, (row.value / maxCollectionTrend) * 126)}px` }}
+                      />
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-            <div className="mt-3 grid grid-cols-5 text-center text-xs font-semibold text-slate-300">
-              {["Oca", "Şub", "Mar", "Nis", "May"].map((month) => <span key={month}>{month}</span>)}
-            </div>
+                <div className="mt-3 grid text-center text-xs font-semibold text-slate-300" style={{ gridTemplateColumns: `repeat(${collectionTrend.length}, minmax(0, 1fr))` }}>
+                  {collectionTrend.map((row) => <span key={row.label}>{row.label.split(" · ")[0]}</span>)}
+                </div>
+              </>
+            ) : (
+              <div className="flex h-[190px] items-center justify-center rounded-[14px] border border-slate-700/70 bg-slate-950/30 text-sm font-semibold text-slate-400">
+                Seçili tarih aralığında Logo tahsilat hareketi yok.
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -862,39 +1360,54 @@ export function ControlPanelPage() {
             <div className="mb-5 flex items-start justify-between gap-3">
               <div>
                 <h3 className="text-xl font-black">Satış Performansı</h3>
-                <p className="text-sm font-semibold text-slate-400">Aylık satış trendi</p>
+                <p className="text-sm font-semibold text-slate-400">Logo günlük satış hareketleri</p>
               </div>
-              <span className="rounded-[10px] border border-slate-700 px-3 py-2 text-xs font-black">Bu Ay</span>
+              <span className="rounded-[10px] border border-slate-700 px-3 py-2 text-xs font-black">{formatCount(metrics.salesCount)} kayıt</span>
             </div>
-            <svg viewBox="0 0 520 160" className="h-[170px] w-full overflow-visible">
-              <defs>
-                <linearGradient id="adminSalesFill" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.38" />
-                  <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
-                </linearGradient>
-              </defs>
-              {[36, 68, 52, 84, 28].map((y) => (
-                <line key={y} x1="0" x2="520" y1={y} y2={y} stroke="rgba(148,163,184,0.13)" strokeDasharray="4 4" />
-              ))}
-              <polyline
-                points={salesTrend.map((value, index) => `${index * 130},${148 - (value / maxSalesTrend) * 118}`).join(" ")}
-                fill="none"
-                stroke="#38bdf8"
-                strokeWidth="4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <polygon
-                points={`0,160 ${salesTrend.map((value, index) => `${index * 130},${148 - (value / maxSalesTrend) * 118}`).join(" ")} 520,160`}
-                fill="url(#adminSalesFill)"
-              />
-              {salesTrend.map((value, index) => (
-                <circle key={`${value}-${index}`} cx={index * 130} cy={148 - (value / maxSalesTrend) * 118} r="6" fill="#38bdf8" />
-              ))}
-            </svg>
-            <div className="grid grid-cols-5 text-center text-xs font-semibold text-slate-300">
-              {["Oca", "Şub", "Mar", "Nis", "May"].map((month) => <span key={month}>{month}</span>)}
-            </div>
+            {salesTrend.length > 0 ? (
+              <>
+                <svg viewBox="0 0 520 160" className="h-[170px] w-full overflow-visible">
+                  <defs>
+                    <linearGradient id="adminSalesFill" x1="0" x2="0" y1="0" y2="1">
+                      <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.38" />
+                      <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
+                    </linearGradient>
+                  </defs>
+                  {[36, 68, 52, 84, 28].map((y) => (
+                    <line key={y} x1="0" x2="520" y1={y} y2={y} stroke="rgba(148,163,184,0.13)" strokeDasharray="4 4" />
+                  ))}
+                  <polyline
+                    points={salesTrend.map((row, index) => {
+                      const x = salesTrend.length === 1 ? 260 : index * (520 / (salesTrend.length - 1));
+                      return `${x},${148 - (row.value / maxSalesTrend) * 118}`;
+                    }).join(" ")}
+                    fill="none"
+                    stroke="#38bdf8"
+                    strokeWidth="4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <polygon
+                    points={`0,160 ${salesTrend.map((row, index) => {
+                      const x = salesTrend.length === 1 ? 260 : index * (520 / (salesTrend.length - 1));
+                      return `${x},${148 - (row.value / maxSalesTrend) * 118}`;
+                    }).join(" ")} 520,160`}
+                    fill="url(#adminSalesFill)"
+                  />
+                  {salesTrend.map((row, index) => {
+                    const x = salesTrend.length === 1 ? 260 : index * (520 / (salesTrend.length - 1));
+                    return <circle key={row.label} cx={x} cy={148 - (row.value / maxSalesTrend) * 118} r="6" fill="#38bdf8" />;
+                  })}
+                </svg>
+                <div className="grid text-center text-xs font-semibold text-slate-300" style={{ gridTemplateColumns: `repeat(${salesTrend.length}, minmax(0, 1fr))` }}>
+                  {salesTrend.map((row) => <span key={row.label}>{row.label.split(" · ")[0]}</span>)}
+                </div>
+              </>
+            ) : (
+              <div className="flex h-[190px] items-center justify-center rounded-[14px] border border-slate-700/70 bg-slate-950/30 text-sm font-semibold text-slate-400">
+                Seçili tarih aralığında Logo satış hareketi yok.
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -910,7 +1423,7 @@ export function ControlPanelPage() {
               </Button>
             </div>
             <div className="grid gap-5 sm:grid-cols-[150px_minmax(0,1fr)] sm:items-center">
-              <div className="mx-auto h-[138px] w-[138px] rounded-full p-[16px]" style={{ background: "conic-gradient(#f97316 0 58%, #facc15 58% 78%, #1f2937 78% 100%)" }}>
+              <div className="mx-auto h-[138px] w-[138px] rounded-full p-[16px]" style={{ background: "conic-gradient(#f97316 0 68%, #1f2937 68% 100%)" }}>
                 <div className="flex h-full w-full items-center justify-center rounded-full bg-[#07111b] text-sky-300">
                   <Truck className="h-10 w-10" />
                 </div>
@@ -920,12 +1433,12 @@ export function ControlPanelPage() {
                 <p className="mt-2 text-sm font-semibold text-slate-300">Toplam Borç</p>
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
                   <span className="rounded-[12px] border border-slate-700 bg-slate-900/55 p-3">
-                    <span className="block text-xs font-semibold text-slate-400">Vadesi Geçen</span>
-                    <strong className="mt-1 block text-lg font-black text-white">{formatMoneyCompact(metrics.supplierDebtTotal * 0.5)}</strong>
+                    <span className="block text-xs font-semibold text-slate-400">Tedarikçi</span>
+                    <strong className="mt-1 block text-lg font-black text-white">{formatCount(metrics.supplierCount)}</strong>
                   </span>
                   <span className="rounded-[12px] border border-slate-700 bg-slate-900/55 p-3">
-                    <span className="block text-xs font-semibold text-slate-400">Vadesi Gelecek</span>
-                    <strong className="mt-1 block text-lg font-black text-white">{formatMoneyCompact(metrics.supplierDebtTotal * 0.5)}</strong>
+                    <span className="block text-xs font-semibold text-slate-400">En yüksek</span>
+                    <strong className="mt-1 block truncate text-lg font-black text-white">{topSupplierDebt?.title ?? "Kayıt yok"}</strong>
                   </span>
                 </div>
               </div>
@@ -942,7 +1455,7 @@ export function ControlPanelPage() {
               <p className="text-sm font-semibold text-slate-400">Aktif cari sayısı</p>
             </span>
             <strong className="text-[2.6rem] font-black leading-none text-cyan-300">{formatCount(Math.round(metrics.customerCount))}</strong>
-            <p className="text-sm font-semibold text-cyan-200">120 yeni cari bu ay</p>
+            <p className="text-sm font-semibold text-cyan-200">{formatCount(Math.round(metrics.activeCustomerCount))} aktif cari</p>
           </CardContent>
         </Card>
 
@@ -953,7 +1466,7 @@ export function ControlPanelPage() {
               <p className="text-sm font-semibold text-slate-400">Ürün çeşidi</p>
             </span>
             <strong className="text-[2.6rem] font-black leading-none text-fuchsia-300">{formatCount(Math.round(metrics.productCount))}</strong>
-            <p className="text-sm font-semibold text-violet-200">12 ürün grubu</p>
+            <p className="text-sm font-semibold text-violet-200">{formatCount(Math.round(metrics.stockedProductCount))} stoklu ürün</p>
           </CardContent>
         </Card>
 
@@ -965,23 +1478,31 @@ export function ControlPanelPage() {
             </div>
             <div className="overflow-hidden rounded-[12px] border border-slate-700/80">
               <div className="grid grid-cols-[1fr_1fr_1.2fr_120px] bg-white/5 px-4 py-2 text-xs font-black uppercase tracking-[0.1em] text-slate-400">
-                <span>İşlem</span>
+                <span>Tarih</span>
                 <span>Tip</span>
                 <span>İlgili</span>
                 <span className="text-right">Tutar</span>
               </div>
-              {recentTransactions.map((row) => (
-                <div key={`${row.type}-${row.related}`} className="grid grid-cols-[1fr_1fr_1.2fr_120px] border-t border-slate-700/70 px-4 py-2 text-sm font-semibold">
-                  <span className="flex items-center gap-2"><i className={`h-2 w-2 rounded-full ${row.tone}`} /> {row.type}</span>
-                  <span>{row.type}</span>
-                  <span className="truncate">{row.related}</span>
-                  <span className="text-right">{formatMoneyCompact(row.amount)}</span>
+              {recentTransactions.length > 0 ? (
+                recentTransactions.map((row) => (
+                  <div key={row.id} className="grid grid-cols-[1fr_1fr_1.2fr_120px] border-t border-slate-700/70 px-4 py-2 text-sm font-semibold">
+                    <span className="flex items-center gap-2"><i className={`h-2 w-2 rounded-full ${row.tone}`} /> {formatShortDate(row.date)}</span>
+                    <span>{row.type}</span>
+                    <span className="truncate">{row.related}</span>
+                    <span className="text-right">{formatMoneyCompact(row.amount)}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="border-t border-slate-700/70 px-4 py-8 text-center text-sm font-semibold text-slate-400">
+                  Seçili tarih aralığında Logo cari hareketi yok.
                 </div>
-              ))}
+              )}
             </div>
           </CardContent>
         </Card>
       </section>
+
+      <LogoBridgeDetails rows={syncRows} gaps={syncGapRows} loading={reportsQuery.isFetching} />
     </div>
   );
 }

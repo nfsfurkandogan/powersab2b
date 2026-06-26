@@ -10,6 +10,7 @@ import sql from "mssql";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(scriptDir, ".env");
+const isMain = process.argv[1] ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
 
 if (fs.existsSync(envPath)) {
   dotenv.config({ path: envPath });
@@ -18,10 +19,12 @@ if (fs.existsSync(envPath)) {
 const config = buildConfig();
 const startedAt = Date.now();
 
-main().catch((error) => {
-  console.error("[logo-sync] failed:", error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (isMain) {
+  main().catch((error) => {
+    console.error("[logo-sync] failed:", error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}
 
 async function main() {
   const steps = buildSteps(config).filter((step) => step.procedure);
@@ -99,7 +102,7 @@ async function runStep(pool, step) {
   );
 }
 
-function buildConfig() {
+export function buildConfig() {
   const timeoutMs = parseInteger(process.env.LOGO_SQL_REQUEST_TIMEOUT_MS, 30000);
   const port = parseInteger(process.env.LOGO_SQL_PORT, undefined);
 
@@ -138,7 +141,7 @@ function buildConfig() {
   };
 }
 
-function buildSteps(currentConfig) {
+export function buildSteps(currentConfig) {
   return [
     {
       key: "orders",
@@ -179,6 +182,28 @@ function buildSteps(currentConfig) {
       ).trim(),
       limit: parseInteger(process.env.POWERSA_SHIPMENTS_LIMIT, 100),
       inputs: buildShipmentInputs,
+    },
+    {
+      key: "purchase-receipts",
+      envKey: "PURCHASE_RECEIPTS",
+      label: "purchase receipt",
+      idField: "purchase_receipt_id",
+      procedure: (process.env.LOGO_PURCHASE_RECEIPT_EXPORT_PROCEDURE ?? "").trim(),
+      pendingUrl:
+        nullable(process.env.POWERSA_PURCHASE_RECEIPTS_PENDING_URL) ??
+        derivePendingUrl(currentConfig.common.syncUrl, "purchase-receipts"),
+      ackUrl:
+        nullable(process.env.POWERSA_PURCHASE_RECEIPTS_ACK_URL) ??
+        deriveAckUrl(currentConfig.common.syncUrl, "purchase-receipts"),
+      syncKey: (
+        process.env.POWERSA_PURCHASE_RECEIPTS_SYNC_KEY ??
+        process.env.POWERSA_SHIPMENTS_SYNC_KEY ??
+        process.env.POWERSA_ORDERS_SYNC_KEY ??
+        currentConfig.common.fallbackSyncKey ??
+        ""
+      ).trim(),
+      limit: parseInteger(process.env.POWERSA_PURCHASE_RECEIPTS_LIMIT, 100),
+      inputs: buildPurchaseReceiptInputs,
     },
     {
       key: "returns",
@@ -229,7 +254,7 @@ function buildSteps(currentConfig) {
   }));
 }
 
-function validateLogoConfig(currentConfig) {
+export function validateLogoConfig(currentConfig) {
   const missing = [];
 
   if (!currentConfig.logo.server) missing.push("LOGO_SQL_SERVER");
@@ -246,7 +271,7 @@ function validateLogoConfig(currentConfig) {
   }
 }
 
-function validateStepConfig(step) {
+export function validateStepConfig(step) {
   const missing = [];
   const envKey = step.envKey ?? step.key.toUpperCase();
 
@@ -294,7 +319,7 @@ async function fetchPending(step) {
   return response.json();
 }
 
-async function loadProcedureParameters(pool, procedureName, label) {
+export async function loadProcedureParameters(pool, procedureName, label) {
   const normalizedProcedureName = procedureName.replaceAll("[", "").replaceAll("]", "");
 
   try {
@@ -320,7 +345,7 @@ async function loadProcedureParameters(pool, procedureName, label) {
   }
 }
 
-async function exportRecord(pool, step, record, procedureParameters) {
+export async function exportRecord(pool, step, record, procedureParameters) {
   const request = pool.request();
   const inputDefinitions = step.inputs(record);
   const execParameters = [];
@@ -341,12 +366,14 @@ async function exportRecord(pool, step, record, procedureParameters) {
 
   const query = hasExternalRefOutput
     ? `
+      ${logoRequiredSetOptions()}
       DECLARE @ExternalRef NVARCHAR(128);
       EXEC ${step.procedure}
         ${execParameters.join(",\n        ")};
       SELECT @ExternalRef AS external_ref;
     `
     : `
+      ${logoRequiredSetOptions()}
       EXEC ${step.procedure}
         ${execParameters.join(",\n        ")};
       SELECT @exportKey AS external_ref;
@@ -355,6 +382,18 @@ async function exportRecord(pool, step, record, procedureParameters) {
   const result = await request.query(query);
 
   return normalizeString(result.recordset?.[0]?.external_ref) ?? nullable(record.export_key);
+}
+
+function logoRequiredSetOptions() {
+  return `
+      SET ANSI_NULLS ON;
+      SET QUOTED_IDENTIFIER ON;
+      SET ANSI_PADDING ON;
+      SET ANSI_WARNINGS ON;
+      SET CONCAT_NULL_YIELDS_NULL ON;
+      SET ARITHABORT ON;
+      SET NUMERIC_ROUNDABORT OFF;
+  `;
 }
 
 function buildOrderInputs(record) {
@@ -384,6 +423,21 @@ function buildShipmentInputs(record) {
     input("Subtotal", "subtotal", sql.Decimal(15, 2), toNumber(record.subtotal)),
     input("VatTotal", "vatTotal", sql.Decimal(15, 2), toNumber(record.vat_total)),
     input("GrandTotal", "grandTotal", sql.Decimal(15, 2), toNumber(record.grand_total)),
+    input("ExportKey", "exportKey", sql.NVarChar(128), nullable(record.export_key)),
+    input("PayloadJson", "payloadJson", sql.NVarChar(sql.MAX), JSON.stringify(record)),
+  ];
+}
+
+function buildPurchaseReceiptInputs(record) {
+  return [
+    input("ReceiptDate", "receiptDate", sql.Date, toDate(record.received_at)),
+    input("ReceiptNo", "receiptNo", sql.NVarChar(64), nullable(record.receipt_no)),
+    input("DocumentNo", "documentNo", sql.NVarChar(64), nullable(record.document_no)),
+    input("SupplierName", "supplierName", sql.NVarChar(160), nullable(record.supplier_name)),
+    input("WarehouseCode", "warehouseCode", sql.NVarChar(64), nullable(record.warehouse_code)),
+    input("WarehouseName", "warehouseName", sql.NVarChar(160), nullable(record.warehouse_name)),
+    input("AcceptedQuantityTotal", "acceptedQuantityTotal", sql.Int, toNumber(record.accepted_quantity_total)),
+    input("ExpectedQuantityTotal", "expectedQuantityTotal", sql.Int, toNumber(record.expected_quantity_total)),
     input("ExportKey", "exportKey", sql.NVarChar(128), nullable(record.export_key)),
     input("PayloadJson", "payloadJson", sql.NVarChar(sql.MAX), JSON.stringify(record)),
   ];

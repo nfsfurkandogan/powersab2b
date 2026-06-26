@@ -20,7 +20,22 @@ class PosSessionController extends Controller
 
         $validated = $request->validate([
             'cashbox_id' => ['nullable', 'integer', 'exists:cashboxes,id'],
+            'all' => ['nullable', 'boolean'],
         ]);
+
+        if ($request->boolean('all')) {
+            $sessions = $posSessionService
+                ->currentQuery(
+                    $request->user(),
+                    isset($validated['cashbox_id']) ? (int) $validated['cashbox_id'] : null,
+                    includeAllAccessible: true
+                )
+                ->get();
+
+            return response()->json([
+                'data' => PosSessionResource::collection($sessions),
+            ]);
+        }
 
         $session = $posSessionService->current($request->user(), $validated['cashbox_id'] ?? null);
 

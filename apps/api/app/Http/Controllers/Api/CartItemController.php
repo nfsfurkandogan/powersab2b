@@ -9,6 +9,7 @@ use App\Models\CartItem;
 use App\Models\Customer;
 use App\Models\Product;
 use App\Models\User;
+use App\Support\Cart\CartLogoIntegrationSummary;
 use App\Support\Pricing\DealerNetPriceExpression;
 use App\Support\Pricing\DisplayCurrency;
 use App\Support\Warehouse\CartWarehouseOptions;
@@ -232,6 +233,7 @@ class CartItemController extends Controller
             ],
             'items' => $items,
             'warehouse_options' => app(CartWarehouseOptions::class)->forCartItems($cart->items),
+            'logo_integration' => app(CartLogoIntegrationSummary::class)->forCart($cart),
             'totals' => $totals,
         ];
     }

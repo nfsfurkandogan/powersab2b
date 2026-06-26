@@ -218,8 +218,10 @@ class ReturnRequestController extends Controller
             'reviewed_at' => now(),
         ])->save();
 
-        if (in_array($nextStatus, [ReturnRequest::STATUS_APPROVED, ReturnRequest::STATUS_COMPLETED], true)) {
+        if ($nextStatus === ReturnRequest::STATUS_APPROVED) {
             $this->queueReturnForLogoExport($syncState, $returnRequest);
+        } elseif ($nextStatus === ReturnRequest::STATUS_COMPLETED) {
+            $this->queueMissingReturnLogoExports($syncState, $returnRequest);
         }
 
         $returnRequest->loadMissing([
@@ -262,6 +264,27 @@ class ReturnRequestController extends Controller
             return;
         }
 
+        $this->queueReturnScrapForLogoExport($syncState, $returnRequest);
+    }
+
+    private function queueMissingReturnLogoExports(IntegrationSyncStateService $syncState, ReturnRequest $returnRequest): void
+    {
+        if (! ($this->logoSyncState('returns', ReturnRequest::class, (int) $returnRequest->id) instanceof IntegrationSyncState)) {
+            $this->queueReturnForLogoExport($syncState, $returnRequest);
+
+            return;
+        }
+
+        if (
+            in_array($returnRequest->request_type, [ReturnRequest::TYPE_DAMAGED, ReturnRequest::TYPE_FAULTY], true)
+            && ! ($this->logoSyncState('return-scraps', ReturnRequest::class, (int) $returnRequest->id) instanceof IntegrationSyncState)
+        ) {
+            $this->queueReturnScrapForLogoExport($syncState, $returnRequest);
+        }
+    }
+
+    private function queueReturnScrapForLogoExport(IntegrationSyncStateService $syncState, ReturnRequest $returnRequest): void
+    {
         $customerCode = $returnRequest->customer?->code
             ?? data_get($returnRequest->order_snapshot, 'customer_code')
             ?? Customer::query()->whereKey($returnRequest->customer_id)->value('code');
@@ -295,7 +318,7 @@ class ReturnRequestController extends Controller
 
     private function ensureReturnRole(User $user): void
     {
-        if (! $user->hasAnyRole(['admin', 'dealer_admin', 'salesperson'])) {
+        if (! $user->hasAnyRole(['admin', 'dealer_admin', 'salesperson', 'cashier', 'point'])) {
             abort(Response::HTTP_FORBIDDEN, 'You are not allowed to access return flow.');
         }
     }

@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import sql from "mssql";
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const scriptPath = fileURLToPath(import.meta.url);
+const scriptDir = path.dirname(scriptPath);
 const envPath = path.join(scriptDir, ".env");
 
 if (fs.existsSync(envPath)) {
@@ -18,10 +19,12 @@ if (fs.existsSync(envPath)) {
 const config = buildConfig();
 const startedAt = Date.now();
 
-main().catch((error) => {
-  console.error("[logo-sync] failed:", error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+  main().catch((error) => {
+    console.error("[logo-sync] failed:", error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}
 
 async function main() {
   validateConfig(config);
@@ -210,18 +213,18 @@ async function exportSale(pool, currentConfig, record) {
   request.input(
     "payloadJson",
     sql.NVarChar(sql.MAX),
-    JSON.stringify({
-      pos_sale_id: record.pos_sale_id,
-      cashbox_id: record.cashbox_id ?? null,
-      cashbox_code: record.cashbox_code ?? null,
-      cashbox_name: record.cashbox_name ?? null,
-      items: record.items ?? [],
-      payments: record.payments ?? [],
-      meta: record.meta ?? {},
-    })
+    JSON.stringify(buildPosSalePayload(record))
   );
 
   const result = await request.query(`
+    SET ANSI_NULLS ON;
+    SET QUOTED_IDENTIFIER ON;
+    SET ANSI_PADDING ON;
+    SET ANSI_WARNINGS ON;
+    SET CONCAT_NULL_YIELDS_NULL ON;
+    SET ARITHABORT ON;
+    SET NUMERIC_ROUNDABORT OFF;
+
     DECLARE @ExternalRef NVARCHAR(128);
     EXEC ${currentConfig.logo.posSaleExportProcedure}
       @CustomerExternalRef = @customerExternalRef,
@@ -242,6 +245,20 @@ async function exportSale(pool, currentConfig, record) {
   `);
 
   return normalizeString(result.recordset?.[0]?.external_ref) ?? nullable(record.export_key);
+}
+
+export function buildPosSalePayload(record) {
+  return {
+    pos_sale_id: record.pos_sale_id,
+    document_type: record.document_type ?? null,
+    cashbox_id: record.cashbox_id ?? null,
+    cashbox_code: record.cashbox_code ?? null,
+    cashbox_name: record.cashbox_name ?? null,
+    logo: record.logo ?? {},
+    items: record.items ?? [],
+    payments: record.payments ?? [],
+    meta: record.meta ?? {},
+  };
 }
 
 async function acknowledgeSales(currentConfig, records) {

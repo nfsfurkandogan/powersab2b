@@ -3,7 +3,9 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\User;
 use App\Models\UserNote;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -19,6 +21,7 @@ class UserNoteController extends Controller
 
         $query = UserNote::query()
             ->with('user:id,name,username');
+        $this->applyVisibleNoteScope($query, $request->user());
 
         $status = $validated['status'] ?? 'open';
         if ($status !== 'all') {
@@ -32,14 +35,18 @@ class UserNoteController extends Controller
             ->orderByDesc('updated_at')
             ->limit(200)
             ->get();
+        $openSummaryQuery = UserNote::query();
+        $this->applyVisibleNoteScope($openSummaryQuery, $request->user());
+        $doneSummaryQuery = UserNote::query();
+        $this->applyVisibleNoteScope($doneSummaryQuery, $request->user());
 
         return response()->json([
             'data' => $notes->map(fn (UserNote $note): array => $this->serializeNote($note))->values(),
             'summary' => [
-                'open' => UserNote::query()
+                'open' => $openSummaryQuery
                     ->where('status', 'open')
                     ->count(),
-                'done' => UserNote::query()
+                'done' => $doneSummaryQuery
                     ->where('status', 'done')
                     ->count(),
             ],
@@ -70,6 +77,8 @@ class UserNoteController extends Controller
 
     public function update(Request $request, UserNote $note): JsonResponse
     {
+        $this->authorizeVisibleNote($note, $request->user());
+
         $validated = $this->validatedPayload($request, partial: true);
         $nextStatus = $validated['status'] ?? $note->status;
 
@@ -92,6 +101,8 @@ class UserNoteController extends Controller
 
     public function destroy(Request $request, UserNote $note): JsonResponse
     {
+        $this->authorizeVisibleNote($note, $request->user());
+
         $note->delete();
 
         return response()->json([
@@ -143,5 +154,47 @@ class UserNoteController extends Controller
             'created_at' => $note->created_at?->toIso8601String(),
             'updated_at' => $note->updated_at?->toIso8601String(),
         ];
+    }
+
+    private function applyVisibleNoteScope(Builder $query, User $user): void
+    {
+        if ($this->usesPrivateNotes($user)) {
+            $query->where('user_id', $user->id);
+
+            return;
+        }
+
+        $query->whereDoesntHave('user', function ($userQuery): void {
+            $userQuery->whereIn('username', $this->privateNoteUsernames());
+        });
+    }
+
+    private function authorizeVisibleNote(UserNote $note, User $user): void
+    {
+        if ($this->usesPrivateNotes($user)) {
+            abort_unless((int) $note->user_id === (int) $user->id, Response::HTTP_NOT_FOUND);
+
+            return;
+        }
+
+        $noteUsername = mb_strtolower(trim((string) $note->user?->username), 'UTF-8');
+        abort_if(in_array($noteUsername, $this->privateNoteUsernames(), true), Response::HTTP_NOT_FOUND);
+    }
+
+    private function usesPrivateNotes(User $user): bool
+    {
+        return in_array(
+            mb_strtolower(trim((string) $user->username), 'UTF-8'),
+            $this->privateNoteUsernames(),
+            true
+        );
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function privateNoteUsernames(): array
+    {
+        return ['erzurum.hizlisatis'];
     }
 }

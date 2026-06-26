@@ -3,9 +3,10 @@
 import { useEffect, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import {
   ClipboardCheck,
+  LogOut,
   PanelLeftClose,
   PanelLeftOpen,
   ShoppingCart,
@@ -39,7 +40,8 @@ type PointSidebarNavProps = {
 
 export function PointSidebarNav({ iconVariant = "default" }: PointSidebarNavProps) {
   const pathname = usePathname();
-  const { user } = useSession();
+  const router = useRouter();
+  const { user, logout } = useSession();
   const useQuickSaleIcons = iconVariant === "quick-sale";
   const roleSlugs = user?.roles.map((role) => role.slug) ?? [];
   const menuPermissions = user?.menu_permissions ?? [];
@@ -109,6 +111,7 @@ export function PointSidebarNav({ iconVariant = "default" }: PointSidebarNavProp
               alt="Güçsa Powersa Filter Logo"
               width={910}
               height={883}
+              sizes="180px"
               className="h-full w-full object-contain"
               priority
             />
@@ -119,6 +122,7 @@ export function PointSidebarNav({ iconVariant = "default" }: PointSidebarNavProp
               alt="Güçsa Powersa Filter Logo"
               width={910}
               height={883}
+              sizes="180px"
               className={cn("h-full w-full object-contain drop-shadow-[0_18px_24px_rgba(0,0,0,0.16)]", collapsed && "scale-125")}
               priority
             />
@@ -185,7 +189,25 @@ export function PointSidebarNav({ iconVariant = "default" }: PointSidebarNavProp
           })}
         </nav>
 
-        <div className="mt-auto pt-8" />
+        <div className="mt-auto pt-8">
+          <button
+            type="button"
+            onClick={() => {
+              void logout().then(() => {
+                void router.replace("/login?v=20260605-login-fast");
+              });
+            }}
+            className={cn(
+              "flex h-14 items-center justify-center rounded-[16px] border border-[#61352f] bg-[linear-gradient(135deg,#3d1814_0%,#1c0d0b_100%)] text-sm font-black text-[#ffe4df] shadow-[0_18px_32px_-28px_rgba(0,0,0,0.9)] transition hover:border-[#ef8f80]/70 hover:bg-[#4b1f19] hover:text-white",
+              collapsed ? "mx-auto w-12" : "w-full gap-3 px-4"
+            )}
+            aria-label="Çıkış yap"
+            title="Çıkış yap"
+          >
+            <LogOut className="h-5 w-5" />
+            {collapsed ? null : <span>Çıkış</span>}
+          </button>
+        </div>
       </div>
     </aside>
   );

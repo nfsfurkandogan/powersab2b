@@ -10,8 +10,8 @@ function readCookie(name: string): string | null {
 }
 
 export function getSanctumHeaders(method: string): Record<string, string> {
-  const isUnsafeMethod = !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
-  const csrfToken = isUnsafeMethod ? readCookie("XSRF-TOKEN") : null;
+  void method;
+  const csrfToken = readCookie("XSRF-TOKEN");
 
   return {
     Accept: "application/json",

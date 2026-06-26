@@ -88,5 +88,5 @@ composer
 tools/*.zip
 tools/**/bin/
 tools/**/obj/
+tools/logo-sync/.sync-state/
 *.publish/
-

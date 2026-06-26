@@ -89,7 +89,7 @@ function normalizeOrderNoteForScope(value: string | null | undefined, isBatumBra
 
 export function CartProvider({ children }: { children: React.ReactNode }) {
   const { status, user, selectedCustomer } = useSession();
-  const roleSlugs = user?.roles.map((role) => role.slug) ?? [];
+  const roleSlugs = Array.isArray(user?.roles) ? user.roles.map((role) => role.slug) : [];
   const warehouseTransferRequired = roleSlugs.includes("salesperson");
   const isBatumBranch = useMemo(() => {
     const batumScopeValues = [

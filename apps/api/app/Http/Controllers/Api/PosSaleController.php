@@ -39,6 +39,21 @@ class PosSaleController extends Controller
             $query->where('document_type', (string) $validated['document_type']);
         }
 
+        $search = trim((string) ($validated['q'] ?? ''));
+        if ($search !== '') {
+            $needle = '%'.mb_strtolower($search).'%';
+
+            $query->where(function ($query) use ($needle): void {
+                $query
+                    ->whereRaw('LOWER(receipt_no) LIKE ?', [$needle])
+                    ->orWhereHas('customer', function ($customerQuery) use ($needle): void {
+                        $customerQuery
+                            ->whereRaw('LOWER(code) LIKE ?', [$needle])
+                            ->orWhereRaw('LOWER(name) LIKE ?', [$needle]);
+                    });
+            });
+        }
+
         $sales = $query
             ->orderByDesc('created_at')
             ->orderByDesc('id')

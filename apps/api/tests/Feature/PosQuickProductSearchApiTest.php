@@ -304,6 +304,7 @@ class PosQuickProductSearchApiTest extends TestCase
         $response->assertJsonMissing(['id' => $equivalentProduct->id]);
 
         $ids = collect($response->json('data'))->pluck('id')->all();
+        $this->assertSame($mainProduct->id, $ids[0]);
         $this->assertContains($mainProduct->id, $ids);
         $this->assertContains($sameGroupProduct->id, $ids);
         $this->assertContains($sameGroupSecondProduct->id, $ids);
@@ -478,6 +479,100 @@ class PosQuickProductSearchApiTest extends TestCase
         $response->assertJsonPath('data.0.stock_locations.1.branch', 'BATUM DEPO');
         $response->assertJsonPath('data.0.stock_locations.1.stock', 3);
         $response->assertJsonPath('data.0.stock_locations.1.shelf_address', 'B.4');
+    }
+
+    public function test_pos_customer_selection_payload_includes_dealer_id_for_admin_context(): void
+    {
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-POS-CUSTOMER-'.Str::upper(Str::random(4)),
+            'name' => 'POS Customer Dealer',
+            'price_list_id' => $priceListId > 0 ? $priceListId : null,
+            'is_active' => true,
+        ]);
+
+        $role = Role::query()->firstOrCreate(
+            ['slug' => 'admin'],
+            ['name' => 'Admin']
+        );
+
+        $user = User::factory()->create([
+            'dealer_id' => null,
+            'is_active' => true,
+        ]);
+        $user->roles()->sync([$role->id]);
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'POS-DEALER-CTX',
+            'name' => 'POS Dealer Context Customer',
+            'source_system' => 'logo',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($user);
+
+        $response = $this->getJson('/api/pos/customers?q=POS-DEALER-CTX&source_system=logo&limit=5');
+
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $customer->id);
+        $response->assertJsonPath('data.0.dealer_id', $dealer->id);
+    }
+
+    public function test_admin_pos_quick_search_uses_selected_customer_dealer_context(): void
+    {
+        $priceListId = (int) DB::table('price_lists')->where('code', 'A')->value('id');
+
+        $dealer = Dealer::query()->create([
+            'code' => 'DLR-POS-ADMIN-'.Str::upper(Str::random(4)),
+            'name' => 'POS Admin Dealer',
+            'price_list_id' => $priceListId > 0 ? $priceListId : null,
+            'is_active' => true,
+        ]);
+
+        $role = Role::query()->firstOrCreate(
+            ['slug' => 'admin'],
+            ['name' => 'Admin']
+        );
+
+        $customer = Customer::query()->create([
+            'dealer_id' => $dealer->id,
+            'code' => 'POS-ADMIN-CUSTOMER',
+            'name' => 'POS Admin Context Customer',
+            'is_active' => true,
+        ]);
+
+        $user = User::factory()->create([
+            'dealer_id' => null,
+            'selected_customer_id' => $customer->id,
+            'is_active' => true,
+        ]);
+        $user->roles()->sync([$role->id]);
+
+        $brand = Brand::query()->create([
+            'name' => 'POS Admin Brand',
+            'slug' => 'pos-admin-brand',
+            'is_active' => true,
+        ]);
+
+        $product = $this->createLogoProduct($brand->id, 'ADM-1401', 'Admin Context Product', 'ADMIN-GROUP', 'D');
+
+        DB::table('base_prices')->insert([
+            'price_list_id' => $priceListId,
+            'product_id' => $product->id,
+            'list_price' => 210.00,
+            'currency' => 'TRY',
+            'updated_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+
+        $response = $this->getJson('/api/pos/products/quick-search?q=ADM-1401&limit=5&code_only=1');
+
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $product->id);
+        $response->assertJsonPath('data.0.sku', 'ADM-1401');
     }
 
     private function createLogoProduct(int $brandId, string $sku, string $name, string $groupCode, string $specode4): Product

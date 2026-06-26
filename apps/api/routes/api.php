@@ -22,6 +22,7 @@ use App\Http\Controllers\Api\LogoOrderExportController;
 use App\Http\Controllers\Api\LogoPosExpenseExportController;
 use App\Http\Controllers\Api\LogoPosSaleExportController;
 use App\Http\Controllers\Api\LogoProductSyncController;
+use App\Http\Controllers\Api\LogoPurchaseReceiptExportController;
 use App\Http\Controllers\Api\LogoReturnExportController;
 use App\Http\Controllers\Api\LogoReturnScrapExportController;
 use App\Http\Controllers\Api\LogoShipmentExportController;
@@ -38,6 +39,7 @@ use App\Http\Controllers\Api\ProductFilterOptionsController;
 use App\Http\Controllers\Api\ProductImageController;
 use App\Http\Controllers\Api\ProductSearchController;
 use App\Http\Controllers\Api\ProfileController;
+use App\Http\Controllers\Api\PurchaseReceiptController;
 use App\Http\Controllers\Api\ReportRunController;
 use App\Http\Controllers\Api\ReturnRequestController;
 use App\Http\Controllers\Api\SalesReportController;
@@ -63,6 +65,8 @@ Route::middleware('throttle:logo-integration')->group(function (): void {
     Route::post('/integrations/logo/orders/ack', [LogoOrderExportController::class, 'acknowledge']);
     Route::get('/integrations/logo/shipments/pending', [LogoShipmentExportController::class, 'index']);
     Route::post('/integrations/logo/shipments/ack', [LogoShipmentExportController::class, 'acknowledge']);
+    Route::get('/integrations/logo/purchase-receipts/pending', [LogoPurchaseReceiptExportController::class, 'index']);
+    Route::post('/integrations/logo/purchase-receipts/ack', [LogoPurchaseReceiptExportController::class, 'acknowledge']);
     Route::get('/integrations/logo/returns/pending', [LogoReturnExportController::class, 'index']);
     Route::post('/integrations/logo/returns/ack', [LogoReturnExportController::class, 'acknowledge']);
     Route::get('/integrations/logo/return-scraps/pending', [LogoReturnScrapExportController::class, 'index']);
@@ -230,8 +234,17 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::get('/shipments/{shipment}/print/label', [WarehouseShipmentPrintController::class, 'label']);
             Route::post('/shipments/{shipment}/scan', [WarehouseShipmentController::class, 'scan']);
             Route::post('/shipments/{shipment}/return-item', [WarehouseShipmentController::class, 'returnItem']);
+            Route::post('/shipments/{shipment}/return-all', [WarehouseShipmentController::class, 'returnAllItems']);
+            Route::post('/shipments/{shipment}/add-item', [WarehouseShipmentController::class, 'addItem']);
+            Route::patch('/shipments/{shipment}/items/{item}/quantity', [WarehouseShipmentController::class, 'updateItemQuantity']);
             Route::delete('/shipments/{shipment}/items/{item}', [WarehouseShipmentController::class, 'destroyItem']);
             Route::post('/shipments/{shipment}/finalize', [WarehouseShipmentController::class, 'finalize']);
             Route::post('/shipments/{shipment}/cancel', [WarehouseShipmentController::class, 'cancel']);
+        });
+
+    Route::prefix('purchase-receipts')
+        ->middleware(['role:admin,dealer_admin,warehouse', 'menu:extra', 'throttle:pos'])
+        ->group(function (): void {
+            Route::post('/', [PurchaseReceiptController::class, 'store']);
         });
 });

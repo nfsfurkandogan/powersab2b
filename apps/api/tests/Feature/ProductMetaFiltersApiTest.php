@@ -285,7 +285,8 @@ class ProductMetaFiltersApiTest extends TestCase
                                 'logo_stock' => [
                                     'warehouses' => [
                                         [
-                                            'warehouse_code' => '25',
+                                            'warehouse_code' => '1',
+                                            'shelf_key' => '25',
                                             'branch' => 'Erzurum',
                                             'available_total' => 7,
                                         ],
@@ -563,6 +564,85 @@ class ProductMetaFiltersApiTest extends TestCase
         $response->assertJsonPath('data.0.stock_locations.0.stock', 7);
     }
 
+    public function test_point_user_sees_erzurum_depo_and_point_stock_with_shelf_addresses(): void
+    {
+        $context = $this->createSalesContext();
+        $product = $this->createProductWithMeta(
+            dealer: $context['dealer'],
+            brand: $context['brand'],
+            category: $context['category'],
+            sku: 'STOCK-POINT-ERZ-001',
+            name: 'Point Erzurum Stock Product',
+            stock: 17,
+            listPrice: 210.00,
+            meta: [
+                'integrations' => [
+                    'logo' => [
+                        'payload' => [
+                            'raw' => [
+                                'RAF25' => 'A42.4',
+                                'RAF250' => 'B1.3',
+                            ],
+                            'logo_stock' => [
+                                'warehouses' => [
+                                    [
+                                        'warehouse_code' => '1',
+                                        'available_total' => 8,
+                                        'shelf_key' => '25',
+                                    ],
+                                    [
+                                        'warehouse_code' => '0',
+                                        'available_total' => 2,
+                                        'shelf_key' => '250',
+                                    ],
+                                    [
+                                        'warehouse_code' => '3',
+                                        'warehouse_name' => 'SAMSUN DEPO',
+                                        'available_total' => 7,
+                                        'shelf_key' => '55',
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ]
+        );
+
+        $pointRole = Role::query()->firstOrCreate(
+            ['slug' => 'point'],
+            ['name' => 'Point']
+        );
+        $pointUser = User::factory()->create([
+            'dealer_id' => $context['dealer']->id,
+            'is_active' => true,
+            'branch_code' => 'ERZURUM',
+            'branch_name' => 'ERZURUM MERKEZ ŞUBESİ',
+            'menu_permissions' => ['search'],
+            'feature_permissions' => [
+                'search.stock',
+                'search.stock.warehouse.erzurum_depo',
+                'search.stock.warehouse.erzurum_point',
+            ],
+        ]);
+        $pointUser->roles()->sync([$pointRole->id]);
+
+        $this->actingAs($pointUser);
+
+        $response = $this->getJson('/api/products/search?limit=20&sort=stock_desc&q=STOCK-POINT-ERZ-001');
+
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $product->id);
+        $response->assertJsonPath('data.0.available_total', 10);
+        $response->assertJsonCount(2, 'data.0.stock_locations');
+        $response->assertJsonPath('data.0.stock_locations.0.warehouse_code', '1');
+        $response->assertJsonPath('data.0.stock_locations.0.stock', 8);
+        $response->assertJsonPath('data.0.stock_locations.0.shelf_address', 'A42.4');
+        $response->assertJsonPath('data.0.stock_locations.1.warehouse_code', '0');
+        $response->assertJsonPath('data.0.stock_locations.1.stock', 2);
+        $response->assertJsonPath('data.0.stock_locations.1.shelf_address', 'B1.3');
+    }
+
     public function test_salesperson_with_selected_customer_sees_only_customer_branch_stock(): void
     {
         $context = $this->createSalesContext();
@@ -775,6 +855,68 @@ class ProductMetaFiltersApiTest extends TestCase
         $spacedResponse->assertJsonPath('data.0.id', $product->id);
     }
 
+    public function test_code_like_product_search_avoids_global_cold_visibility_scans(): void
+    {
+        $context = $this->createSalesContext();
+
+        $visibleProduct = $this->createProductWithMeta(
+            dealer: $context['dealer'],
+            brand: $context['brand'],
+            category: $context['category'],
+            sku: 'CS 0040',
+            name: 'Visible Code Search Product',
+            stock: 12,
+            listPrice: 175.00,
+            meta: [
+                'specode4' => 'E',
+            ]
+        );
+
+        $this->createProductWithMeta(
+            dealer: $context['dealer'],
+            brand: $context['brand'],
+            category: $context['category'],
+            sku: 'CS 0040 HIDDEN',
+            name: 'Hidden Equivalent Product',
+            stock: 8,
+            listPrice: 165.00,
+            meta: [
+                'specode4' => 'H',
+            ]
+        );
+
+        Cache::flush();
+        $queries = [];
+        DB::listen(function ($query) use (&$queries): void {
+            $queries[] = $query->sql;
+        });
+
+        $this->actingAs($context['user']);
+
+        $response = $this->getJson('/api/products/search?limit=20&q=cs0040');
+
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $visibleProduct->id);
+        $response->assertJsonPath('search_backend', 'db_code_fast');
+
+        $globalLogoMarkerCounts = array_values(array_filter(
+            $queries,
+            fn (string $sql): bool => str_contains($sql, 'count(*) as aggregate')
+                && str_contains($sql, 'from "products"')
+                && ! str_contains($sql, '"products"."id" in')
+        ));
+        $globalSpecialCodeScans = array_values(array_filter(
+            $queries,
+            fn (string $sql): bool => str_contains($sql, 'select "products"."id" from "products"')
+                && str_contains($sql, 'JSON_EXTRACT(products.meta')
+                && str_contains($sql, 'specode4')
+                && ! str_contains($sql, '"products"."id" in')
+        ));
+
+        $this->assertSame([], $globalLogoMarkerCounts, implode("\n", $globalLogoMarkerCounts));
+        $this->assertSame([], $globalSpecialCodeScans, implode("\n", $globalSpecialCodeScans));
+    }
+
     public function test_products_search_resolves_package_quantity_from_logo_units(): void
     {
         $context = $this->createSalesContext();
@@ -864,7 +1006,7 @@ class ProductMetaFiltersApiTest extends TestCase
         $response->assertJsonCount(1, 'data');
         $response->assertJsonPath('data.0.id', $product->id);
         $response->assertJsonPath('data.0.sku', 'WY 403');
-        $response->assertJsonPath('search_backend', 'db_fallback');
+        $response->assertJsonPath('search_backend', 'db_code_fast');
     }
 
     public function test_products_search_limits_exact_code_lookup_to_same_logo_group(): void
@@ -1242,6 +1384,38 @@ class ProductMetaFiltersApiTest extends TestCase
         $response->assertJsonPath('data.0.net_price', '14.71');
         $response->assertJsonPath('data.0.list_price', '14.71');
         $response->assertJsonPath('data.0.currency', 'GEL');
+    }
+
+    public function test_products_search_returns_logo_synced_at_for_dynamic_freshness_badge(): void
+    {
+        $context = $this->createSalesContext();
+        $syncedAt = '2026-06-23T02:41:12+03:00';
+
+        $product = $this->createProductWithMeta(
+            dealer: $context['dealer'],
+            brand: $context['brand'],
+            category: $context['category'],
+            sku: 'LOGO-FRESH-001',
+            name: 'Logo Fresh Product',
+            stock: 10,
+            listPrice: 250.00,
+            meta: [
+                'integrations' => [
+                    'logo' => [
+                        'synced_at' => $syncedAt,
+                        'external_ref' => 'LOGO-FRESH-001',
+                    ],
+                ],
+            ]
+        );
+
+        $this->actingAs($context['user']);
+
+        $response = $this->getJson('/api/products/search?limit=20&q=LOGO-FRESH-001');
+
+        $response->assertOk();
+        $response->assertJsonPath('data.0.id', $product->id);
+        $response->assertJsonPath('data.0.logo_synced_at', $syncedAt);
     }
 
     /**

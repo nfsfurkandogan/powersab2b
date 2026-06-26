@@ -79,6 +79,10 @@ class ReportService
                 [$asOfDate]
             )
             ->when($dealerId !== null, fn (EloquentBuilder $query) => $query->where('dealer_id', $dealerId))
+            ->when(
+                ! empty($filters['customer_id']),
+                fn (EloquentBuilder $query) => $query->where('customer_id', (int) $filters['customer_id'])
+            )
             ->whereRaw("DATE({$entryDateExpr}) <= ?", [$asOfDate])
             ->groupBy('customer_id');
 
@@ -102,6 +106,10 @@ class ReportService
             })
             ->when($dealerId !== null, fn (EloquentBuilder $query) => $query->where('customers.dealer_id', $dealerId))
             ->where('customers.source_system', 'logo')
+            ->when(
+                ! empty($filters['customer_id']),
+                fn (EloquentBuilder $q) => $q->where('customers.id', (int) $filters['customer_id'])
+            )
             ->when(! empty($filters['q']), function (EloquentBuilder $q) use ($filters): void {
                 $search = trim((string) $filters['q']);
                 $q->where(function (EloquentBuilder $inner) use ($search): void {
@@ -164,6 +172,7 @@ class ReportService
             'report' => self::KEY_CUSTOMER_BALANCES,
             'filters' => [
                 'dealer_id' => $dealerId,
+                'customer_id' => isset($filters['customer_id']) ? (int) $filters['customer_id'] : null,
                 'date_to' => $asOfDate,
             ],
             'summary' => $summary,
@@ -224,6 +233,24 @@ class ReportService
                 'logo_order_sync.external_ref as logo_external_ref',
                 'logo_order_sync.last_synced_at as logo_last_synced_at',
             ])
+            ->selectSub(
+                DB::table('order_items')
+                    ->selectRaw('COALESCE(SUM(quantity), 0)')
+                    ->whereColumn('order_items.order_id', 'orders.id'),
+                'order_quantity'
+            )
+            ->selectSub(
+                DB::table('order_items')
+                    ->selectRaw('COALESCE(SUM(shipped_qty), 0)')
+                    ->whereColumn('order_items.order_id', 'orders.id'),
+                'shipped_quantity'
+            )
+            ->selectSub(
+                DB::table('order_items')
+                    ->selectRaw('COALESCE(SUM(CASE WHEN quantity > COALESCE(shipped_qty, 0) THEN quantity - COALESCE(shipped_qty, 0) ELSE 0 END), 0)')
+                    ->whereColumn('order_items.order_id', 'orders.id'),
+                'remaining_quantity'
+            )
             ->orderByDesc('orders.ordered_at')
             ->orderByDesc('orders.id')
             ->paginate($perPage)
@@ -248,6 +275,9 @@ class ReportService
                     'currency' => $row->currency,
                     'subtotal' => $this->money($row->subtotal),
                     'grand_total' => $this->money($row->grand_total),
+                    'order_quantity' => (int) $row->order_quantity,
+                    'shipped_quantity' => (int) $row->shipped_quantity,
+                    'remaining_quantity' => (int) $row->remaining_quantity,
                     'ordered_at' => $row->ordered_at,
                     'logo_sync_status' => $row->logo_sync_status,
                     'logo_sync_error' => $row->logo_sync_error,
@@ -519,6 +549,10 @@ class ReportService
             ->when($dealerId !== null, fn (QueryBuilder $query) => $query->where('orders.dealer_id', $dealerId))
             ->where('customers.source_system', 'logo')
             ->when(
+                ! empty($filters['customer_id']),
+                fn (QueryBuilder $q) => $q->where('orders.customer_id', (int) $filters['customer_id'])
+            )
+            ->when(
                 ! empty($filters['date_from']),
                 fn (QueryBuilder $q) => $q->whereDate('orders.ordered_at', '>=', (string) $filters['date_from'])
             )
@@ -602,6 +636,7 @@ class ReportService
             'report' => self::KEY_SALES,
             'filters' => [
                 'dealer_id' => $dealerId,
+                'customer_id' => isset($filters['customer_id']) ? (int) $filters['customer_id'] : null,
                 'date_from' => $filters['date_from'] ?? null,
                 'date_to' => $filters['date_to'] ?? null,
                 'breakdown' => $breakdown,
@@ -663,11 +698,27 @@ class ReportService
 
         $this->customerAccessScope->applyToCustomerOwnedQuery($query, $user, 'orders.customer_id');
 
-        if (! empty($filters['statuses']) && is_array($filters['statuses'])) {
-            $query->whereIn('orders.status', $filters['statuses']);
+        $statuses = collect(is_array($filters['statuses'] ?? null) ? $filters['statuses'] : [])
+            ->map(fn ($status) => strtolower(trim((string) $status)))
+            ->filter()
+            ->values();
+        $balanceFilterEnabled = $statuses->contains('balance');
+        $statusFilters = $statuses
+            ->reject(fn (string $status): bool => $status === 'balance')
+            ->values()
+            ->all();
+
+        if ($statusFilters !== []) {
+            $query->whereIn('orders.status', $statusFilters);
         } elseif ($lowerClosed !== []) {
             $placeholders = implode(', ', array_fill(0, count($lowerClosed), '?'));
             $query->whereRaw("LOWER(orders.status) NOT IN ({$placeholders})", $lowerClosed);
+        }
+
+        if ($balanceFilterEnabled) {
+            $query->whereHas('items', function (EloquentBuilder $itemQuery): void {
+                $itemQuery->whereColumn('order_items.quantity', '>', 'order_items.shipped_qty');
+            });
         }
 
         return $query;

@@ -95,6 +95,110 @@ run-sync-pos-expenses.cmd
 run-sync-documents-export.cmd
 ```
 
+## Urun Sync Icin Dayanikli Calisma Ayarlari
+
+Urun senkronu 502/timeout/network hatalarinda otomatik retry yapar, başarılı batchleri
+checkpoint dosyasına yazar ve hatalı batchleri loglara ekler. Aynı script tekrar
+çalıştırıldığında `SYNC_RESUME=true` ise kaldığı batch'ten devam eder.
+
+- `SYNC_RETRY_MAX`: Yeniden deneme sayısı (varsayılan `3`)
+- `SYNC_RETRY_BASE_DELAY_MS`: Başlangıç geri çekilme süresi, üstel olarak artar (varsayılan `3000`)
+- `SYNC_RESUME`: Başarılı son batch sonrası kaldığı yerden başlatma (varsayılan `true`)
+- `SYNC_STATE_FILE`: Checkpoint dosyası (varsayılan `.sync-state/products-sync-state.json`)
+- `SYNC_FAILED_FILE`: Başarısız batch raporu (varsayılan `.sync-state/products-sync-failed.jsonl`)
+- `SYNC_LOG_DIR`: Günlük dosyası dizini (varsayılan `logs`)
+- `SYNC_DISABLE_LOCK`: Çift çalışmayı engelleyen lock'u devre dışı bırakır (`true`/`false`)
+- `SYNC_CONTINUE_ON_ERROR`: Retry sonrası hatalı batch'leri atlayarak devam eder (`true`) veya durur (`false`)
+
+Örnek PowerShell kullanım:
+
+```powershell
+$env:SYNC_PRODUCTS_IMAGES_ONLY="true"
+$env:SYNC_RESUME="true"
+$env:SYNC_BATCH_SIZE="10"
+npm run sync:products
+```
+
+CMD örnekleri:
+
+```bat
+run-sync-product-stocks-fast.cmd
+run-sync-product-images.cmd
+run-sync-products.cmd
+```
+
+Hizli stok otomasyonu icin yeni `run-sync-product-stocks-fast.cmd` wrapper'i
+kullanilir. Bu mod full stock repair gibi tum urunleri taramaz; son hareket
+goren urunleri `STLINE`/`STFICHE` uzerinden lookback penceresinde bulur ve
+stok summary/view tablosundan minimum `stock_only` payload gonderir. Varsayilan
+lookback 10 dakikadir ve movement fallback kapali oldugu icin summary satiri
+olmayan urunler skip edilir.
+
+```powershell
+cd C:\PowersaB2B\tools\logo-sync
+.\run-sync-product-stocks-fast.cmd
+```
+
+Fast stock env ayarlari:
+
+- `SYNC_PRODUCTS_STOCK_FAST`: Hizli stok modunu acar.
+- `SYNC_PRODUCTS_STOCK_INCREMENTAL`: STLINE/STFICHE uzerinden degisen urunleri secer.
+- `SYNC_PRODUCTS_STOCK_LOOKBACK_MINUTES`: Geriye donuk hareket penceresi.
+- `SYNC_PRODUCTS_STOCK_SKIP_MOVEMENT_FALLBACK`: Summary yoksa agir movement fallback'e gitmez.
+- `SYNC_PRODUCTS_STOCK_REQUIRE_SUMMARY_ROW`: Summary stok satiri yoksa kaydi gondermez.
+- `SYNC_PRODUCTS_STOCK_STATE_FILE`: Fast stock run state dosyasi.
+- `SYNC_PRODUCTS_STOCK_INCLUDE_PRICE`: Fast stock payload'ina fiyat ekleme kontrolu.
+
+Fast catalog env ayarlari:
+
+- `SYNC_PRODUCTS_CATALOG_INCREMENTAL`: Urun kartlarini tam tarama yerine hizli secimle gonderir.
+- `SYNC_PRODUCTS_CATALOG_LOOKBACK_MINUTES`: Degisen/yeni urun kartlari icin geriye donuk pencere.
+- `SYNC_PRODUCTS_CATALOG_RECENT_LIMIT`: En yeni LOGICALREF araligindan her kosuda kontrol edilecek urun sayisi.
+- `SYNC_PRODUCTS_CATALOG_ROLLING_LIMIT`: Eski LOGICALREF araliklarini parca parca gezen ek pencere. `CS0040` gibi eski kartta yapilan degisikliklerin gece full sync beklemeden yakalanmasi icin kullanilir.
+- `SYNC_PRODUCTS_CATALOG_STATE_FILE`: Rolling katalog cursor state dosyasi.
+
+Image-only sync, Logo GO Wings tarafinda firma genel dokuman tablosundan resim
+okuyabilir. Canli firma 003 icin bulunan ornek mapping:
+
+```env
+LOGO_PRODUCT_IMAGE_TABLE=dbo.LG_003_FIRMDOC
+LOGO_PRODUCT_IMAGE_REF_COLUMN=INFOREF
+LOGO_PRODUCT_IMAGE_DATA_COLUMN=LDATA
+LOGO_PRODUCT_IMAGE_ORDER_COLUMN=LREF
+```
+
+Buyuk Logo resimleri API'ye ham 6-10 MB blob olarak gonderilmez. Image-only
+wrapper varsayilan olarak resmi client-side optimize eder, batch'i 1 tutar ve
+ayri state/failed dosyasi kullanir:
+
+```env
+SYNC_PRODUCT_IMAGE_OPTIMIZE=true
+SYNC_PRODUCT_IMAGE_MAX_WIDTH=1200
+SYNC_PRODUCT_IMAGE_JPEG_QUALITY=80
+SYNC_PRODUCT_IMAGE_TARGET_MAX_BYTES=1500000
+SYNC_PRODUCT_IMAGE_OUTPUT_FORMAT=jpeg
+SYNC_PRODUCT_IMAGE_ALLOW_ORIGINAL_IF_SMALL=true
+SYNC_PRODUCT_IMAGE_ORIGINAL_MAX_BYTES=1500000
+SYNC_BATCH_SIZE=1
+```
+
+Optimize icin `sharp` kullanilir. Windows Logo sunucusunda bu paket yoksa:
+
+```powershell
+npm install
+```
+
+Image-only test komutu:
+
+```powershell
+cd C:\PowersaB2B\tools\logo-sync
+.\run-sync-product-images.cmd
+```
+
+Eger optimize edilmis tekli payload'a ragmen 413 alinirsa Nginx/PHP/Laravel
+request limitleri gecici olarak 32M veya 64M seviyesine alinabilir. Yine de
+kalici tercih optimize edilmis gorsel veya dosya/storage/CDN mimarisidir.
+
 Saglik kontrolu:
 
 ```bat
@@ -115,6 +219,107 @@ Task Scheduler kaydi:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\register-logo-sync-task.ps1 -Mode all -IntervalMinutes 5
+```
+
+## Uretim Otomasyon Calisma Plani
+
+Uretimde manuel ve Task Scheduler calistirmalari sadece bu klasorden
+yapilmalidir:
+
+```bat
+cd /d C:\PowersaB2B\tools\logo-sync
+```
+
+Root klasorden `npm run ...` calistirmayin. Eski root log/lock/state dosyalari
+silmeden yerinde birakilabilir; aktif calisma kaynagi bu klasordeki wrapper
+dosyalaridir.
+
+Ilk manuel test sirasi:
+
+```bat
+run-sync-doctor.cmd
+run-sync-product-stocks.cmd
+run-sync-product-images.cmd
+run-sync-products.cmd
+run-sync-all.cmd
+```
+
+`run-sync-products.cmd` ve `run-sync-all.cmd` sadece dusuk trafik veya gece
+penceresinde denenmelidir. Gorsel sync ve full product sync ayni anda
+calistirilmamalidir.
+
+Gunduz sik calisacak isler:
+
+```bat
+run-sync-product-stocks-fast.cmd
+run-sync-customers.cmd
+run-sync-customers-export.cmd
+run-sync-ledger.cmd
+run-sync-collections.cmd
+run-sync-pos-sales.cmd
+run-sync-pos-expenses.cmd
+run-sync-documents-export.cmd
+```
+
+Gece calisacak agir isler:
+
+```bat
+run-sync-product-stocks.cmd
+run-sync-products.cmd
+run-sync-product-images.cmd
+```
+
+`sync:all` gunduz rutin otomasyona alinmamalidir; bakim veya kontrollu gece
+testi olarak kalmalidir.
+
+Uretim Task Scheduler gorevlerini tek seferde kaydetmek icin:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-production-tasks.ps1
+```
+
+Bu script gorevleri `MultipleInstances=IgnoreNew` ayariyla kaydeder ve calisma
+klasorunu bu dizin yapar. Varsayilan plan:
+
+- `Powersa Logo Product Stocks`: 5 dakikada bir
+- `Powersa Logo Customers Sync`: 1 dakikada bir
+- `Powersa Logo Customers Export`: 1 dakikada bir
+- `Powersa Logo Ledger Sync`: 5 dakikada bir
+- `Powersa Logo Collections Export`: 1 dakikada bir
+- `Powersa Logo POS Sales Export`: 1 dakikada bir
+- `Powersa Logo POS Expenses Export`: 1 dakikada bir
+- `Powersa Logo Documents Export`: 1 dakikada bir
+- `Powersa Logo Products Full Nightly`: her gece 01:00
+- `Powersa Logo Product Images Nightly`: her gece 02:30
+
+Gece product/gorsel gorevlerini kaydetmeden sadece hafif gunduz islerini kurmak
+icin:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-production-tasks.ps1 -SkipNightlyProducts -SkipNightlyImages
+```
+
+Daemon modu uzun vadede hizli isler icin kullanilabilir, ancak ilk uretim
+duzeninde ayri Task Scheduler gorevleri daha okunabilir ve daha kontrolludur.
+Full urun ve gorsel sync daemon icine alinmamalidir.
+
+Log kontrol sirasi:
+
+```text
+sync-products.log
+sync-product-images.log
+sync-customers.log
+sync-customers-export.log
+sync-ledger.log
+sync-collections.log
+sync-pos-sales.log
+sync-pos-expenses.log
+sync-documents-export.log
+sync-all.log
+sync-daemon.log
+sync-daemon-status.json
+.sync-state\products-sync-state.json
+.sync-state\products-sync-failed.jsonl
 ```
 
 Saniyelik entegrasyon icin onerilen yeni calisma sekli daemon modudur:
@@ -169,7 +374,8 @@ Logo yazma bloklari uygulanmis olmalidir.
 - Powersa API gelen kayitlari `insert/update` eder.
 - Ilk calistirmada tam senkron yapar.
 - Sonraki calismalarda `CAPIBLOCK_MODIFIEDDATE` + `LOGICALREF` uzerinden sadece degisen carileri gonderir.
-- Delta cursor bilgisi `SYNC_STATE_FILE` icinde tutulur.
+- `SYNC_CUSTOMERS_LOOKBACK_SECONDS` varsayilan `300` saniyedir; son cursor etrafinda kucuk bir pencereyi tekrar okuyarak Logo zaman hassasiyeti veya ayni saniye icindeki gec gelen cari guncellemelerinin kacirilmasini engeller.
+- Urun senkronu durum bilgisi `SYNC_STATE_FILE` içinde tutulur (`.sync-state/products-sync-state.json`).
 - Script tablo kolonlarini calisma aninda okur; bu sayede farkli Logo kurulumlarinda bulunan ek cari alanlari da `meta.integrations.logo.payload` altinda saklanir.
 - Cari kartinin ham satiri da `meta.integrations.logo.payload.raw` altina yazilir.
 - B2B'de acilan veya duzenlenen yerel cariler `GET /api/integrations/logo/customers/pending` kuyruguna duser. `logo-customers-export.mjs` bu kuyruktaki kayitlari `LOGO_CUSTOMER_EXPORT_PROCEDURE` ile Logo `LG_003_CLCARD` / Cari Hesap Karti ekranina yazar ve `POST /api/integrations/logo/customers/ack` ile sonucu isler. Kurulum SQL dosyasi: `sql/powersa-b2b-customer-write-procedure.sql`.
@@ -217,11 +423,12 @@ Logo yazma bloklari uygulanmis olmalidir.
 - Tahsilat kaydinda kasa bilgisi B2B'den `cashbox_id`, `cashbox_code`, `cashbox_name` olarak gelir. Script bu bilgiyi her zaman `@PayloadJson` icine koyar; procedure tarafinda `@CashboxId`, `@CashboxCode` veya `@CashboxName` parametreleri varsa bunlari otomatik algilayip direkt parametre olarak da gonderir. Kayitta kasa yoksa opsiyonel `LOGO_COLLECTION_DEFAULT_CASHBOX_ID`, `LOGO_COLLECTION_DEFAULT_CASHBOX_CODE`, `LOGO_COLLECTION_DEFAULT_CASHBOX_NAME` degerleri fallback olarak kullanilir.
 - `ExportKey` B2B tarafinda `B2B-COL-{id}` formatinda gelir ve Logo tarafinda idempotency anahtari olarak kullanilmalidir.
 - Musteri export tarafinda `ExportKey` degeri `B2B-CUST-{id}` formatindadir ve ayni sekilde idempotency icin kullanilmalidir.
-- Siparis, sevkiyat, iade ve hasar/ariza fire cikislari `logo-documents-export.mjs` tarafindan calistirilir. Sirayla `GET /orders/pending`, `GET /shipments/pending`, `GET /returns/pending`, `GET /return-scraps/pending` endpointlerinden kayit cekip `LOGO_ORDER_EXPORT_PROCEDURE`, `LOGO_SHIPMENT_EXPORT_PROCEDURE`, `LOGO_RETURN_EXPORT_PROCEDURE`, `LOGO_RETURN_SCRAP_EXPORT_PROCEDURE` sakli yordamlarina verir ve ilgili `ack` endpoint'lerine sonucu dondurur. `return`, `damaged` ve `faulty` taleplerinin ucu de `returns` endpointinden `(03) Toptan Satis Iade Faturasi` olarak aktarilir; `damaged` ve `faulty` talepleri buna ek olarak `return-scraps` endpointinden fire fisi olarak aktarilir. Siparis, sevkiyat ve POS satis uygulama dosyasi `sql/powersa-b2b-order-shipment-pos-write-procedure.sql` dosyasidir.
+- Siparis, sevkiyat, mal kabul, iade ve hasar/ariza fire cikislari `logo-documents-export.mjs` tarafindan calistirilir. Sirayla `GET /orders/pending`, `GET /shipments/pending`, `GET /purchase-receipts/pending`, `GET /returns/pending`, `GET /return-scraps/pending` endpointlerinden kayit cekip `LOGO_ORDER_EXPORT_PROCEDURE`, `LOGO_SHIPMENT_EXPORT_PROCEDURE`, `LOGO_PURCHASE_RECEIPT_EXPORT_PROCEDURE`, `LOGO_RETURN_EXPORT_PROCEDURE`, `LOGO_RETURN_SCRAP_EXPORT_PROCEDURE` sakli yordamlarina verir ve ilgili `ack` endpoint'lerine sonucu dondurur. `return`, `damaged` ve `faulty` taleplerinin ucu de `returns` endpointinden `(03) Toptan Satis Iade Faturasi` olarak aktarilir; `damaged` ve `faulty` talepleri buna ek olarak `return-scraps` endpointinden fire fisi olarak aktarilir. Siparis, sevkiyat ve POS satis uygulama dosyasi `sql/powersa-b2b-order-shipment-pos-write-procedure.sql` dosyasidir.
 - POS masraf export scripti B2B'den `GET /pos-expenses/pending` kayitlarini ceker, `LOGO_POS_EXPENSE_EXPORT_PROCEDURE` ile Logo tarafina kasa cikisi olarak yazar ve `POST /pos-expenses/ack` endpoint'ine sonucu dondurur. Uygulama dosyasi `sql/powersa-b2b-pos-expense-write-procedure.sql`; Logo tarafinda `KSLINES` uzerinden `TRCODE = 12` yazar.
 - POS masraf import scripti `logo-pos-expenses-sync.mjs`, Logo `KSLINES` uzerinden `TRCODE = 12` Batum kasa cikislarini okur ve `POST /pos-expenses/sync` endpoint'ine yollar. Tek basina calistirmak icin `run-sync-pos-expenses-from-logo.cmd` kullanilir. Varsayilan filtre kasa adinda `BATUM` arar; daha net filtre icin `.env` icinde `POWERSA_POS_EXPENSES_CASHBOX_CODE=100.01.002` veya `POWERSA_POS_EXPENSES_CASHBOX_NAME=...` verilebilir. Bu kayitlar B2B'deki acik POS oturumuna baglanir; acik oturum yoksa import bilerek durur.
 - Siparis procedure'u icin standart parametreler: `@CustomerExternalRef`, `@CustomerCode`, `@OrderDate`, `@OrderNo`, `@Currency`, `@Subtotal`, `@DiscountTotal`, `@VatTotal`, `@GrandTotal`, `@ExportKey`, `@PayloadJson`, `@ExternalRef OUTPUT`.
 - Sevkiyat procedure'u icin standart parametreler: `@CustomerExternalRef`, `@CustomerCode`, `@ShipmentDate`, `@ShipmentNo`, `@OrderNo`, `@WarehouseCode`, `@Subtotal`, `@VatTotal`, `@GrandTotal`, `@ExportKey`, `@PayloadJson`, `@ExternalRef OUTPUT`.
+- Mal kabul procedure'u icin standart parametreler: `@ReceiptDate`, `@ReceiptNo`, `@DocumentNo`, `@SupplierName`, `@WarehouseCode`, `@WarehouseName`, `@AcceptedQuantityTotal`, `@ExpectedQuantityTotal`, `@ExportKey`, `@PayloadJson`, `@ExternalRef OUTPUT`.
 - POS masraf procedure'u icin standart parametreler: `@ExpenseDate`, `@Category`, `@Amount`, `@Currency`, `@Note`, `@CashboxCode`, `@ExportKey`, `@PayloadJson`, `@ExternalRef OUTPUT`.
 - Iade procedure'u icin standart parametreler: `@CustomerExternalRef`, `@CustomerCode`, `@ReturnDate`, `@RequestNo`, `@ReturnType`, `@ReasonCode`, `@Amount`, `@Currency`, `@ExportKey`, `@PayloadJson`, `@ExternalRef OUTPUT`. Uygulama dosyasi `sql/powersa-b2b-return-write-procedure.sql`; Logo tarafinda `INVOICE/STFICHE/STLINE` uzerinden `TRCODE = 3` ve `GRPCODE = 2` ile `(03) Toptan Satis Iade Faturasi` yazar.
 - Fire fisi procedure'u icin standart parametreler: `@CustomerExternalRef`, `@CustomerCode`, `@ScrapDate`, `@DocumentNo`, `@RequestNo`, `@ReturnType`, `@ReasonCode`, `@Amount`, `@Currency`, `@ExportKey`, `@PayloadJson`, `@ExternalRef OUTPUT`. B2B `@DocumentNo` alanina cari kodunu gonderir; Logo tarafinda `STFICHE.DOCODE` bu degerle dolar.
@@ -256,7 +463,7 @@ Logo yazma bloklari uygulanmis olmalidir.
 Canli SQL makinede aktif klasor tek bir `C:\PowersaB2B` olmalidir. Temiz
 kurulumda aktif klasorde sunlar kalabilir:
 
-- `.env`, `.sync-state.json`, `.ledger-sync-state.json`
+- `.env`, `.sync-state/products-sync-state.json`, `.sync-state/products-sync-failed.jsonl`, `.ledger-sync-state.json`
 - `package.json`, `package-lock.json`, `node_modules`
 - `logo-*.mjs`, `logo-table-names.mjs`, `run-sync-*.cmd`
 - `bootstrap-logo-sync.ps1`, `register-logo-sync-task.ps1`,

@@ -1,31 +1,47 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowLeft,
+  Edit3,
   FileText,
   Loader2,
+  PackagePlus,
   PackageCheck,
   Printer,
+  RefreshCcw,
   Send,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import {
+  addWarehouseShipmentItem,
   deleteWarehouseShipmentItem,
   finalizeWarehouseShipment,
   getWarehouseShipment,
+  returnAllWarehouseShipmentItems,
   returnWarehouseShipmentItem,
   scanWarehouseShipment,
+  searchProducts,
+  updateWarehouseShipmentItemQuantity,
+  type ProductSearchItem,
   type WarehouseShipmentItemDto,
   type WarehouseShipmentState,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -78,6 +94,49 @@ function displayText(value: string | number | null | undefined): string {
   return normalized.length > 0 ? normalized : "-";
 }
 
+function parseOptionalNumber(value: string | number | null | undefined): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  const normalized = String(value ?? "").trim().replace(",", ".");
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseLabelPositiveInt(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isInteger(parsed) && parsed > 0) {
+    return parsed;
+  }
+
+  return fallback;
+}
+
+function parseScanCommand(value: string): { barcode: string; qty: number; hasQuantityPrefix: boolean } {
+  const normalized = value.trim();
+  const quantityMatch = normalized.match(/^(\d+)\s*\+\s*(.*)$/);
+
+  if (quantityMatch) {
+    const parsedQty = Number.parseInt(quantityMatch[1] ?? "", 10);
+    return {
+      barcode: (quantityMatch[2] ?? "").trim(),
+      qty: Number.isInteger(parsedQty) && parsedQty > 0 ? parsedQty : 1,
+      hasQuantityPrefix: true,
+    };
+  }
+
+  return {
+    barcode: normalized,
+    qty: 1,
+    hasQuantityPrefix: false,
+  };
+}
+
 function resolveItemCode(item: WarehouseShipmentItemDto): string | null {
   const code = (item.sku ?? item.oem ?? "").trim();
   return code.length > 0 ? code : null;
@@ -85,6 +144,11 @@ function resolveItemCode(item: WarehouseShipmentItemDto): string | null {
 
 function resolveShelfAddress(item: WarehouseShipmentItemDto): string {
   return displayText(item.shelf_address);
+}
+
+function availablePickQty(item: WarehouseShipmentItemDto): number {
+  const availableTotal = Math.max(0, item.logo_stock?.available_total ?? 0);
+  return Math.max(0, availableTotal - item.shipped_qty);
 }
 
 function maybeApiMessage(error: unknown): string {
@@ -99,7 +163,7 @@ function optimisticScan(
   source: WarehouseShipmentState,
   barcode: string,
   qty: number
-): { applied: boolean; reason?: "not_found" | "over_scan"; state: WarehouseShipmentState } {
+): { applied: boolean; reason?: "not_found" | "over_scan" | "out_of_stock"; state: WarehouseShipmentState } {
   const key = normalizeCode(barcode);
 
   const matcher = (item: WarehouseShipmentItemDto) => {
@@ -122,6 +186,10 @@ function optimisticScan(
 
   if (!baseItem || baseItem.remaining_qty < qty) {
     return { applied: false, reason: "over_scan", state: source };
+  }
+
+  if (availablePickQty(baseItem) < qty) {
+    return { applied: false, reason: "out_of_stock", state: source };
   }
 
   const unitPrice = Number(baseItem.unit_price);
@@ -248,9 +316,21 @@ function optimisticDeleteItem(
 
 export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const invoiceWindowRef = useRef<Window | null>(null);
   const [barcode, setBarcode] = useState("");
   const [warning, setWarning] = useState<string | null>(null);
+  const [packageNo, setPackageNo] = useState("1");
+  const [packageTotal, setPackageTotal] = useState("1");
+  const [packageDesi, setPackageDesi] = useState("1");
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    item: WarehouseShipmentItemDto;
+  } | null>(null);
+  const [addProductDialogOpen, setAddProductDialogOpen] = useState(false);
+  const [addProductSearch, setAddProductSearch] = useState("");
+  const [addProductQuantity, setAddProductQuantity] = useState("1");
+  const [quantityDialogItem, setQuantityDialogItem] = useState<WarehouseShipmentItemDto | null>(null);
+  const [quantityValue, setQuantityValue] = useState("1");
 
   const queryClient = useQueryClient();
   const queryKey = useMemo(() => ["warehouse", "shipment", shipmentId] as const, [shipmentId]);
@@ -262,20 +342,41 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
   });
 
   const shipmentState = shipmentQuery.data?.data;
+  const isReadOnly = shipmentState
+    ? ["shipped", "partially_shipped", "cancelled"].includes(shipmentState.shipment.status.toLowerCase())
+    : false;
+
+  const productSearchQuery = useQuery({
+    queryKey: ["warehouse", "shipment", shipmentId, "product-search", addProductSearch.trim()],
+    queryFn: () =>
+      searchProducts({
+        q: addProductSearch.trim(),
+        limit: 8,
+        include_equivalents: true,
+      }),
+    enabled: addProductDialogOpen && addProductSearch.trim().length >= 2 && !isReadOnly,
+    staleTime: 30_000,
+  });
+
+  const printSearchParams = useMemo(() => {
+    const safePackageNo = parseLabelPositiveInt(packageNo, 1);
+    const safePackageTotal = Math.max(safePackageNo, parseLabelPositiveInt(packageTotal, safePackageNo));
+    const query = new URLSearchParams({
+      package_no: String(safePackageNo),
+      package_total: String(safePackageTotal),
+      desi: String(parseLabelPositiveInt(packageDesi, 1)),
+    });
+
+    return query.toString();
+  }, [packageDesi, packageNo, packageTotal]);
 
   const printUrls = useMemo(
     () => ({
       packingSlip: `/warehouse/shipments/${shipmentId}/print/packing-slip`,
-      label: `/warehouse/shipments/${shipmentId}/print/label`,
+      label: `/warehouse/shipments/${shipmentId}/print/label?${printSearchParams}`,
     }),
-    [shipmentId]
+    [shipmentId, printSearchParams]
   );
-  const invoiceUrl = useMemo(() => {
-    const orderId = shipmentState?.shipment.order.id;
-
-    return orderId ? `/warehouse/orders/${orderId}/invoice` : null;
-  }, [shipmentState?.shipment.order.id]);
-
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
@@ -350,6 +451,24 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
     },
   });
 
+  const returnAllItemsMutation = useMutation({
+    mutationFn: () => returnAllWarehouseShipmentItems(shipmentId),
+    onError: (error) => {
+      const message = maybeApiMessage(error);
+      setWarning(message);
+      toast.error(message);
+    },
+    onSuccess: (response) => {
+      setWarning(null);
+      queryClient.setQueryData(queryKey, response);
+      toast.success("Tüm sevk satırları geri alındı");
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey });
+      inputRef.current?.focus();
+    },
+  });
+
   const deleteItemMutation = useMutation({
     mutationFn: (itemId: number) => deleteWarehouseShipmentItem(shipmentId, itemId),
     onMutate: async (itemId) => {
@@ -385,11 +504,14 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
     },
   });
 
-  const finalizeMutation = useMutation({
-    mutationFn: () => finalizeWarehouseShipment(shipmentId),
+  const addItemMutation = useMutation({
+    mutationFn: (payload: {
+      product_id: number;
+      quantity: number;
+      unit_net_price?: number | string | null;
+      tax_rate?: number | string | null;
+    }) => addWarehouseShipmentItem(shipmentId, payload),
     onError: (error) => {
-      invoiceWindowRef.current?.close();
-      invoiceWindowRef.current = null;
       const message = maybeApiMessage(error);
       setWarning(message);
       toast.error(message);
@@ -397,52 +519,82 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
     onSuccess: (response) => {
       setWarning(null);
       queryClient.setQueryData(queryKey, response);
-      const nextInvoiceUrl = response.data.shipment.order.id
-        ? `/warehouse/orders/${response.data.shipment.order.id}/invoice`
-        : invoiceUrl;
+      setAddProductDialogOpen(false);
+      setAddProductSearch("");
+      setAddProductQuantity("1");
+      toast.success("Ürün siparişe eklendi");
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey });
+      inputRef.current?.focus();
+    },
+  });
 
-      if (invoiceWindowRef.current && nextInvoiceUrl) {
-        invoiceWindowRef.current.location.href = nextInvoiceUrl;
-        invoiceWindowRef.current = null;
-        toast.success("Fatura hazırlandı, çıktı ekranı açıldı");
-        return;
-      }
+  const updateQuantityMutation = useMutation({
+    mutationFn: (payload: { item_id: number; quantity: number }) =>
+      updateWarehouseShipmentItemQuantity(shipmentId, payload.item_id, { quantity: payload.quantity }),
+    onError: (error) => {
+      const message = maybeApiMessage(error);
+      setWarning(message);
+      toast.error(message);
+    },
+    onSuccess: (response) => {
+      setWarning(null);
+      queryClient.setQueryData(queryKey, response);
+      setQuantityDialogItem(null);
+      toast.success("Miktar güncellendi");
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey });
+      inputRef.current?.focus();
+    },
+  });
 
-      toast.success("Sevkiyat finalize edildi");
+  const finalizeMutation = useMutation({
+    mutationFn: () => finalizeWarehouseShipment(shipmentId),
+    onError: (error) => {
+      const message = maybeApiMessage(error);
+      setWarning(message);
+      toast.error(message);
+    },
+    onSuccess: (response) => {
+      setWarning(null);
+      queryClient.setQueryData(queryKey, response);
+      toast.success(response.data.message ?? "Fatura Logo'ya aktarıldı");
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey });
     },
   });
 
-  const handleFinalizeAndPrint = () => {
-    if (!invoiceUrl) {
-      toast.error("Fatura çıktısı için sipariş bilgisi bulunamadı");
-      return;
-    }
-
-    invoiceWindowRef.current = window.open("", "_blank");
-    invoiceWindowRef.current?.document.write(
-      "<!doctype html><title>Fatura hazırlanıyor</title><body style='font-family:Arial;padding:24px'>Fatura hazırlanıyor...</body>"
-    );
+  const handleFinalizeInvoice = () => {
     finalizeMutation.mutate();
   };
 
   const handleScanSubmit = (event?: FormEvent) => {
     event?.preventDefault();
 
-    const current = barcode.trim();
+    const command = parseScanCommand(barcode);
+    const current = command.barcode;
     if (!current) {
+      if (command.hasQuantityPrefix) {
+        const message = "Miktar girildi; ürün satırına tıklayın veya barkodu yazın.";
+        setWarning(message);
+        toast.warning(message);
+        inputRef.current?.focus();
+      }
       return;
     }
 
-    const qty = 1;
+    const qty = command.qty;
     if (shipmentState) {
       const optimistic = optimisticScan(shipmentState, current, qty);
       if (!optimistic.applied) {
         const message =
           optimistic.reason === "not_found"
             ? "Okutulan barkod bu sevkiyat satırlarında bulunamadı."
+            : optimistic.reason === "out_of_stock"
+              ? "Okutulan adet mevcut stoğu aşıyor."
             : "Okutulan adet kalan miktarı aşıyor.";
         setWarning(message);
         toast.warning(message);
@@ -457,7 +609,7 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
     scanMutation.mutate({ barcode: current, qty });
   };
 
-  const scanByItem = (item: WarehouseShipmentItemDto, qty = 1) => {
+  const scanByItem = (item: WarehouseShipmentItemDto, qty = 1, clearQuantityPrefix = false) => {
     const code = resolveItemCode(item);
     if (!code) {
       const message = "Bu satır için okutma kodu bulunamadı (SKU/OEM yok).";
@@ -480,6 +632,8 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
         const message =
           optimistic.reason === "not_found"
             ? "Seçilen satır için barkod bulunamadı."
+            : optimistic.reason === "out_of_stock"
+              ? "Seçilen miktar mevcut stoğu aşıyor."
             : "Okutulan adet kalan miktarı aşıyor.";
         setWarning(message);
         toast.warning(message);
@@ -489,12 +643,25 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
     }
 
     setWarning(null);
+    if (clearQuantityPrefix) {
+      setBarcode("");
+    }
     inputRef.current?.focus();
     scanMutation.mutate({ barcode: code, qty: safeQty });
   };
 
-  const scanFullItem = (item: WarehouseShipmentItemDto) => {
-    scanByItem(item, item.remaining_qty);
+  const returnAllShippedItems = () => {
+    if (
+      isReadOnly ||
+      returnAllItemsMutation.isPending ||
+      !shipmentState ||
+      shipmentState.shipped_items.length === 0
+    ) {
+      return;
+    }
+
+    setWarning(null);
+    returnAllItemsMutation.mutate();
   };
 
   const returnFullShippedItem = (item: WarehouseShipmentItemDto) => {
@@ -513,6 +680,63 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
 
     setWarning(null);
     deleteItemMutation.mutate(item.id);
+  };
+
+  const openRowMenu = (event: MouseEvent, item: WarehouseShipmentItemDto) => {
+    if (isReadOnly) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      x: Math.min(event.clientX, window.innerWidth - 220),
+      y: Math.min(event.clientY, window.innerHeight - 118),
+      item,
+    });
+  };
+
+  const openAddProductDialog = () => {
+    setContextMenu(null);
+    setAddProductDialogOpen(true);
+  };
+
+  const openQuantityDialog = (item: WarehouseShipmentItemDto) => {
+    setContextMenu(null);
+    setQuantityDialogItem(item);
+    setQuantityValue(String(item.ordered_qty));
+  };
+
+  const addProductToShipment = (product: ProductSearchItem) => {
+    const quantity = Number.parseInt(addProductQuantity, 10);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      toast.warning("Eklenecek miktar en az 1 olmalı");
+      return;
+    }
+
+    addItemMutation.mutate({
+      product_id: product.id,
+      quantity,
+      unit_net_price: parseOptionalNumber(product.net_price),
+      tax_rate: parseOptionalNumber(product.vat_rate),
+    });
+  };
+
+  const saveQuantity = () => {
+    if (!quantityDialogItem) {
+      return;
+    }
+
+    const quantity = Number.parseInt(quantityValue, 10);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      toast.warning("Miktar en az 1 olmalı");
+      return;
+    }
+
+    updateQuantityMutation.mutate({
+      item_id: quantityDialogItem.id,
+      quantity,
+    });
   };
 
   if (shipmentQuery.isLoading) {
@@ -551,13 +775,13 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
   }
 
   const shipment = shipmentState.shipment;
-  const isReadOnly = ["shipped", "partially_shipped", "cancelled"].includes(
-    shipment.status.toLowerCase()
-  );
+  const orderTotal = shipment.order.grand_total ?? shipmentState.totals.gonderilen_tutar;
   const shipmentItemCount = new Set([
     ...shipmentState.remaining_items.map((item) => item.id),
     ...shipmentState.shipped_items.map((item) => item.id),
   ]).size;
+  const hasShippedRows = shipmentState.shipped_items.length > 0;
+  const canReturnAll = !isReadOnly && hasShippedRows && !returnAllItemsMutation.isPending;
   const customer = shipment.order.customer;
   const customerLocation = [customer.city, customer.district]
     .map((value) => String(value ?? "").trim())
@@ -565,8 +789,25 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
     .join(" / ");
 
   return (
-    <div className="point-sale-screen warehouse-shipment-clean space-y-4 rounded-[24px] border border-[var(--point-border)] bg-[#071018] p-3 text-[#eef8ef] shadow-[0_30px_90px_-54px_rgba(0,0,0,0.95)]" data-point-theme="dark">
+    <div
+      className="point-sale-screen warehouse-shipment-clean space-y-4 rounded-[24px] border border-[var(--point-border)] bg-[#071018] p-3 text-[#eef8ef] shadow-[0_30px_90px_-54px_rgba(0,0,0,0.95)]"
+      data-point-theme="dark"
+      onClick={() => setContextMenu(null)}
+    >
       <section className="point-panel point-product-panel rounded-[22px] border p-4">
+        <div className="mb-3 flex justify-start">
+          <Button
+            type="button"
+            variant="ghost"
+            asChild
+            className="h-10 rounded-[12px] px-3 text-sm font-black !text-[#dcebe0] hover:!bg-[#1c3928] hover:!text-white"
+          >
+            <Link href="/warehouse">
+              <ArrowLeft className="h-4 w-4" /> Geri
+            </Link>
+          </Button>
+        </div>
+
         <div className="mb-4 grid gap-3">
           <div className="warehouse-summary-card min-w-0 rounded-[18px] border border-emerald-300/35 bg-[linear-gradient(135deg,#1f6b45_0%,#2f7650_55%,#416650_100%)] p-3 shadow-[0_20px_48px_-36px_rgba(31,107,69,0.65),inset_0_1px_0_rgba(255,255,255,0.10)]">
             <div className="grid min-h-[86px] gap-3 xl:grid-cols-[46px_140px_minmax(280px,0.95fr)_minmax(520px,1.55fr)] xl:items-center">
@@ -628,7 +869,7 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
                   }
                 }}
                 className="h-20 rounded-none border-0 bg-transparent text-xl font-black text-white shadow-none placeholder:text-[var(--point-muted)] focus-visible:ring-0"
-                placeholder="Barkod / stok kodu okut"
+	                placeholder="Barkod / stok kodu okut"
               />
               <Button
                 type="button"
@@ -643,30 +884,82 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
             </div>
           </label>
 
-          <div className="grid grid-cols-[0.52fr_1fr_1fr_1fr] gap-3">
-            <div className="flex h-20 w-full flex-col items-center justify-center gap-1.5 rounded-[16px] border border-[#faee56]/35 bg-[#4d4310]/45 px-2 text-center text-[10px] font-black text-[#fff8a8]">
-              <span className="uppercase leading-tight tracking-[0.08em]">Sipariş Tutarı</span>
-              <span className="text-sm leading-none text-white">{toPlainMoney(shipmentState.totals.gonderilen_tutar)}</span>
+          <div className="space-y-2">
+            <div className="grid grid-cols-3 gap-2">
+              <label className="block">
+                <span className="mb-1 block text-[10px] font-black uppercase tracking-[0.08em] text-[var(--point-muted-strong)]">
+                  Koli No
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  value={packageNo}
+                  onChange={(event) => setPackageNo(event.target.value)}
+                  className="h-10 text-sm font-bold"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[10px] font-black uppercase tracking-[0.08em] text-[var(--point-muted-strong)]">
+                  Toplam Koli
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  value={packageTotal}
+                  onChange={(event) => setPackageTotal(event.target.value)}
+                  className="h-10 text-sm font-bold"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[10px] font-black uppercase tracking-[0.08em] text-[var(--point-muted-strong)]">
+                  Desi
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  value={packageDesi}
+                  onChange={(event) => setPackageDesi(event.target.value)}
+                  className="h-10 text-sm font-bold"
+                />
+              </label>
             </div>
-            <Button type="button" variant="outline" className="point-secondary-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black" asChild>
-              <a href={printUrls.packingSlip} target="_blank" rel="noreferrer">
-                <Printer className="h-5 w-5" /> Depo Transfer
-              </a>
-            </Button>
-            <Button type="button" className="point-primary-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black" asChild>
-              <a href={printUrls.label} target="_blank" rel="noreferrer">
-                <Printer className="h-5 w-5" /> Kargo Etiketi
-              </a>
-            </Button>
-            <Button
-              type="button"
-              className="point-yellow-action-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black"
-              onClick={handleFinalizeAndPrint}
-              disabled={finalizeMutation.isPending || shipmentState.totals.shipped_qty_total <= 0 || !invoiceUrl}
-            >
-              {finalizeMutation.isPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileText className="h-5 w-5" />}
-              Fatura Aktar
-            </Button>
+
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-[0.52fr_1fr_1fr_1fr_1fr]">
+              <div className="flex h-20 w-full flex-col items-center justify-center gap-1.5 rounded-[16px] border border-[#faee56]/35 bg-[#4d4310]/45 px-2 text-center text-[10px] font-black text-[#fff8a8]">
+                <span className="uppercase leading-tight tracking-[0.08em]">Sipariş Tutarı</span>
+                <span className="text-sm leading-none text-white">{toPlainMoney(orderTotal)}</span>
+              </div>
+              <Button type="button" variant="outline" className="point-secondary-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black" asChild>
+                <a href={printUrls.packingSlip} target="_blank" rel="noreferrer">
+                  <Printer className="h-5 w-5" /> Depo Transfer
+                </a>
+              </Button>
+              <Button type="button" className="point-primary-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black" asChild>
+                <a href={printUrls.label} target="_blank" rel="noreferrer">
+                  <Printer className="h-5 w-5" /> Kargo Etiketi
+                </a>
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="point-secondary-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black"
+                onClick={returnAllShippedItems}
+                disabled={!canReturnAll}
+                title="Sevk edilen ürünleri tekrar sipariş listesine al"
+              >
+                {returnAllItemsMutation.isPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <RefreshCcw className="h-5 w-5" />}
+                Sipariş Düzelt
+              </Button>
+              <Button
+                type="button"
+                className="point-yellow-action-button h-20 w-full flex-col gap-1.5 rounded-[16px] text-center text-[11px] font-black"
+                onClick={handleFinalizeInvoice}
+                disabled={finalizeMutation.isPending || shipmentState.totals.shipped_qty_total <= 0}
+              >
+                {finalizeMutation.isPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileText className="h-5 w-5" />}
+                Fatura Aktar
+              </Button>
+            </div>
           </div>
         </div>
       </section>
@@ -686,9 +979,8 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
         </div>
         <div className="max-h-[30vh] min-w-[1140px] overflow-auto border-t border-[var(--point-border)] bg-[var(--point-control)]">
           <Table className="text-[12px]">
-            <TableHeader className="sticky top-0 z-10 bg-[linear-gradient(135deg,#1f6b45_0%,#2f7650_55%,#416650_100%)]">
+              <TableHeader className="sticky top-0 z-10 bg-[linear-gradient(135deg,#1f6b45_0%,#2f7650_55%,#416650_100%)]">
               <TableRow className="border-b border-emerald-300/35 hover:bg-transparent">
-                <TableHead className="h-10 w-[42px] border-r border-emerald-300/25 px-3 text-center text-white">&gt;</TableHead>
                 <TableHead className="h-10 w-[130px] border-r border-emerald-300/25 px-4 text-white">Ürün Kodu</TableHead>
                 <TableHead className="h-10 min-w-[340px] border-r border-emerald-300/25 px-4 text-white">Ürün Adı</TableHead>
                 <TableHead className="h-10 w-[100px] border-r border-emerald-300/25 px-4 text-center text-white">Raf</TableHead>
@@ -706,18 +998,19 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
                   <TableCell colSpan={10} className="py-10 text-center text-base font-black text-[var(--point-muted)]">Kalan ürün yok.</TableCell>
                 </TableRow>
               ) : (
-                shipmentState.remaining_items.map((item) => (
-                  <TableRow
-                    key={item.id}
-                    className="h-12 cursor-pointer border-b border-[var(--point-border)] text-[var(--point-text)] transition-colors hover:bg-[var(--point-control-strong)]"
-                    title="Satıra basınca kalan adedin tamamı sevk edilir"
-                    onClick={() => {
-                      if (!scanMutation.isPending && !isReadOnly && item.remaining_qty > 0) {
-                        scanFullItem(item);
-                      }
-                    }}
-                  >
-                    <TableCell className="border-r border-[var(--point-border)] px-3 text-center font-black text-[#faee56]">&gt;</TableCell>
+	                shipmentState.remaining_items.map((item) => (
+	                  <TableRow
+	                    key={item.id}
+	                    className="h-12 cursor-pointer border-b border-[var(--point-border)] text-[var(--point-text)] transition-colors hover:bg-[var(--point-control-strong)]"
+	                    title="Sol tık: 1 adet sevk eder. 5+ yazıp tıklarsanız 5 adet sevk eder. Sağ tık: ürün ekle / miktar düzenle"
+	                    onContextMenu={(event) => openRowMenu(event, item)}
+	                    onClick={() => {
+	                      if (!scanMutation.isPending && !isReadOnly && item.remaining_qty > 0) {
+	                        const command = parseScanCommand(barcode);
+	                        scanByItem(item, command.hasQuantityPrefix ? command.qty : 1, command.hasQuantityPrefix);
+	                      }
+	                    }}
+	                  >
                     <TableCell className="border-r border-[var(--point-border)] px-4 text-base font-black">{displayText(item.sku)}</TableCell>
                     <TableCell className="border-r border-[var(--point-border)] px-4 text-sm font-black">{displayText(item.name)}</TableCell>
                     <TableCell className="border-r border-[var(--point-border)] px-4 text-center font-black text-[#e6f3e9]">{resolveShelfAddress(item)}</TableCell>
@@ -751,13 +1044,37 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
         <p className="border-t border-[var(--point-border)] px-4 py-2 text-sm font-black text-[var(--point-muted-strong)]">Toplam: {shipmentState.remaining_items.length}</p>
       </section>
 
+      {contextMenu ? (
+        <div
+          className="fixed z-50 w-[210px] overflow-hidden rounded-[14px] border border-emerald-300/35 bg-[#071018] p-1.5 text-[#eef8ef] shadow-[0_22px_70px_-28px_rgba(0,0,0,0.96)]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 rounded-[10px] px-3 py-2 text-left text-sm font-black text-[#d9ffe1] hover:bg-[#1f6b45]/60"
+            onClick={openAddProductDialog}
+          >
+            <PackagePlus className="h-4 w-4" /> Ürün Ekle
+          </button>
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 rounded-[10px] px-3 py-2 text-left text-sm font-black text-[#d6f0ff] hover:bg-[#0d3b52]/70"
+            onClick={() => openQuantityDialog(contextMenu.item)}
+          >
+            <Edit3 className="h-4 w-4" /> Miktar Düzenle
+          </button>
+        </div>
+      ) : null}
+
       <section className="point-table overflow-x-auto rounded-[14px] border">
         <div className="px-4 py-3">
           <p className="text-sm font-black uppercase tracking-[0.12em] text-white">Sevk Edilen Ürünler</p>
         </div>
-        <div className="max-h-[22vh] min-w-[940px] overflow-auto border-t border-[var(--point-border)] bg-[var(--point-control)]">
+        <div className="min-w-[940px] border-t border-[var(--point-border)] bg-[var(--point-control)]">
           <Table className="text-[12px]">
-            <TableHeader className="sticky top-0 z-10 bg-[linear-gradient(135deg,#1f6b45_0%,#2f7650_55%,#416650_100%)]">
+            <TableHeader className="bg-[linear-gradient(135deg,#1f6b45_0%,#2f7650_55%,#416650_100%)]">
               <TableRow className="border-b border-emerald-300/35 hover:bg-transparent">
                 <TableHead className="h-10 w-[150px] px-4 text-white">Ürün Kodu</TableHead>
                 <TableHead className="h-10 min-w-[340px] px-4 text-white">Ürün Adı</TableHead>
@@ -806,6 +1123,133 @@ export function WarehouseShipmentDetailPage({ shipmentId }: { shipmentId: string
           </Table>
         </div>
       </section>
+
+      <Dialog open={addProductDialogOpen} onOpenChange={setAddProductDialogOpen}>
+        <DialogContent className="max-h-[88vh] max-w-[760px] overflow-hidden rounded-[22px] border border-emerald-900/80 bg-[#071018] p-0 text-[#eef8ef] shadow-[0_34px_110px_-42px_rgba(0,0,0,0.92)]">
+          <DialogHeader className="mb-0 border-b border-emerald-900/70 bg-[linear-gradient(135deg,#102019_0%,#071018_55%,#0c1c24_100%)] px-6 py-5 pr-12">
+            <DialogTitle className="text-2xl font-black text-white">Ürün Ekle</DialogTitle>
+            <DialogDescription className="text-sm font-semibold text-[#9fb2a7]">
+              Bu müşterinin sevkiyat siparişine yeni ürün ekler.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 overflow-y-auto px-6 py-5">
+            <div className="grid gap-3 sm:grid-cols-[1fr_120px]">
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-black uppercase tracking-[0.08em] text-[var(--point-muted-strong)]">
+                  Ürün / Barkod Ara
+                </span>
+                <Input
+                  value={addProductSearch}
+                  onChange={(event) => setAddProductSearch(event.target.value)}
+                  className="h-12 border-emerald-900/70 bg-[#0c151d] text-base font-black text-white placeholder:text-[#63746b]"
+                  placeholder="Ürün kodu, barkod veya ad"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-black uppercase tracking-[0.08em] text-[var(--point-muted-strong)]">
+                  Miktar
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  value={addProductQuantity}
+                  onChange={(event) => setAddProductQuantity(event.target.value)}
+                  className="h-12 border-emerald-900/70 bg-[#0c151d] text-base font-black text-white"
+                />
+              </label>
+            </div>
+
+            <div className="max-h-[48vh] overflow-auto rounded-[14px] border border-emerald-900/70">
+              {addProductSearch.trim().length < 2 ? (
+                <p className="px-4 py-8 text-center text-sm font-black text-[var(--point-muted)]">
+                  Ürün aramak için en az 2 karakter yazın.
+                </p>
+              ) : productSearchQuery.isLoading ? (
+                <p className="flex items-center justify-center gap-2 px-4 py-8 text-sm font-black text-[var(--point-muted)]">
+                  <Loader2 className="h-4 w-4 animate-spin" /> Ürünler aranıyor...
+                </p>
+              ) : (productSearchQuery.data?.data.length ?? 0) === 0 ? (
+                <p className="px-4 py-8 text-center text-sm font-black text-[var(--point-muted)]">
+                  Ürün bulunamadı.
+                </p>
+              ) : (
+                <div className="divide-y divide-emerald-900/60">
+                  {productSearchQuery.data?.data.map((product) => (
+                    <div key={product.id} className="grid gap-3 bg-[#08131a] px-4 py-3 sm:grid-cols-[1fr_120px] sm:items-center">
+                      <div className="min-w-0">
+                        <p className="truncate text-base font-black text-white">{displayText(product.sku)}</p>
+                        <p className="mt-0.5 line-clamp-2 text-sm font-bold text-[#cfe1d2]">{displayText(product.name)}</p>
+                        <p className="mt-1 text-xs font-black text-[#9fb2a7]">
+                          Stok: {product.available_total ?? 0} · Fiyat: {displayText(product.net_price)}
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        className="point-primary-button h-11 rounded-[12px] text-sm font-black"
+                        onClick={() => addProductToShipment(product)}
+                        disabled={addItemMutation.isPending}
+                      >
+                        {addItemMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <PackagePlus className="h-4 w-4" />}
+                        Ekle
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={quantityDialogItem !== null} onOpenChange={(open) => !open && setQuantityDialogItem(null)}>
+        <DialogContent className="max-w-md rounded-[22px] border border-emerald-900/80 bg-[#071018] p-0 text-[#eef8ef]">
+          <DialogHeader className="mb-0 border-b border-emerald-900/70 px-6 py-5 pr-12">
+            <DialogTitle className="text-xl font-black text-white">Miktar Düzenle</DialogTitle>
+            <DialogDescription className="text-sm font-semibold text-[#9fb2a7]">
+              {quantityDialogItem ? `${displayText(quantityDialogItem.sku)} - ${displayText(quantityDialogItem.name)}` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="px-6 py-5">
+            <label className="block">
+              <span className="mb-1 block text-[11px] font-black uppercase tracking-[0.08em] text-[var(--point-muted-strong)]">
+                Sipariş Miktarı
+              </span>
+              <Input
+                type="number"
+                min={Math.max(1, quantityDialogItem?.shipped_qty ?? 0)}
+                value={quantityValue}
+                onChange={(event) => setQuantityValue(event.target.value)}
+                className="h-12 border-emerald-900/70 bg-[#0c151d] text-base font-black text-white"
+              />
+            </label>
+            {quantityDialogItem && quantityDialogItem.shipped_qty > 0 ? (
+              <p className="mt-2 text-xs font-bold text-amber-200">
+                Sevk edilen adet: {quantityDialogItem.shipped_qty}. Miktar bunun altına indirilemez.
+              </p>
+            ) : null}
+          </div>
+          <DialogFooter className="mt-0 border-t border-emerald-900/70 px-6 py-4">
+            <Button
+              type="button"
+              variant="outline"
+              className="point-secondary-button rounded-[12px] font-black"
+              onClick={() => setQuantityDialogItem(null)}
+            >
+              Vazgeç
+            </Button>
+            <Button
+              type="button"
+              className="point-primary-button rounded-[12px] font-black"
+              onClick={saveQuantity}
+              disabled={updateQuantityMutation.isPending}
+            >
+              {updateQuantityMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Edit3 className="h-4 w-4" />}
+              Kaydet
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

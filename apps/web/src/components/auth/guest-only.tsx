@@ -12,7 +12,7 @@ export function GuestOnly({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (isAuthenticated) {
-      const roleSlugs = user?.roles.map((role) => role.slug) ?? [];
+      const roleSlugs = Array.isArray(user?.roles) ? user.roles.map((role) => role.slug) : [];
       const hasRole = (slug: string) => roleSlugs.includes(slug);
       const isWarehouseOnly =
         hasRole("warehouse") && !hasRole("admin") && !hasRole("dealer_admin") && !hasRole("salesperson");

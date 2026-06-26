@@ -28,6 +28,7 @@ class CustomerSelectionResource extends JsonResource
 
         return [
             'id' => $this->id,
+            'dealer_id' => $this->dealer_id !== null ? (int) $this->dealer_id : null,
             'code' => $this->code,
             'title' => $title,
             'city' => $city,

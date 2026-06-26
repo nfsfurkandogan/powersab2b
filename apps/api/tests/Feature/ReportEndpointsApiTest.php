@@ -13,7 +13,9 @@ use App\Models\Role;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
@@ -51,6 +53,34 @@ class ReportEndpointsApiTest extends TestCase
             ->assertJsonPath('data.0.aging.0_30', '100.00')
             ->assertJsonPath('data.0.aging.31_60', '200.00')
             ->assertJsonPath('data.0.aging.60_plus', '300.00');
+    }
+
+    public function test_customer_balance_report_can_be_filtered_by_customer_id(): void
+    {
+        $dealer = $this->createDealer('DLR-RPT-CB-FILTER');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        $customerA = $this->createCustomer($dealer, 'CBF-001', 'Cari Filtre A', [
+            'salesperson_user_id' => $user->id,
+        ]);
+        $customerB = $this->createCustomer($dealer, 'CBF-002', 'Cari Filtre B', [
+            'salesperson_user_id' => $user->id,
+        ]);
+        $asOfDate = Carbon::create(2026, 3, 1)->toDateString();
+
+        $this->insertLedgerDebit($dealer->id, $customerA->id, 120.00, Carbon::parse($asOfDate)->subDays(10)->toDateString());
+        $this->insertLedgerDebit($dealer->id, $customerB->id, 280.00, Carbon::parse($asOfDate)->subDays(10)->toDateString());
+
+        $this->actingAs($user);
+
+        $response = $this->getJson('/api/reports/customer-balances?date_to='.$asOfDate.'&customer_id='.$customerB->id.'&per_page=10');
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('filters.customer_id', $customerB->id)
+            ->assertJsonPath('summary.customer_count', 1)
+            ->assertJsonPath('summary.balance_total', '280.00')
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.customer_id', $customerB->id);
     }
 
     public function test_order_balances_returns_open_orders_summary_and_status_breakdown(): void
@@ -116,6 +146,57 @@ class ReportEndpointsApiTest extends TestCase
             ->assertJsonFragment(['logo_sync_status' => 'synced'])
             ->assertJsonFragment(['logo_external_ref' => 'LOGO-ORD-001'])
             ->assertJsonFragment(['status' => 'approved']);
+    }
+
+    public function test_order_balances_can_filter_orders_with_remaining_quantity_balance(): void
+    {
+        $dealer = $this->createDealer('DLR-RPT-OB-BAL');
+        $user = $this->createUserWithRole('salesperson', $dealer);
+        $customer = $this->createCustomer($dealer, 'OBB-001', 'Bakiye Musteri', [
+            'salesperson_user_id' => $user->id,
+        ]);
+
+        $this->createOrderWithItem($dealer, $customer, $user, [
+            'order_no' => 'ORD-BALANCE-001',
+            'status' => 'picking',
+            'ordered_at' => '2026-02-13 10:00:00',
+            'quantity' => 5,
+            'shipped_qty' => 4,
+            'line_total' => 500.00,
+        ]);
+
+        $this->createOrderWithItem($dealer, $customer, $user, [
+            'order_no' => 'ORD-BALANCE-FULL',
+            'status' => 'packed',
+            'ordered_at' => '2026-02-13 11:00:00',
+            'quantity' => 5,
+            'shipped_qty' => 5,
+            'line_total' => 500.00,
+        ]);
+
+        $this->createOrderWithItem($dealer, $customer, $user, [
+            'order_no' => 'ORD-BALANCE-CLOSED',
+            'status' => 'completed',
+            'ordered_at' => '2026-02-13 12:00:00',
+            'quantity' => 5,
+            'shipped_qty' => 4,
+            'line_total' => 500.00,
+        ]);
+
+        $this->actingAs($user);
+
+        $response = $this->getJson('/api/reports/order-balances?statuses=balance&per_page=50');
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('filters.statuses.0', 'balance')
+            ->assertJsonPath('summary.open_order_count', 1)
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.order_no', 'ORD-BALANCE-001')
+            ->assertJsonPath('data.0.status', 'picking')
+            ->assertJsonPath('data.0.order_quantity', 5)
+            ->assertJsonPath('data.0.shipped_quantity', 4)
+            ->assertJsonPath('data.0.remaining_quantity', 1);
     }
 
     public function test_sales_report_supports_product_brand_and_customer_breakdowns(): void
@@ -217,6 +298,16 @@ class ReportEndpointsApiTest extends TestCase
             ->assertJsonCount(2, 'data')
             ->assertJsonFragment(['code' => 'SL-001'])
             ->assertJsonFragment(['code' => 'SL-002']);
+
+        $filteredResponse = $this->getJson($baseUrl.'&breakdown=product&customer_id='.$customerA->id);
+        $filteredResponse
+            ->assertOk()
+            ->assertJsonPath('filters.customer_id', $customerA->id)
+            ->assertJsonPath('summary.order_count', 1)
+            ->assertJsonPath('summary.quantity_total', 3)
+            ->assertJsonPath('summary.net_total', '300.00')
+            ->assertJsonCount(1, 'data')
+            ->assertJsonFragment(['name' => 'Urun A']);
     }
 
     public function test_admin_without_dealer_context_reads_all_dealers(): void
@@ -299,6 +390,232 @@ class ReportEndpointsApiTest extends TestCase
             ->assertJsonPath('data.0.customer_id', $trabzonCustomer->id);
     }
 
+    public function test_logo_dashboard_reports_bidirectional_sync_state_and_latest_sync(): void
+    {
+        Http::fake([
+            'www.tcmb.gov.tr/*' => Http::response('', 500),
+        ]);
+
+        $dealer = $this->createDealer('DLR-RPT-LOGO');
+        $admin = $this->createUserWithRole('admin');
+        $customer = $this->createCustomer($dealer, 'LOGO-001', 'Logo Cari');
+        $inboundSyncedAt = Carbon::parse('2026-02-15 10:00:00');
+        $outboundSyncedAt = Carbon::parse('2026-02-15 10:05:00');
+
+        IntegrationSyncState::query()->create([
+            'system' => 'logo',
+            'domain' => 'customers',
+            'direction' => 'inbound',
+            'entity_type' => Customer::class,
+            'entity_id' => $customer->id,
+            'dealer_id' => $dealer->id,
+            'customer_id' => $customer->id,
+            'external_ref' => 'LOGO-CUSTOMER-001',
+            'status' => 'synced',
+            'last_synced_at' => $inboundSyncedAt,
+        ]);
+
+        IntegrationSyncState::query()->create([
+            'system' => 'logo',
+            'domain' => 'customers',
+            'direction' => 'inbound',
+            'entity_type' => Customer::class,
+            'entity_id' => $customer->id + 100,
+            'dealer_id' => $dealer->id,
+            'customer_id' => $customer->id,
+            'external_ref' => 'LOGO-CUSTOMER-ERR',
+            'status' => 'failed',
+            'last_error' => 'Logo cari okuma hatasi',
+            'last_synced_at' => null,
+            'updated_at' => Carbon::parse('2026-02-15 10:03:00'),
+        ]);
+
+        IntegrationSyncState::query()->create([
+            'system' => 'logo',
+            'domain' => 'pos-sales',
+            'direction' => 'outbound',
+            'entity_type' => Customer::class,
+            'entity_id' => $customer->id,
+            'dealer_id' => $dealer->id,
+            'customer_id' => $customer->id,
+            'external_ref' => 'LOGO-POS-001',
+            'status' => 'synced',
+            'last_synced_at' => $outboundSyncedAt,
+        ]);
+
+        $this->actingAs($admin);
+
+        $response = $this->getJson('/api/reports/logo-dashboard?date_from=2026-02-01&date_to=2026-02-28');
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('summary.logo_last_synced_at', $outboundSyncedAt->toJSON())
+            ->assertJsonFragment([
+                'domain' => 'customers',
+                'direction' => 'inbound',
+                'records' => 2,
+                'synced_records' => 1,
+                'failed_records' => 1,
+                'pending_records' => 0,
+                'latest_status' => 'failed',
+                'last_error' => 'Logo cari okuma hatasi',
+                'last_synced_at' => $inboundSyncedAt->toJSON(),
+            ])
+            ->assertJsonFragment([
+                'domain' => 'pos-sales',
+                'direction' => 'outbound',
+                'records' => 1,
+                'synced_records' => 1,
+                'failed_records' => 0,
+                'pending_records' => 0,
+                'latest_status' => 'synced',
+                'last_synced_at' => $outboundSyncedAt->toJSON(),
+            ]);
+    }
+
+    public function test_logo_dashboard_counts_products_with_logo_integration_refs(): void
+    {
+        Http::fake([
+            'www.tcmb.gov.tr/*' => Http::response('', 500),
+        ]);
+
+        $admin = $this->createUserWithRole('admin');
+        $syncedProduct = $this->createProduct('LOGO-SYNCED', [
+            'integrations' => [
+                'logo' => [
+                    'synced_at' => '2026-02-15T10:00:00Z',
+                ],
+            ],
+        ]);
+        $externalRefProduct = $this->createProduct('LOGO-EXT', [
+            'integrations' => [
+                'logo' => [
+                    'external_ref' => 'LOGO-EXT-001',
+                ],
+            ],
+        ]);
+        $logicalRefProduct = $this->createProduct('LOGO-LOGICAL', [
+            'integrations' => [
+                'logo' => [
+                    'logical_ref' => 12345,
+                ],
+            ],
+        ]);
+        $this->createProduct('LOCAL-ONLY', []);
+
+        DB::table('stock_summary')->insert([
+            [
+                'product_id' => $syncedProduct->id,
+                'available_total' => 4,
+                'reserved_total' => 0,
+                'updated_at' => now(),
+            ],
+            [
+                'product_id' => $logicalRefProduct->id,
+                'available_total' => 9,
+                'reserved_total' => 0,
+                'updated_at' => now(),
+            ],
+            [
+                'product_id' => $externalRefProduct->id,
+                'available_total' => 0,
+                'reserved_total' => 0,
+                'updated_at' => now(),
+            ],
+        ]);
+
+        $this->actingAs($admin);
+
+        $response = $this->getJson('/api/reports/logo-dashboard?date_from=2026-02-01&date_to=2026-02-28');
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('summary.logo_products_total', 3)
+            ->assertJsonPath('summary.logo_stocked_products_total', 2)
+            ->assertJsonFragment([
+                'key' => 'products-inbound',
+                'title' => 'Ürün okuma',
+                'flow' => 'Logo -> B2B',
+                'status' => 'warning',
+                'expected_count' => 3,
+                'synced_count' => 0,
+                'missing_count' => 3,
+            ])
+            ->assertJsonFragment([
+                'key' => 'products-shelf',
+                'title' => 'Ürün raf adresleri',
+                'flow' => 'Logo -> B2B',
+                'status' => 'warning',
+                'expected_count' => 3,
+                'synced_count' => 0,
+                'missing_count' => 3,
+            ]);
+    }
+
+    public function test_logo_dashboard_does_not_treat_non_location_logo_fields_as_shelf_addresses(): void
+    {
+        Http::fake([
+            'www.tcmb.gov.tr/*' => Http::response('', 500),
+        ]);
+        Cache::flush();
+
+        $admin = $this->createUserWithRole('admin');
+        $this->createProduct('LOGO-NO-RAF', [
+            'integrations' => [
+                'logo' => [
+                    'synced_at' => '2026-02-15T10:00:00Z',
+                    'payload' => [
+                        'raw' => [
+                            'SHELFLIFE' => '0',
+                            'SHELFDATE' => '0',
+                            'DRAFTOFFERBRWS' => '0',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+        $this->createProduct('LOGO-RAF', [
+            'integrations' => [
+                'logo' => [
+                    'synced_at' => '2026-02-15T10:00:00Z',
+                    'payload' => [
+                        'raw' => [
+                            'RAF25' => 'D.12',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+        $this->createProduct('LOGO-ZERO-RAF', [
+            'integrations' => [
+                'logo' => [
+                    'synced_at' => '2026-02-15T10:00:00Z',
+                    'payload' => [
+                        'raw' => [
+                            'RAF25' => '0',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->actingAs($admin);
+
+        $response = $this->getJson('/api/reports/logo-dashboard?date_from=2026-02-01&date_to=2026-02-28');
+
+        $response
+            ->assertOk()
+            ->assertJsonFragment([
+                'key' => 'products-shelf',
+                'title' => 'Ürün raf adresleri',
+                'flow' => 'Logo -> B2B',
+                'status' => 'warning',
+                'expected_count' => 3,
+                'synced_count' => 1,
+                'missing_count' => 2,
+            ]);
+    }
+
     private function createDealer(string $code): Dealer
     {
         return Dealer::query()->create([
@@ -337,6 +654,20 @@ class ReportEndpointsApiTest extends TestCase
             'source_system' => 'logo',
             'is_active' => true,
         ], $overrides));
+    }
+
+    /**
+     * @param  array<string, mixed>  $meta
+     */
+    private function createProduct(string $sku, array $meta): Product
+    {
+        return Product::query()->create([
+            'sku' => $sku,
+            'name' => 'Product '.$sku,
+            'oem_code' => null,
+            'is_active' => true,
+            'meta' => $meta,
+        ]);
     }
 
     private function insertLedgerDebit(int $dealerId, int $customerId, float $amount, string $date): void

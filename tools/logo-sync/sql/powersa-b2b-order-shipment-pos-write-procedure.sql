@@ -4,7 +4,8 @@
 
   Payment writes are intentionally left to PowersaB2B_ExportCollection. POS sale
   export writes the stock/delivery side only, so POS cash movements are not
-  duplicated in KSLINES/CLFLINE.
+  duplicated in KSLINES/CLFLINE. Shipment export writes the wholesale sales
+  invoice side and the matching customer ledger debit.
 */
 
 IF OBJECT_ID(N'dbo.POWERSA_B2B_EXPORT_LOG', N'U') IS NULL
@@ -26,6 +27,10 @@ BEGIN
 END;
 GO
 
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 CREATE OR ALTER PROCEDURE dbo.PowersaB2B_BeginExport
     @ExportKey NVARCHAR(128),
     @DocumentType NVARCHAR(64),
@@ -66,6 +71,10 @@ BEGIN
 END;
 GO
 
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 CREATE OR ALTER PROCEDURE dbo.PowersaB2B_FinishExport
     @ExportKey NVARCHAR(128),
     @ExternalRef NVARCHAR(128)
@@ -85,6 +94,10 @@ BEGIN
 END;
 GO
 
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 CREATE OR ALTER PROCEDURE dbo.PowersaB2B_ExportOrder
     @CustomerExternalRef NVARCHAR(128) = NULL,
     @CustomerCode NVARCHAR(64) = NULL,
@@ -113,7 +126,7 @@ BEGIN
 
     DECLARE @CustomerRef INT = TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM(@CustomerExternalRef)), N''));
     DECLARE @Docode VARCHAR(33) = CONVERT(VARCHAR(33), LEFT(COALESCE(NULLIF(@OrderNo, N''), @ExportKey), 33));
-    DECLARE @FicheNo VARCHAR(17) = CONVERT(VARCHAR(17), RIGHT(REPLICATE('0', 17) + CONVERT(VARCHAR(32), ABS(CHECKSUM(@ExportKey))), 17));
+    DECLARE @FicheNo VARCHAR(17) = CONVERT(VARCHAR(17), 'F' + RIGHT(REPLICATE('0', 16) + CONVERT(VARCHAR(32), ABS(CHECKSUM(@ExportKey))), 16));
     DECLARE @Specode VARCHAR(11) = CONVERT(VARCHAR(11), LEFT(@ExportKey, 11));
     DECLARE @Now DATETIME = GETDATE();
     DECLARE @Hour SMALLINT = DATEPART(HOUR, @Now);
@@ -249,6 +262,10 @@ BEGIN
 END;
 GO
 
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 CREATE OR ALTER PROCEDURE dbo.PowersaB2B_ExportShipment
     @CustomerExternalRef NVARCHAR(128) = NULL,
     @CustomerCode NVARCHAR(64) = NULL,
@@ -278,13 +295,17 @@ BEGIN
     DECLARE @CustomerRef INT = TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM(@CustomerExternalRef)), N''));
     DECLARE @SourceIndex SMALLINT = COALESCE(TRY_CONVERT(SMALLINT, NULLIF(@WarehouseCode, N'')), 0);
     DECLARE @Docode VARCHAR(33) = CONVERT(VARCHAR(33), LEFT(COALESCE(NULLIF(@ShipmentNo, N''), NULLIF(@OrderNo, N''), @ExportKey), 33));
-    DECLARE @FicheNo VARCHAR(17) = CONVERT(VARCHAR(17), RIGHT(REPLICATE('0', 17) + CONVERT(VARCHAR(32), ABS(CHECKSUM(@ExportKey))), 17));
+    DECLARE @FicheNo VARCHAR(17) = CONVERT(VARCHAR(17), 'F' + RIGHT(REPLICATE('0', 16) + CONVERT(VARCHAR(32), ABS(CHECKSUM(@ExportKey))), 16));
     DECLARE @Specode VARCHAR(11) = CONVERT(VARCHAR(11), LEFT(@ExportKey, 11));
     DECLARE @Now DATETIME = GETDATE();
     DECLARE @Hour SMALLINT = DATEPART(HOUR, @Now);
     DECLARE @Minute SMALLINT = DATEPART(MINUTE, @Now);
     DECLARE @Second SMALLINT = DATEPART(SECOND, @Now);
+    DECLARE @CyphCode VARCHAR(11) = CONVERT(VARCHAR(11), LEFT(COALESCE(NULLIF(@OrderNo, N''), N''), 11));
+    DECLARE @LineExp VARCHAR(251) = CONVERT(VARCHAR(251), LEFT(COALESCE(NULLIF(@ShipmentNo, N''), NULLIF(@OrderNo, N''), @ExportKey), 251));
+    DECLARE @InvoiceRef INT;
     DECLARE @StockFicheRef INT;
+    DECLARE @ClflineRef INT;
 
     DECLARE @Lines TABLE (
         RowNo INT IDENTITY(1, 1) NOT NULL,
@@ -366,22 +387,52 @@ BEGIN
     UPDATE @Lines
        SET VatAmount = LineTotal * VatRate / 100;
 
+    SELECT
+        @Subtotal = CASE WHEN @Subtotal > 0 THEN @Subtotal ELSE COALESCE(SUM(LineTotal), 0) END,
+        @VatTotal = CASE WHEN @VatTotal > 0 THEN @VatTotal ELSE COALESCE(SUM(VatAmount), 0) END
+    FROM @Lines;
+
+    IF @GrandTotal <= 0
+        SET @GrandTotal = @Subtotal + @VatTotal;
+
     BEGIN TRANSACTION;
+
+    INSERT INTO dbo.LG_003_01_INVOICE (
+        GRPCODE, TRCODE, FICHENO, DATE_, DOCODE, SPECODE, CYPHCODE, CLIENTREF,
+        SOURCEINDEX, SOURCECOSTGRP, CANCELLED, ACCOUNTED, VAT, TOTALDISCOUNTS,
+        TOTALDISCOUNTED, TOTALVAT, GROSSTOTAL, NETTOTAL, GENEXP1, GENEXP2, GENEXP3, GENEXP4,
+        TRCURR, TRRATE, REPORTRATE, REPORTNET, PAYDEFREF, BRANCH, DEPARTMENT,
+        CAPIBLOCK_CREATEDBY, CAPIBLOCK_CREADEDDATE, CAPIBLOCK_CREATEDHOUR,
+        CAPIBLOCK_CREATEDMIN, CAPIBLOCK_CREATEDSEC
+    )
+    VALUES (
+        2, 8, @FicheNo, @ShipmentDate, @Docode, @Specode, @CyphCode, @CustomerRef,
+        @SourceIndex, @SourceIndex, 0, 0, CONVERT(FLOAT, @VatTotal), 0,
+        CONVERT(FLOAT, @Subtotal), CONVERT(FLOAT, @VatTotal), CONVERT(FLOAT, @Subtotal), CONVERT(FLOAT, @GrandTotal),
+        CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@ShipmentNo, N''), @ExportKey), 51)),
+        CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@CustomerCode, N''), N''), 51)),
+        CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@OrderNo, N''), N''), 51)),
+        CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@WarehouseCode, N''), N''), 51)),
+        0, 1, 1, CONVERT(FLOAT, @GrandTotal), 0, 0, 0,
+        1, @Now, @Hour, @Minute, @Second
+    );
+
+    SET @InvoiceRef = SCOPE_IDENTITY();
 
     INSERT INTO dbo.LG_003_01_STFICHE (
         GRPCODE, TRCODE, IOCODE, FICHENO, DATE_, FTIME, DOCODE, SPECODE, CYPHCODE,
         CLIENTREF, SOURCETYPE, SOURCEINDEX, SOURCECOSTGRP, BRANCH, DEPARTMENT,
         CANCELLED, BILLED, ACCOUNTED, UPDCURR, INUSE, ADDDISCOUNTS,
-        TOTALDISCOUNTS, TOTALDISCOUNTED, ADDEXPENSES, TOTALEXPENSES,
+        INVOICEREF, TOTALDISCOUNTS, TOTALDISCOUNTED, ADDEXPENSES, TOTALEXPENSES,
         TOTALVAT, GROSSTOTAL, NETTOTAL, REPORTRATE, REPORTNET, GENEXP1, GENEXP2,
         CAPIBLOCK_CREATEDBY, CAPIBLOCK_CREADEDDATE, CAPIBLOCK_CREATEDHOUR,
         CAPIBLOCK_CREATEDMIN, CAPIBLOCK_CREATEDSEC
     )
     VALUES (
-        2, 8, 4, @FicheNo, @ShipmentDate, 0, @Docode, @Specode, CONVERT(VARCHAR(11), LEFT(COALESCE(NULLIF(@OrderNo, N''), N''), 11)),
+        2, 8, 4, @FicheNo, @ShipmentDate, 0, @Docode, @Specode, @CyphCode,
         @CustomerRef, 0, @SourceIndex, @SourceIndex, 0, 0,
-        0, 0, 0, 0, 0, 0,
-        0, CONVERT(FLOAT, @Subtotal), 0, 0,
+        0, 1, 0, 0, 0, 0,
+        @InvoiceRef, 0, CONVERT(FLOAT, @Subtotal), 0, 0,
         CONVERT(FLOAT, @VatTotal), CONVERT(FLOAT, @Subtotal), CONVERT(FLOAT, @GrandTotal),
         1, CONVERT(FLOAT, @GrandTotal),
         CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@ShipmentNo, N''), @ExportKey), 51)),
@@ -394,29 +445,82 @@ BEGIN
     INSERT INTO dbo.LG_003_01_STLINE (
         STOCKREF, LINETYPE, TRCODE, DATE_, FTIME, GLOBTRANS, CALCTYPE,
         SOURCETYPE, SOURCEINDEX, SOURCECOSTGRP, DESTTYPE, DESTINDEX, DESTCOSTGRP,
-        FACTORYNR, IOCODE, STFICHEREF, STFICHELNNO, CLIENTREF, SPECODE, AMOUNT,
-        PRICE, TOTAL, PRCURR, PRPRICE, TRCURR, TRRATE, REPORTRATE, LINEEXP,
-        UOMREF, USREF, UINFO1, UINFO2, VATINC, VAT, VATAMNT, VATMATRAH,
+        FACTORYNR, IOCODE, STFICHEREF, STFICHELNNO, INVOICEREF, INVOICELNNO,
+        CLIENTREF, PAYDEFREF, SPECODE, AMOUNT, PRICE, TOTAL, PRCURR, PRPRICE,
+        TRCURR, TRRATE, REPORTRATE, LINEEXP, UOMREF, USREF, UINFO1, UINFO2,
+        VATINC, VAT, VATAMNT, VATMATRAH,
         BILLEDITEM, BILLED, CANCELLED, LINENET, MONTH_, YEAR_
     )
     SELECT
         src.StockRef, 0, 8, @ShipmentDate, 0, 0, 0,
         0, @SourceIndex, @SourceIndex, 0, 0, 0,
-        0, 4, @StockFicheRef, src.RowNo, @CustomerRef, @Specode, CONVERT(FLOAT, src.Quantity),
-        CONVERT(FLOAT, src.Price), CONVERT(FLOAT, src.LineTotal), 0, CONVERT(FLOAT, src.Price), 0, 1, 1,
-        CONVERT(VARCHAR(251), src.LineExp), COALESCE(src.UomRef, 0), COALESCE(src.UsRef, 0), 1, 1,
+        0, 4, @StockFicheRef, src.RowNo, @InvoiceRef, src.RowNo,
+        @CustomerRef, 0, @Specode, CONVERT(FLOAT, src.Quantity),
+        CONVERT(FLOAT, src.Price), CONVERT(FLOAT, src.LineTotal), 0, CONVERT(FLOAT, src.Price),
+        0, 1, 1, CONVERT(VARCHAR(251), src.LineExp), COALESCE(src.UomRef, 0), COALESCE(src.UsRef, 0), 1, 1,
         0, CONVERT(FLOAT, src.VatRate), CONVERT(FLOAT, src.VatAmount), CONVERT(FLOAT, src.LineTotal),
-        0, 0, 0, CONVERT(FLOAT, src.LineTotal), MONTH(@ShipmentDate), YEAR(@ShipmentDate)
+        0, 1, 0, CONVERT(FLOAT, src.LineTotal), MONTH(@ShipmentDate), YEAR(@ShipmentDate)
     FROM @Lines AS src
     ORDER BY src.RowNo;
 
-    SET @ExternalRef = CONCAT(N'STFICHE-', @StockFicheRef);
+    INSERT INTO dbo.LG_003_01_CLFLINE (
+        CLIENTREF, SOURCEFREF, DATE_, MODULENR, TRCODE, SPECODE, CYPHCODE,
+        TRANNO, DOCODE, LINEEXP, SIGN, AMOUNT, TRCURR, TRRATE, TRNET,
+        REPORTRATE, REPORTNET, CANCELLED, CAPIBLOCK_CREATEDBY,
+        CAPIBLOCK_CREADEDDATE, CAPIBLOCK_CREATEDHOUR, CAPIBLOCK_CREATEDMIN,
+        CAPIBLOCK_CREATEDSEC
+    )
+    VALUES (
+        @CustomerRef, @InvoiceRef, @ShipmentDate, 4, 38, @Specode, @CyphCode,
+        @FicheNo, @Docode, @LineExp, 0, CONVERT(FLOAT, @GrandTotal), 0, 1, CONVERT(FLOAT, @GrandTotal),
+        1, CONVERT(FLOAT, @GrandTotal), 0, 1,
+        @Now, @Hour, @Minute, @Second
+    );
+
+    SET @ClflineRef = SCOPE_IDENTITY();
+
+    DECLARE @NormalizeSql NVARCHAR(MAX) = N'';
+
+    SELECT @NormalizeSql = @NormalizeSql + N'UPDATE dbo.LG_003_01_INVOICE SET ' + QUOTENAME(c.name) + N' = 0 WHERE LOGICALREF = @Ref AND ' + QUOTENAME(c.name) + N' IS NULL;'
+    FROM sys.columns AS c
+    INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+    WHERE c.object_id = OBJECT_ID(N'dbo.LG_003_01_INVOICE')
+      AND c.is_nullable = 1
+      AND t.name IN (N'tinyint', N'smallint', N'int', N'bigint', N'float', N'real', N'decimal', N'numeric', N'money', N'smallmoney');
+
+    EXEC sp_executesql @NormalizeSql, N'@Ref INT', @Ref = @InvoiceRef;
+
+    SET @NormalizeSql = N'';
+    SELECT @NormalizeSql = @NormalizeSql + N'UPDATE dbo.LG_003_01_STFICHE SET ' + QUOTENAME(c.name) + N' = 0 WHERE LOGICALREF = @Ref AND ' + QUOTENAME(c.name) + N' IS NULL;'
+    FROM sys.columns AS c
+    INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+    WHERE c.object_id = OBJECT_ID(N'dbo.LG_003_01_STFICHE')
+      AND c.is_nullable = 1
+      AND t.name IN (N'tinyint', N'smallint', N'int', N'bigint', N'float', N'real', N'decimal', N'numeric', N'money', N'smallmoney');
+
+    EXEC sp_executesql @NormalizeSql, N'@Ref INT', @Ref = @StockFicheRef;
+
+    SET @NormalizeSql = N'';
+    SELECT @NormalizeSql = @NormalizeSql + N'UPDATE dbo.LG_003_01_STLINE SET ' + QUOTENAME(c.name) + N' = 0 WHERE STFICHEREF = @Ref AND ' + QUOTENAME(c.name) + N' IS NULL;'
+    FROM sys.columns AS c
+    INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+    WHERE c.object_id = OBJECT_ID(N'dbo.LG_003_01_STLINE')
+      AND c.is_nullable = 1
+      AND t.name IN (N'tinyint', N'smallint', N'int', N'bigint', N'float', N'real', N'decimal', N'numeric', N'money', N'smallmoney');
+
+    EXEC sp_executesql @NormalizeSql, N'@Ref INT', @Ref = @StockFicheRef;
+
+    SET @ExternalRef = CONCAT(N'INVOICE-', @InvoiceRef);
     EXEC dbo.PowersaB2B_FinishExport @ExportKey, @ExternalRef;
 
     COMMIT TRANSACTION;
 END;
 GO
 
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 CREATE OR ALTER PROCEDURE dbo.PowersaB2B_ExportPosSale
     @CustomerExternalRef NVARCHAR(128) = NULL,
     @CustomerCode NVARCHAR(64) = NULL,
@@ -448,13 +552,18 @@ BEGIN
     DECLARE @CustomerRef INT = TRY_CONVERT(INT, NULLIF(LTRIM(RTRIM(@CustomerExternalRef)), N''));
     DECLARE @SourceIndex SMALLINT = COALESCE(TRY_CONVERT(SMALLINT, JSON_VALUE(@PayloadJson, '$.meta.warehouse_code')), TRY_CONVERT(SMALLINT, JSON_VALUE(@PayloadJson, '$.logo.warehouse_code')), 0);
     DECLARE @Docode VARCHAR(33) = CONVERT(VARCHAR(33), LEFT(COALESCE(NULLIF(@ReceiptNo, N''), @ExportKey), 33));
-    DECLARE @FicheNo VARCHAR(17) = CONVERT(VARCHAR(17), RIGHT(REPLICATE('0', 17) + CONVERT(VARCHAR(32), ABS(CHECKSUM(@ExportKey))), 17));
+    DECLARE @FicheNo VARCHAR(17) = CONVERT(VARCHAR(17), 'F' + RIGHT(REPLICATE('0', 16) + CONVERT(VARCHAR(32), ABS(CHECKSUM(@ExportKey))), 16));
     DECLARE @Specode VARCHAR(11) = CONVERT(VARCHAR(11), LEFT(@ExportKey, 11));
     DECLARE @Now DATETIME = GETDATE();
     DECLARE @Hour SMALLINT = DATEPART(HOUR, @Now);
     DECLARE @Minute SMALLINT = DATEPART(MINUTE, @Now);
     DECLARE @Second SMALLINT = DATEPART(SECOND, @Now);
+    DECLARE @CyphCode VARCHAR(11) = CONVERT(VARCHAR(11), LEFT(COALESCE(NULLIF(@SaleType, N''), N''), 11));
+    DECLARE @LineExp VARCHAR(251) = CONVERT(VARCHAR(251), LEFT(COALESCE(NULLIF(@ReceiptNo, N''), @ExportKey), 251));
+    DECLARE @IsInvoice BIT = CASE WHEN LOWER(COALESCE(@DocumentType, N'')) = N'delivery' THEN 0 ELSE 1 END;
+    DECLARE @InvoiceRef INT;
     DECLARE @StockFicheRef INT;
+    DECLARE @ClflineRef INT;
 
     DECLARE @Lines TABLE (
         RowNo INT IDENTITY(1, 1) NOT NULL,
@@ -536,21 +645,55 @@ BEGIN
     UPDATE @Lines
        SET VatAmount = LineTotal * VatRate / 100;
 
+    SELECT
+        @Subtotal = CASE WHEN @Subtotal > 0 THEN @Subtotal ELSE COALESCE(SUM(LineTotal), 0) END,
+        @VatTotal = CASE WHEN @VatTotal > 0 THEN @VatTotal ELSE COALESCE(SUM(VatAmount), 0) END
+    FROM @Lines;
+
+    IF @GrandTotal <= 0
+        SET @GrandTotal = @Subtotal + @VatTotal;
+
     BEGIN TRANSACTION;
+
+    IF @IsInvoice = 1
+    BEGIN
+        INSERT INTO dbo.LG_003_01_INVOICE (
+            GRPCODE, TRCODE, FICHENO, DATE_, DOCODE, SPECODE, CYPHCODE, CLIENTREF,
+            SOURCEINDEX, SOURCECOSTGRP, CANCELLED, ACCOUNTED, VAT, TOTALDISCOUNTS,
+            TOTALDISCOUNTED, TOTALVAT, GROSSTOTAL, NETTOTAL, GENEXP1, GENEXP2, GENEXP3, GENEXP4,
+            TRCURR, TRRATE, REPORTRATE, REPORTNET, PAYDEFREF, BRANCH, DEPARTMENT,
+            CAPIBLOCK_CREATEDBY, CAPIBLOCK_CREADEDDATE, CAPIBLOCK_CREATEDHOUR,
+            CAPIBLOCK_CREATEDMIN, CAPIBLOCK_CREATEDSEC
+        )
+        VALUES (
+            2, 8, @FicheNo, @SaleDate, @Docode, @Specode, @CyphCode, @CustomerRef,
+            @SourceIndex, @SourceIndex, 0, 0, CONVERT(FLOAT, @VatTotal), CONVERT(FLOAT, @DiscountTotal),
+            CONVERT(FLOAT, @Subtotal), CONVERT(FLOAT, @VatTotal), CONVERT(FLOAT, @Subtotal), CONVERT(FLOAT, @GrandTotal),
+            CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@ReceiptNo, N''), @ExportKey), 51)),
+            CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@CustomerCode, N''), N''), 51)),
+            CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@CashboxCode, N''), N''), 51)),
+            CONVERT(VARCHAR(51), LEFT(COALESCE(NULLIF(@DocumentType, N''), N''), 51)),
+            0, 1, 1, CONVERT(FLOAT, @GrandTotal), 0, 0, 0,
+            1, @Now, @Hour, @Minute, @Second
+        );
+
+        SET @InvoiceRef = SCOPE_IDENTITY();
+    END;
 
     INSERT INTO dbo.LG_003_01_STFICHE (
         GRPCODE, TRCODE, IOCODE, FICHENO, DATE_, FTIME, DOCODE, SPECODE, CYPHCODE,
         CLIENTREF, SOURCETYPE, SOURCEINDEX, SOURCECOSTGRP, BRANCH, DEPARTMENT,
         CANCELLED, BILLED, ACCOUNTED, UPDCURR, INUSE, ADDDISCOUNTS,
-        TOTALDISCOUNTS, TOTALDISCOUNTED, ADDEXPENSES, TOTALEXPENSES,
+        INVOICEREF, TOTALDISCOUNTS, TOTALDISCOUNTED, ADDEXPENSES, TOTALEXPENSES,
         TOTALVAT, GROSSTOTAL, NETTOTAL, REPORTRATE, REPORTNET, GENEXP1, GENEXP2,
         CAPIBLOCK_CREATEDBY, CAPIBLOCK_CREADEDDATE, CAPIBLOCK_CREATEDHOUR,
         CAPIBLOCK_CREATEDMIN, CAPIBLOCK_CREATEDSEC
     )
     VALUES (
-        2, 8, 4, @FicheNo, @SaleDate, 0, @Docode, @Specode, CONVERT(VARCHAR(11), LEFT(COALESCE(NULLIF(@SaleType, N''), N''), 11)),
+        2, 8, 4, @FicheNo, @SaleDate, 0, @Docode, @Specode, @CyphCode,
         @CustomerRef, 0, @SourceIndex, @SourceIndex, 0, 0,
-        0, 0, 0, 0, 0, 0,
+        0, @IsInvoice, 0, 0, 0, 0,
+        CASE WHEN @IsInvoice = 1 THEN @InvoiceRef ELSE 0 END,
         CONVERT(FLOAT, @DiscountTotal), CONVERT(FLOAT, @Subtotal), 0, 0,
         CONVERT(FLOAT, @VatTotal), CONVERT(FLOAT, @Subtotal), CONVERT(FLOAT, @GrandTotal),
         1, CONVERT(FLOAT, @GrandTotal),
@@ -564,7 +707,8 @@ BEGIN
     INSERT INTO dbo.LG_003_01_STLINE (
         STOCKREF, LINETYPE, TRCODE, DATE_, FTIME, GLOBTRANS, CALCTYPE,
         SOURCETYPE, SOURCEINDEX, SOURCECOSTGRP, DESTTYPE, DESTINDEX, DESTCOSTGRP,
-        FACTORYNR, IOCODE, STFICHEREF, STFICHELNNO, CLIENTREF, SPECODE, AMOUNT,
+        FACTORYNR, IOCODE, STFICHEREF, STFICHELNNO, INVOICEREF, INVOICELNNO,
+        CLIENTREF, SPECODE, AMOUNT,
         PRICE, TOTAL, PRCURR, PRPRICE, TRCURR, TRRATE, REPORTRATE, LINEEXP,
         UOMREF, USREF, UINFO1, UINFO2, VATINC, VAT, VATAMNT, VATMATRAH,
         BILLEDITEM, BILLED, CANCELLED, LINENET, MONTH_, YEAR_
@@ -572,15 +716,71 @@ BEGIN
     SELECT
         src.StockRef, 0, 8, @SaleDate, 0, 0, 0,
         0, @SourceIndex, @SourceIndex, 0, 0, 0,
-        0, 4, @StockFicheRef, src.RowNo, @CustomerRef, @Specode, CONVERT(FLOAT, src.Quantity),
+        0, 4, @StockFicheRef, src.RowNo,
+        CASE WHEN @IsInvoice = 1 THEN @InvoiceRef ELSE 0 END,
+        CASE WHEN @IsInvoice = 1 THEN src.RowNo ELSE 0 END,
+        @CustomerRef, @Specode, CONVERT(FLOAT, src.Quantity),
         CONVERT(FLOAT, src.Price), CONVERT(FLOAT, src.LineTotal), 0, CONVERT(FLOAT, src.Price), 0, 1, 1,
         CONVERT(VARCHAR(251), src.LineExp), COALESCE(src.UomRef, 0), COALESCE(src.UsRef, 0), 1, 1,
         0, CONVERT(FLOAT, src.VatRate), CONVERT(FLOAT, src.VatAmount), CONVERT(FLOAT, src.LineTotal),
-        0, 0, 0, CONVERT(FLOAT, src.LineTotal), MONTH(@SaleDate), YEAR(@SaleDate)
+        0, @IsInvoice, 0, CONVERT(FLOAT, src.LineTotal), MONTH(@SaleDate), YEAR(@SaleDate)
     FROM @Lines AS src
     ORDER BY src.RowNo;
 
-    SET @ExternalRef = CONCAT(N'STFICHE-', @StockFicheRef);
+    IF @IsInvoice = 1
+    BEGIN
+        INSERT INTO dbo.LG_003_01_CLFLINE (
+            CLIENTREF, SOURCEFREF, DATE_, MODULENR, TRCODE, SPECODE, CYPHCODE,
+            TRANNO, DOCODE, LINEEXP, SIGN, AMOUNT, TRCURR, TRRATE, TRNET,
+            REPORTRATE, REPORTNET, CANCELLED, CAPIBLOCK_CREATEDBY,
+            CAPIBLOCK_CREADEDDATE, CAPIBLOCK_CREATEDHOUR, CAPIBLOCK_CREATEDMIN,
+            CAPIBLOCK_CREATEDSEC
+        )
+        VALUES (
+            @CustomerRef, @InvoiceRef, @SaleDate, 4, 38, @Specode, @CyphCode,
+            @FicheNo, @Docode, @LineExp, 0, CONVERT(FLOAT, @GrandTotal), 0, 1, CONVERT(FLOAT, @GrandTotal),
+            1, CONVERT(FLOAT, @GrandTotal), 0, 1,
+            @Now, @Hour, @Minute, @Second
+        );
+
+        SET @ClflineRef = SCOPE_IDENTITY();
+    END;
+
+    DECLARE @NormalizeSql NVARCHAR(MAX) = N'';
+
+    IF @IsInvoice = 1 AND @InvoiceRef IS NOT NULL
+    BEGIN
+        SELECT @NormalizeSql = @NormalizeSql + N'UPDATE dbo.LG_003_01_INVOICE SET ' + QUOTENAME(c.name) + N' = 0 WHERE LOGICALREF = @Ref AND ' + QUOTENAME(c.name) + N' IS NULL;'
+        FROM sys.columns AS c
+        INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+        WHERE c.object_id = OBJECT_ID(N'dbo.LG_003_01_INVOICE')
+          AND c.is_nullable = 1
+          AND t.name IN (N'tinyint', N'smallint', N'int', N'bigint', N'float', N'real', N'decimal', N'numeric', N'money', N'smallmoney');
+
+        EXEC sp_executesql @NormalizeSql, N'@Ref INT', @Ref = @InvoiceRef;
+    END;
+
+    SET @NormalizeSql = N'';
+    SELECT @NormalizeSql = @NormalizeSql + N'UPDATE dbo.LG_003_01_STFICHE SET ' + QUOTENAME(c.name) + N' = 0 WHERE LOGICALREF = @Ref AND ' + QUOTENAME(c.name) + N' IS NULL;'
+    FROM sys.columns AS c
+    INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+    WHERE c.object_id = OBJECT_ID(N'dbo.LG_003_01_STFICHE')
+      AND c.is_nullable = 1
+      AND t.name IN (N'tinyint', N'smallint', N'int', N'bigint', N'float', N'real', N'decimal', N'numeric', N'money', N'smallmoney');
+
+    EXEC sp_executesql @NormalizeSql, N'@Ref INT', @Ref = @StockFicheRef;
+
+    SET @NormalizeSql = N'';
+    SELECT @NormalizeSql = @NormalizeSql + N'UPDATE dbo.LG_003_01_STLINE SET ' + QUOTENAME(c.name) + N' = 0 WHERE STFICHEREF = @Ref AND ' + QUOTENAME(c.name) + N' IS NULL;'
+    FROM sys.columns AS c
+    INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+    WHERE c.object_id = OBJECT_ID(N'dbo.LG_003_01_STLINE')
+      AND c.is_nullable = 1
+      AND t.name IN (N'tinyint', N'smallint', N'int', N'bigint', N'float', N'real', N'decimal', N'numeric', N'money', N'smallmoney');
+
+    EXEC sp_executesql @NormalizeSql, N'@Ref INT', @Ref = @StockFicheRef;
+
+    SET @ExternalRef = CASE WHEN @IsInvoice = 1 THEN CONCAT(N'INVOICE-', @InvoiceRef) ELSE CONCAT(N'STFICHE-', @StockFicheRef) END;
     EXEC dbo.PowersaB2B_FinishExport @ExportKey, @ExternalRef;
 
     COMMIT TRANSACTION;

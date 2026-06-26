@@ -52,6 +52,7 @@ class WarehouseShipmentPrintController extends Controller
 
         return response()->view('warehouse.prints.label', [
             'shipment' => $shipment,
+            'labelShipTime' => $this->resolveLabelShipTime($request->query('ship_time'), $shipment),
         ], HttpResponse::HTTP_OK, [
             'Content-Type' => 'text/html; charset=UTF-8',
         ]);
@@ -105,6 +106,18 @@ class WarehouseShipmentPrintController extends Controller
             'cancelled' => 'İptal',
             default => strtoupper($status),
         };
+    }
+
+    private function resolveLabelShipTime(mixed $value, Shipment $shipment): string
+    {
+        if (is_scalar($value)) {
+            $raw = trim((string) $value);
+            if ($raw !== '') {
+                return $raw;
+            }
+        }
+
+        return optional($shipment->shipped_at ?? $shipment->created_at)->format('d.m.Y H:i:s') ?? '-';
     }
 
     private function ensureShipmentScope(?User $user, Shipment $shipment): void

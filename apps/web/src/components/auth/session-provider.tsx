@@ -23,6 +23,10 @@ import {
 type SessionStatus = "loading" | "authenticated" | "guest";
 const SELECTED_CUSTOMER_STORAGE_KEY = "powersa:selected_customer";
 
+type ApiUserPayload = ApiUser & {
+  selected_customer?: (Partial<CustomerSummary> & { name?: string | null }) | null;
+};
+
 function normalizeCustomerSummary(
   customer: Partial<CustomerSummary> & {
     name?: string | null;
@@ -108,6 +112,21 @@ function persistSelectedCustomer(customer: CustomerSummary | null) {
   window.localStorage.setItem(SELECTED_CUSTOMER_STORAGE_KEY, JSON.stringify(customer));
 }
 
+function selectedCustomerFromUser(user: ApiUserPayload | null | undefined): CustomerSummary | null {
+  if (!user) {
+    return null;
+  }
+
+  return normalizeCustomerSummary(user.selectedCustomer ?? user.selected_customer ?? {}) ?? null;
+}
+
+function normalizeApiUser(user: ApiUserPayload): ApiUser {
+  return {
+    ...user,
+    selectedCustomer: selectedCustomerFromUser(user),
+  };
+}
+
 type SessionContextType = {
   status: SessionStatus;
   user: ApiUser | null;
@@ -138,8 +157,9 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const me = await getMe();
+      const normalizedUser = normalizeApiUser(me.user as ApiUserPayload);
 
-      let nextCustomer = normalizeCustomerSummary(me.user.selectedCustomer ?? {}) ?? null;
+      let nextCustomer = selectedCustomerFromUser(normalizedUser);
 
       if (!nextCustomer) {
         try {
@@ -150,7 +170,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      setUser(me.user);
+      setUser(normalizedUser);
       setSelectedCustomerPersisted(nextCustomer);
       setStatus("authenticated");
     } catch {
@@ -175,8 +195,9 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       await ensureCsrfCookie();
 
       const response = await loginRequest(payload);
-      setUser(response.user);
-      setSelectedCustomerPersisted(normalizeCustomerSummary(response.user.selectedCustomer ?? {}) ?? null);
+      const normalizedUser = normalizeApiUser(response.user as ApiUserPayload);
+      setUser(normalizedUser);
+      setSelectedCustomerPersisted(selectedCustomerFromUser(normalizedUser));
       setStatus("authenticated");
 
       try {

@@ -18,6 +18,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Schema;
 use Symfony\Component\HttpFoundation\Response;
 use Throwable;
 
@@ -33,7 +34,7 @@ class LogoDashboardReportController extends Controller
         $dateFrom = Carbon::parse((string) $request->query('date_from', now()->subDays(30)->toDateString()))->toDateString();
         $dateTo = Carbon::parse((string) $request->query('date_to', now()->toDateString()))->toDateString();
         $dealerId = $this->resolveDealerId($request->query('dealer_id'));
-        $ledgerDateExpr = 'COALESCE(ledger_entries.`date`, ledger_entries.entry_date)';
+        $ledgerDateExpr = $this->coalescedColumnExpression('ledger_entries.date', 'ledger_entries.entry_date');
 
         $logoCustomers = Customer::query()
             ->select(['id', 'dealer_id', 'salesperson_user_id', 'code', 'name', 'is_active', 'meta', 'last_synced_at'])
@@ -222,6 +223,7 @@ class LogoDashboardReportController extends Controller
         $methodBreakdown = $this->collectionMethodBreakdown($dealerId, $dateFrom, $dateTo);
         $productCounts = $this->logoProductCounts();
         $syncStates = $this->syncStates($dealerId);
+        $syncGaps = $this->syncGaps($dealerId, $productCounts);
         $lastSyncedAt = collect($syncStates)
             ->pluck('last_synced_at')
             ->filter()
@@ -280,6 +282,7 @@ class LogoDashboardReportController extends Controller
             'sales_breakdown' => $salesBreakdown,
             'recent_movements' => $recentMovements,
             'sync' => $syncStates,
+            'sync_gaps' => $syncGaps,
             'market_rates' => $this->tcmbMarketRates(),
         ]);
     }
@@ -300,7 +303,7 @@ class LogoDashboardReportController extends Controller
      */
     private function collectionMethodBreakdown(?int $dealerId, string $dateFrom, string $dateTo): array
     {
-        $collectionDateExpr = 'COALESCE(collections.`date`, collections.collection_date)';
+        $collectionDateExpr = $this->coalescedColumnExpression('collections.date', 'collections.collection_date');
 
         $rows = CollectionModel::query()
             ->where('source_system', 'logo')
@@ -351,36 +354,551 @@ class LogoDashboardReportController extends Controller
 
     private function applyLogoProductFilter(EloquentBuilder|QueryBuilder $query): void
     {
-        $driver = DB::connection()->getDriverName();
-        $expression = $driver === 'sqlite'
-            ? "(json_extract(products.meta, '$.integrations.logo.synced_at') IS NOT NULL OR json_extract(products.meta, '$.integrations.logo.external_ref') IS NOT NULL)"
-            : "(JSON_EXTRACT(products.meta, '$.integrations.logo.synced_at') IS NOT NULL OR JSON_EXTRACT(products.meta, '$.integrations.logo.external_ref') IS NOT NULL)";
+        $query->where(function (EloquentBuilder|QueryBuilder $query): void {
+            $query
+                ->whereNotNull('products.meta->integrations->logo->synced_at')
+                ->orWhereNotNull('products.meta->integrations->logo->external_ref')
+                ->orWhereNotNull('products.meta->integrations->logo->logical_ref');
+        });
+    }
 
-        $query->whereRaw($expression);
+    private function coalescedColumnExpression(string $primaryColumn, string $fallbackColumn): string
+    {
+        $grammar = DB::connection()->getQueryGrammar();
+
+        return sprintf('COALESCE(%s, %s)', $grammar->wrap($primaryColumn), $grammar->wrap($fallbackColumn));
     }
 
     /**
-     * @return array<int, array{domain:string,records:int,last_synced_at:?string}>
+     * @return array<int, array<string, mixed>>
      */
     private function syncStates(?int $dealerId): array
     {
-        return IntegrationSyncState::query()
+        $rows = IntegrationSyncState::query()
             ->where('system', 'logo')
-            ->where('direction', 'inbound')
             ->when($dealerId !== null, fn (EloquentBuilder $query) => $query->where('dealer_id', $dealerId))
-            ->select('domain')
-            ->selectRaw('COUNT(*) as records')
-            ->selectRaw('MAX(last_synced_at) as last_synced_at')
-            ->groupBy('domain')
             ->orderBy('domain')
-            ->get()
-            ->map(fn ($row): array => [
-                'domain' => $row->domain,
-                'records' => (int) $row->records,
-                'last_synced_at' => $row->last_synced_at ? Carbon::parse($row->last_synced_at)->toJSON() : null,
-            ])
+            ->orderBy('direction')
+            ->get(['domain', 'direction', 'status', 'last_error', 'last_synced_at', 'created_at', 'updated_at']);
+
+        return $rows
+            ->groupBy(fn (IntegrationSyncState $row): string => "{$row->domain}::{$row->direction}")
+            ->map(function ($rows): array {
+                $first = $rows->first();
+                $sortedByActivity = $rows->sortByDesc(fn (IntegrationSyncState $row): int => $this->syncStateTimestamp($row))->values();
+                $latest = $sortedByActivity->first();
+                $lastSyncedAt = $rows
+                    ->pluck('last_synced_at')
+                    ->filter()
+                    ->sortBy(fn ($value): int => Carbon::parse($value)->getTimestamp())
+                    ->last();
+                $lastError = $rows
+                    ->filter(fn (IntegrationSyncState $row): bool => trim((string) $row->last_error) !== '')
+                    ->sortByDesc(fn (IntegrationSyncState $row): int => $this->syncStateTimestamp($row))
+                    ->first();
+                $statusCounts = $rows
+                    ->groupBy(fn (IntegrationSyncState $row): string => $this->normalizeSyncStatus($row->status))
+                    ->map(fn ($group): int => $group->count())
+                    ->all();
+
+                $failedRecords = $rows->filter(function (IntegrationSyncState $row): bool {
+                    $status = $this->normalizeSyncStatus($row->status);
+
+                    return in_array($status, ['failed', 'error'], true) || trim((string) $row->last_error) !== '';
+                })->count();
+
+                $pendingRecords = $rows->filter(function (IntegrationSyncState $row): bool {
+                    $status = $this->normalizeSyncStatus($row->status);
+
+                    return in_array($status, ['pending', 'queued', 'processing'], true);
+                })->count();
+                $groupStatus = $failedRecords > 0
+                    ? 'failed'
+                    : ($pendingRecords > 0 ? 'pending' : $latest?->status);
+
+                return [
+                    'domain' => $first?->domain,
+                    'direction' => $first?->direction,
+                    'records' => $rows->count(),
+                    'synced_records' => $rows->filter(fn (IntegrationSyncState $row): bool => $this->normalizeSyncStatus($row->status) === 'synced')->count(),
+                    'failed_records' => $failedRecords,
+                    'pending_records' => $pendingRecords,
+                    'latest_status' => $this->normalizeSyncStatus($groupStatus),
+                    'status_counts' => $statusCounts,
+                    'last_synced_at' => $this->dateTimeJson($lastSyncedAt),
+                    'last_activity_at' => $this->dateTimeJson($latest?->updated_at ?? $latest?->last_synced_at),
+                    'last_error' => $lastError?->last_error,
+                    'last_error_at' => $this->dateTimeJson($lastError?->updated_at ?? $lastError?->last_synced_at),
+                ];
+            })
             ->values()
             ->all();
+    }
+
+    /**
+     * @param  array{products_total:int,stocked_products_total:int}  $productCounts
+     * @return array<int, array<string, mixed>>
+     */
+    private function syncGaps(?int $dealerId, array $productCounts): array
+    {
+        $productSync = $this->syncStateSummary('products', 'inbound', Product::class, $dealerId);
+        $productMissing = max(0, (int) $productCounts['products_total'] - $productSync['records']);
+        $productStale = (int) $productCounts['products_total'] > 0 && $this->isSyncStale($productSync['last_synced_at'], 120) ? 1 : 0;
+        $productShelfMissing = $this->countLogoProductsWithoutShelfAddress($dealerId);
+
+        $ledgerExpected = $this->countRows('ledger_entries', $dealerId, function (QueryBuilder $query): void {
+            $this->whereColumnIfExists($query, 'ledger_entries', 'source_system', 'logo');
+        });
+        $ledgerSync = $this->syncStateSummary('ledger', 'inbound', LedgerEntry::class, $dealerId);
+        $ledgerMissing = $this->countMissingSyncStates('ledger_entries', 'ledger', 'inbound', LedgerEntry::class, $dealerId, function (QueryBuilder $query): void {
+            $this->whereColumnIfExists($query, 'ledger_entries', 'source_system', 'logo');
+        });
+        $ledgerStale = $ledgerExpected > 0 && $this->isSyncStale($ledgerSync['last_synced_at'], 1440) ? 1 : 0;
+
+        $collectionExpected = $this->countRows('collections', $dealerId, function (QueryBuilder $query): void {
+            if (Schema::hasColumn('collections', 'sync_status')) {
+                $query->where(function (QueryBuilder $query): void {
+                    $query->whereNull('source.sync_status')->orWhere('source.sync_status', '<>', 'draft');
+                });
+            }
+        });
+        $collectionSync = $this->syncStateSummary('collections', 'outbound', CollectionModel::class, $dealerId);
+        $collectionMissing = $this->countMissingSyncStates('collections', 'collections', 'outbound', CollectionModel::class, $dealerId, function (QueryBuilder $query): void {
+            if (Schema::hasColumn('collections', 'sync_status')) {
+                $query->where(function (QueryBuilder $query): void {
+                    $query->whereNull('source.sync_status')->orWhere('source.sync_status', '<>', 'draft');
+                });
+            }
+        });
+
+        $posExpected = $this->countRows('pos_sales', $dealerId, function (QueryBuilder $query): void {
+            if (Schema::hasColumn('pos_sales', 'status')) {
+                $query->where('source.status', '<>', 'draft');
+            }
+        });
+        $posSync = $this->syncStateSummary('pos-sales', 'outbound', 'App\\Models\\PosSale', $dealerId);
+        $posMissing = $this->countMissingSyncStates('pos_sales', 'pos-sales', 'outbound', 'App\\Models\\PosSale', $dealerId, function (QueryBuilder $query): void {
+            if (Schema::hasColumn('pos_sales', 'status')) {
+                $query->where('source.status', '<>', 'draft');
+            }
+        });
+
+        $orderExpected = $this->countRows('orders', $dealerId, function (QueryBuilder $query): void {
+            if (Schema::hasColumn('orders', 'status')) {
+                $query->where('source.status', '<>', 'draft');
+            }
+        });
+        $orderSync = $this->syncStateSummary('orders', 'outbound', 'App\\Models\\Order', $dealerId);
+        $orderMissing = $this->countMissingSyncStates('orders', 'orders', 'outbound', 'App\\Models\\Order', $dealerId, function (QueryBuilder $query): void {
+            if (Schema::hasColumn('orders', 'status')) {
+                $query->where('source.status', '<>', 'draft');
+            }
+        });
+
+        $shipmentExpected = $this->countRows('shipments', $dealerId);
+        $shipmentSync = $this->syncStateSummary('warehouse-shipments', 'outbound', 'App\\Models\\Shipment', $dealerId);
+        $shipmentMissing = $this->countMissingSyncStates('shipments', 'warehouse-shipments', 'outbound', 'App\\Models\\Shipment', $dealerId);
+
+        $returnExpected = $this->countRows('return_requests', $dealerId);
+        $returnSync = $this->syncStateSummary('returns', 'outbound', 'App\\Models\\ReturnRequest', $dealerId);
+        $returnMissing = $this->countMissingSyncStates('return_requests', 'returns', 'outbound', 'App\\Models\\ReturnRequest', $dealerId);
+
+        return collect([
+            $this->syncGapRow(
+                key: 'products-inbound',
+                title: 'Ürün okuma',
+                flow: 'Logo -> B2B',
+                status: $this->syncGapStatus($productMissing, $productSync['failed'], $productStale),
+                expectedCount: (int) $productCounts['products_total'],
+                syncedCount: $productSync['records'],
+                missingCount: $productMissing,
+                staleCount: $productStale,
+                lastSyncedAt: $productSync['last_synced_at'],
+                lastActivityAt: $productSync['last_activity_at'],
+                detail: $productMissing > 0
+                    ? 'Logo ürün kaydı B2B sync state tablosunda eksik görünüyor.'
+                    : ($productStale > 0 ? 'Ürün sync zamanı iki saati geçti; hızlı ürün görevi kontrol edilmeli.' : 'Ürün okuma kayıtları tamam.')
+            ),
+            $this->syncGapRow(
+                key: 'products-shelf',
+                title: 'Ürün raf adresleri',
+                flow: 'Logo -> B2B',
+                status: $productShelfMissing > 0 ? 'warning' : 'ok',
+                expectedCount: (int) $productCounts['products_total'],
+                syncedCount: max(0, (int) $productCounts['products_total'] - $productShelfMissing),
+                missingCount: $productShelfMissing,
+                staleCount: 0,
+                lastSyncedAt: $productSync['last_synced_at'],
+                lastActivityAt: $productSync['last_activity_at'],
+                detail: $productShelfMissing > 0
+                    ? 'Logo raf kaynağı veya raf map dosyası eksik; ürün listesinde raf adresi boş kalır.'
+                    : 'Raf adresleri Logo payload içinde görünüyor.'
+            ),
+            $this->syncGapRow(
+                key: 'ledger-inbound',
+                title: 'Cari hesap hareketleri',
+                flow: 'Logo -> B2B',
+                status: $this->syncGapStatus($ledgerMissing, $ledgerSync['failed'], $ledgerStale, true),
+                expectedCount: $ledgerExpected,
+                syncedCount: $ledgerSync['records'],
+                missingCount: $ledgerMissing,
+                staleCount: $ledgerStale,
+                lastSyncedAt: $ledgerSync['last_synced_at'],
+                lastActivityAt: $ledgerSync['last_activity_at'],
+                detail: $ledgerMissing > 0
+                    ? 'Ledger kayıtları ile Logo sync state sayısı eşleşmiyor.'
+                    : ($ledgerStale > 0 ? 'Cari hareket sync zamanı bir günü geçti.' : 'Cari hareket okuma kayıtları tamam.')
+            ),
+            $this->syncGapRow(
+                key: 'collections-outbound',
+                title: 'Tahsilat yazma',
+                flow: 'B2B -> Logo',
+                status: $this->syncGapStatus($collectionMissing, $collectionSync['failed'], 0),
+                expectedCount: $collectionExpected,
+                syncedCount: $collectionSync['records'],
+                missingCount: $collectionMissing,
+                staleCount: 0,
+                lastSyncedAt: $collectionSync['last_synced_at'],
+                lastActivityAt: $collectionSync['last_activity_at'],
+                detail: $collectionMissing > 0 ? 'Taslak olmayan tahsilatlarda Logo yazma state eksik.' : 'Tahsilat yazma kayıtları tamam.'
+            ),
+            $this->syncGapRow(
+                key: 'pos-sales-outbound',
+                title: 'POS satış yazma',
+                flow: 'B2B -> Logo',
+                status: $this->syncGapStatus($posMissing, $posSync['failed'], 0),
+                expectedCount: $posExpected,
+                syncedCount: $posSync['records'],
+                missingCount: $posMissing,
+                staleCount: 0,
+                lastSyncedAt: $posSync['last_synced_at'],
+                lastActivityAt: $posSync['last_activity_at'],
+                detail: $posMissing > 0 ? 'POS satışlarda Logo yazma state eksik.' : 'POS satış yazma kayıtları tamam.'
+            ),
+            $this->syncGapRow(
+                key: 'orders-outbound',
+                title: 'Sipariş yazma',
+                flow: 'B2B -> Logo',
+                status: $this->syncGapStatus($orderMissing, $orderSync['failed'], 0),
+                expectedCount: $orderExpected,
+                syncedCount: $orderSync['records'],
+                missingCount: $orderMissing,
+                staleCount: 0,
+                lastSyncedAt: $orderSync['last_synced_at'],
+                lastActivityAt: $orderSync['last_activity_at'],
+                detail: $orderMissing > 0 ? 'Siparişlerde Logo yazma state eksik.' : 'Sipariş yazma kayıtları tamam.'
+            ),
+            $this->syncGapRow(
+                key: 'warehouse-shipments-outbound',
+                title: 'Depo sevkiyat yazma',
+                flow: 'B2B -> Logo',
+                status: $this->syncGapStatus($shipmentMissing, $shipmentSync['failed'], 0),
+                expectedCount: $shipmentExpected,
+                syncedCount: $shipmentSync['records'],
+                missingCount: $shipmentMissing,
+                staleCount: 0,
+                lastSyncedAt: $shipmentSync['last_synced_at'],
+                lastActivityAt: $shipmentSync['last_activity_at'],
+                detail: $shipmentMissing > 0 ? 'Depo sevkiyatında Logo yazma state eksik; paketleme/irsaliye akışı kontrol edilmeli.' : 'Depo sevkiyat yazma kayıtları tamam.'
+            ),
+            $this->syncGapRow(
+                key: 'returns-outbound',
+                title: 'İade yazma',
+                flow: 'B2B -> Logo',
+                status: $this->syncGapStatus($returnMissing, $returnSync['failed'], 0),
+                expectedCount: $returnExpected,
+                syncedCount: $returnSync['records'],
+                missingCount: $returnMissing,
+                staleCount: 0,
+                lastSyncedAt: $returnSync['last_synced_at'],
+                lastActivityAt: $returnSync['last_activity_at'],
+                detail: $returnMissing > 0 ? 'İade kayıtlarında Logo yazma state eksik.' : 'İade yazma kayıtları tamam.'
+            ),
+        ])
+            ->sortBy(fn (array $row): array => [$this->syncGapSeverityScore((string) $row['status']), $row['title']])
+            ->values()
+            ->all();
+    }
+
+    private function syncStateSummary(string $domain, string $direction, string $entityType, ?int $dealerId): array
+    {
+        $rows = IntegrationSyncState::query()
+            ->where('system', 'logo')
+            ->where('domain', $domain)
+            ->where('direction', $direction)
+            ->where('entity_type', $entityType)
+            ->when($dealerId !== null, fn (EloquentBuilder $query) => $query->where('dealer_id', $dealerId))
+            ->get(['status', 'last_error', 'last_synced_at', 'created_at', 'updated_at']);
+
+        $failed = $rows->filter(function (IntegrationSyncState $row): bool {
+            $status = $this->normalizeSyncStatus($row->status);
+
+            return in_array($status, ['failed', 'error'], true) || trim((string) $row->last_error) !== '';
+        })->count();
+
+        $lastSyncedAt = $rows
+            ->pluck('last_synced_at')
+            ->filter()
+            ->sortBy(fn ($value): int => Carbon::parse($value)->getTimestamp())
+            ->last();
+        $latest = $rows
+            ->sortByDesc(fn (IntegrationSyncState $row): int => $this->syncStateTimestamp($row))
+            ->first();
+
+        return [
+            'records' => $rows->count(),
+            'failed' => $failed,
+            'last_synced_at' => $lastSyncedAt,
+            'last_activity_at' => $latest?->updated_at ?? $latest?->last_synced_at,
+        ];
+    }
+
+    private function syncGapRow(
+        string $key,
+        string $title,
+        string $flow,
+        string $status,
+        int $expectedCount,
+        int $syncedCount,
+        int $missingCount,
+        int $staleCount,
+        mixed $lastSyncedAt,
+        mixed $lastActivityAt,
+        string $detail,
+    ): array {
+        return [
+            'key' => $key,
+            'title' => $title,
+            'flow' => $flow,
+            'status' => $status,
+            'expected_count' => max(0, $expectedCount),
+            'synced_count' => max(0, $syncedCount),
+            'missing_count' => max(0, $missingCount),
+            'stale_count' => max(0, $staleCount),
+            'last_synced_at' => $this->dateTimeJson($lastSyncedAt),
+            'last_activity_at' => $this->dateTimeJson($lastActivityAt),
+            'detail' => $detail,
+        ];
+    }
+
+    private function syncGapStatus(int $missingCount, int $failedCount, int $staleCount, bool $staleIsCritical = false): string
+    {
+        if ($failedCount > 0 || ($staleIsCritical && $staleCount > 0)) {
+            return 'critical';
+        }
+
+        if ($missingCount > 0 || $staleCount > 0) {
+            return 'warning';
+        }
+
+        return 'ok';
+    }
+
+    private function syncGapSeverityScore(string $status): int
+    {
+        return match ($status) {
+            'critical' => 0,
+            'warning' => 1,
+            'ok' => 2,
+            default => 3,
+        };
+    }
+
+    private function isSyncStale(mixed $value, int $minutes): bool
+    {
+        if (! $value) {
+            return true;
+        }
+
+        return Carbon::parse($value)->lt(now()->subMinutes($minutes));
+    }
+
+    private function countRows(string $table, ?int $dealerId = null, ?callable $filter = null): int
+    {
+        if (! Schema::hasTable($table)) {
+            return 0;
+        }
+
+        try {
+            $query = DB::table("{$table} as source");
+            $this->applyDealerFilter($query, $table, $dealerId);
+
+            if ($filter) {
+                $filter($query);
+            }
+
+            return (int) $query->count();
+        } catch (Throwable) {
+            return 0;
+        }
+    }
+
+    private function countMissingSyncStates(string $table, string $domain, string $direction, string $entityType, ?int $dealerId = null, ?callable $filter = null): int
+    {
+        if (! Schema::hasTable($table) || ! Schema::hasTable('integration_sync_states')) {
+            return 0;
+        }
+
+        try {
+            $query = DB::table("{$table} as source")
+                ->leftJoin('integration_sync_states as state', function ($join) use ($domain, $direction, $entityType): void {
+                    $join->on('state.entity_id', '=', 'source.id')
+                        ->where('state.system', '=', 'logo')
+                        ->where('state.domain', '=', $domain)
+                        ->where('state.direction', '=', $direction)
+                        ->where('state.entity_type', '=', $entityType);
+                })
+                ->whereNull('state.id');
+            $this->applyDealerFilter($query, $table, $dealerId);
+
+            if ($filter) {
+                $filter($query);
+            }
+
+            return (int) $query->count();
+        } catch (Throwable) {
+            return 0;
+        }
+    }
+
+    private function applyDealerFilter(QueryBuilder $query, string $table, ?int $dealerId): void
+    {
+        if ($dealerId !== null && Schema::hasColumn($table, 'dealer_id')) {
+            $query->where('source.dealer_id', $dealerId);
+        }
+    }
+
+    private function whereColumnIfExists(QueryBuilder $query, string $table, string $column, mixed $value): void
+    {
+        if (Schema::hasColumn($table, $column)) {
+            $query->where("source.{$column}", $value);
+        }
+    }
+
+    private function countLogoProductsWithoutShelfAddress(?int $dealerId): int
+    {
+        if (! Schema::hasTable('products')) {
+            return 0;
+        }
+
+        $query = Product::query()->select(['id', 'meta']);
+        $this->applyLogoProductFilter($query);
+
+        if ($dealerId !== null && Schema::hasColumn('products', 'dealer_id')) {
+            $query->where('products.dealer_id', $dealerId);
+        }
+
+        $scopeQuery = clone $query;
+        $latestUpdatedAt = (string) ($scopeQuery->toBase()->max('products.updated_at') ?? '');
+        $totalProducts = (clone $query)->count();
+        $cacheKey = sprintf(
+            'logo-dashboard:missing-product-shelf:v3:%s:%d:%s',
+            $dealerId ?? 'all',
+            $totalProducts,
+            md5($latestUpdatedAt)
+        );
+
+        return (int) Cache::remember($cacheKey, now()->addMinutes(2), function () use ($query, $totalProducts): int {
+            $count = 0;
+
+            try {
+                $query->chunkById(500, function ($products) use (&$count): void {
+                    foreach ($products as $product) {
+                        if (! $this->metaHasShelfAddress($product->meta)) {
+                            $count++;
+                        }
+                    }
+                }, 'id');
+            } catch (Throwable) {
+                return (int) $totalProducts;
+            }
+
+            return $count;
+        });
+    }
+
+    private function metaHasShelfAddress(mixed $meta): bool
+    {
+        if (is_string($meta)) {
+            $decoded = json_decode($meta, true);
+            $meta = is_array($decoded) ? $decoded : [];
+        }
+
+        if (! is_array($meta)) {
+            return false;
+        }
+
+        foreach ([
+            'integrations.logo.payload.shelf_address',
+            'integrations.logo.payload.raf',
+            'integrations.logo.payload.raf_adresi',
+            'integrations.logo.payload.logo_stock.shelf_address',
+        ] as $path) {
+            if ($this->nonBlankString(data_get($meta, $path)) !== null) {
+                return true;
+            }
+        }
+
+        $warehouses = data_get($meta, 'integrations.logo.payload.logo_stock.warehouses');
+        if (is_array($warehouses)) {
+            foreach ($warehouses as $warehouse) {
+                if (is_array($warehouse) && $this->nonBlankString(data_get($warehouse, 'shelf_address')) !== null) {
+                    return true;
+                }
+            }
+        }
+
+        $raw = data_get($meta, 'integrations.logo.payload.raw');
+        if (is_array($raw)) {
+            foreach ($raw as $key => $value) {
+                if ($this->isShelfAddressKey((string) $key) && $this->nonBlankString($value) !== null) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function isShelfAddressKey(string $key): bool
+    {
+        $normalized = strtoupper(str_replace([' ', '-', '.'], '_', $key));
+
+        return preg_match(
+            '/^(RAF(_?\d+)?|RAF_?ADRESI(_?\d+)?|RAF_?BILGISI(_?\d+)?|RAF_?BILGILERI(_?\d+)?|SHELF_?ADDRESS(_?\d+)?|LOCATION(_?CODE)?(_?\d+)?)$/',
+            $normalized
+        ) === 1;
+    }
+
+    private function nonBlankString(mixed $value): ?string
+    {
+        if ($value === null || is_array($value) || is_object($value)) {
+            return null;
+        }
+
+        $value = trim((string) $value);
+
+        return $value !== '' && $value !== '-' && preg_match('/^0+$/', $value) !== 1 ? $value : null;
+    }
+
+    private function normalizeSyncStatus(mixed $status): string
+    {
+        $value = strtolower(trim((string) $status));
+
+        return $value !== '' ? $value : 'unknown';
+    }
+
+    private function syncStateTimestamp(IntegrationSyncState $row): int
+    {
+        return collect([$row->updated_at, $row->last_synced_at, $row->created_at])
+            ->filter()
+            ->map(fn ($value): int => Carbon::parse($value)->getTimestamp())
+            ->max() ?? 0;
+    }
+
+    private function dateTimeJson(mixed $value): ?string
+    {
+        return $value ? Carbon::parse($value)->toJSON() : null;
     }
 
     private function money(mixed $value): string

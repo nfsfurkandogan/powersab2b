@@ -26,7 +26,8 @@ use Illuminate\Validation\ValidationException;
 
 class PosSaleService
 {
-    private const POINT_CURRENCY = 'GEL';
+    private const POINT_CURRENCY = 'TRY';
+    private const BATUM_POINT_CURRENCY = 'GEL';
 
     public function __construct(
         private readonly LedgerWriter $ledgerWriter,
@@ -41,7 +42,7 @@ class PosSaleService
     {
         return DB::transaction(function () use ($user, $payload) {
             $session = PosSession::query()
-                ->with('openedBy')
+                ->with(['openedBy', 'cashbox'])
                 ->lockForUpdate()
                 ->find((int) $payload['pos_session_id']);
 
@@ -52,6 +53,7 @@ class PosSaleService
             }
 
             $this->assertCanOperateSession($user, $session);
+            $pointCurrency = $this->pointCurrency($session, $user);
 
             $customer = Customer::query()->lockForUpdate()->find((int) $payload['customer_id']);
             if (! $customer instanceof Customer) {
@@ -113,7 +115,8 @@ class PosSaleService
 
             $totals = $this->calculateTotals(
                 $normalizedItems,
-                discountTotalCents: $this->toCents((float) ($payload['discount_total'] ?? 0))
+                discountTotalCents: $this->toCents((float) ($payload['discount_total'] ?? 0)),
+                applyVat: true
             );
 
             $paymentTotalCents = $paymentsPayload
@@ -176,7 +179,7 @@ class PosSaleService
                 'type' => 'invoice',
                 'debit' => $this->fromCents($totals['grand_total_cents']),
                 'credit' => 0,
-                'currency' => self::POINT_CURRENCY,
+                'currency' => $pointCurrency,
                 'reference_no' => $sale->receipt_no,
                 'description' => 'POS sale '.$sale->receipt_no,
                 'created_by_user_id' => $user->id,
@@ -208,7 +211,7 @@ class PosSaleService
                     'created_by_user_id' => $user->id,
                     'method' => $this->toCollectionMethod($payment->method),
                     'amount' => $payment->amount,
-                    'currency' => self::POINT_CURRENCY,
+                    'currency' => $pointCurrency,
                     'reference_no' => $sale->receipt_no,
                     'reference_fields' => [
                         'pos_payment_id' => $payment->id,
@@ -233,7 +236,7 @@ class PosSaleService
                     'type' => 'payment',
                     'debit' => 0,
                     'credit' => $payment->amount,
-                    'currency' => self::POINT_CURRENCY,
+                    'currency' => $pointCurrency,
                     'reference_no' => $sale->receipt_no,
                     'description' => 'POS payment '.$sale->receipt_no,
                     'created_by_user_id' => $user->id,
@@ -293,6 +296,7 @@ class PosSaleService
             }
 
             $this->assertCanOperateSession($user, $sale->posSession);
+            $pointCurrency = $this->pointCurrency($sale->posSession, $user);
 
             $stocks = StockSummary::query()
                 ->whereIn('product_id', $sale->items->pluck('product_id')->unique()->values())
@@ -337,7 +341,7 @@ class PosSaleService
                 'type' => 'credit',
                 'debit' => 0,
                 'credit' => $sale->grand_total,
-                'currency' => self::POINT_CURRENCY,
+                'currency' => $pointCurrency,
                 'reference_no' => $sale->receipt_no,
                 'description' => $cancelNote.' - reverse invoice '.$sale->receipt_no,
                 'created_by_user_id' => $user->id,
@@ -357,7 +361,7 @@ class PosSaleService
                     'created_by_user_id' => $user->id,
                     'method' => $this->toCollectionMethod($payment->method),
                     'amount' => number_format(-1 * (float) $payment->amount, 2, '.', ''),
-                    'currency' => self::POINT_CURRENCY,
+                    'currency' => $pointCurrency,
                     'reference_no' => $sale->receipt_no,
                     'reference_fields' => [
                         'reversal_of_pos_payment_id' => $payment->id,
@@ -379,7 +383,7 @@ class PosSaleService
                     'type' => 'debit',
                     'debit' => $payment->amount,
                     'credit' => 0,
-                    'currency' => self::POINT_CURRENCY,
+                    'currency' => $pointCurrency,
                     'reference_no' => $sale->receipt_no,
                     'description' => $cancelNote.' - reverse payment '.$sale->receipt_no,
                     'created_by_user_id' => $user->id,
@@ -497,7 +501,8 @@ class PosSaleService
 
             $totals = $this->calculateTotals(
                 $normalizedItems,
-                discountTotalCents: $this->toCents((float) ($payload['discount_total'] ?? 0))
+                discountTotalCents: $this->toCents((float) ($payload['discount_total'] ?? 0)),
+                applyVat: true
             );
 
             $paymentPayload = Arr::first((array) $payload['payments']);
@@ -714,6 +719,7 @@ class PosSaleService
         $newGrandTotal = (float) $sale->grand_total;
         $newPaymentTotal = (float) $payment->amount;
         $newCollectionMethod = $this->toCollectionMethod($payment->method);
+        $pointCurrency = $this->pointCurrencyForSale($sale, $user);
 
         Collection::query()
             ->where(function ($query) use ($sale, $oldReceiptNo): void {
@@ -724,7 +730,7 @@ class PosSaleService
             ->update([
                 'method' => $newCollectionMethod,
                 'amount' => number_format($newPaymentTotal, 2, '.', ''),
-                'currency' => self::POINT_CURRENCY,
+                'currency' => $pointCurrency,
                 'reference_no' => $sale->receipt_no,
                 'note' => 'POS payment '.$sale->receipt_no,
             ]);
@@ -750,7 +756,7 @@ class PosSaleService
                 'type' => $invoiceDelta > 0 ? 'invoice' : 'credit',
                 'debit' => $invoiceDelta > 0 ? number_format($invoiceDelta, 2, '.', '') : 0,
                 'credit' => $invoiceDelta < 0 ? number_format(abs($invoiceDelta), 2, '.', '') : 0,
-                'currency' => self::POINT_CURRENCY,
+                'currency' => $pointCurrency,
                 'reference_no' => $sale->receipt_no,
                 'description' => 'POS sale edit '.$sale->receipt_no,
                 'created_by_user_id' => $user->id,
@@ -778,7 +784,7 @@ class PosSaleService
                     'type' => $paymentDelta > 0 ? 'payment' : 'debit',
                     'debit' => $paymentDelta < 0 ? number_format(abs($paymentDelta), 2, '.', '') : 0,
                     'credit' => $paymentDelta > 0 ? number_format($paymentDelta, 2, '.', '') : 0,
-                    'currency' => self::POINT_CURRENCY,
+                    'currency' => $pointCurrency,
                     'reference_no' => $sale->receipt_no,
                     'description' => 'POS payment edit '.$sale->receipt_no,
                     'created_by_user_id' => $user->id,
@@ -792,6 +798,49 @@ class PosSaleService
                 ]);
             }
         }
+    }
+
+    private function pointCurrencyForSale(PosSale $sale, User $user): string
+    {
+        $sale->loadMissing('posSession.cashbox', 'posSession.openedBy');
+
+        return $this->pointCurrency($sale->posSession, $user);
+    }
+
+    private function pointCurrency(?PosSession $session, User $user): string
+    {
+        $session?->loadMissing('cashbox', 'openedBy');
+
+        $batumSignals = [
+            $user->branch_code,
+            $user->region_code,
+            $session?->openedBy?->branch_code,
+            $session?->openedBy?->region_code,
+            $session?->cashbox?->code,
+            $session?->cashbox?->name,
+        ];
+
+        foreach ($batumSignals as $value) {
+            if ($this->isBatumPointSignal($value)) {
+                return self::BATUM_POINT_CURRENCY;
+            }
+        }
+
+        return self::POINT_CURRENCY;
+    }
+
+    private function isBatumPointSignal(mixed $value): bool
+    {
+        $normalized = $this->normalizePointCurrencySignal($value);
+        $batumCashboxCode = $this->normalizePointCurrencySignal(config('integrations.pos.batum_point_cashbox_code'));
+
+        return str_contains($normalized, 'BATUM')
+            || ($batumCashboxCode !== '' && $normalized === $batumCashboxCode);
+    }
+
+    private function normalizePointCurrencySignal(mixed $value): string
+    {
+        return mb_strtoupper(trim((string) $value), 'UTF-8');
     }
 
     private function restoreSaleStock(PosSale $sale): void
@@ -821,7 +870,7 @@ class PosSaleService
      * @param  array<int, array<string, mixed>>  $items
      * @return array<string, mixed>
      */
-    private function calculateTotals(array $items, int $discountTotalCents): array
+    private function calculateTotals(array $items, int $discountTotalCents, bool $applyVat = true): array
     {
         $subtotalCents = collect($items)->sum('line_total_cents');
         $discountTotalCents = max(0, min($discountTotalCents, $subtotalCents));
@@ -843,10 +892,12 @@ class PosSaleService
 
             $remainingDiscount -= $lineDiscountCents;
             $taxBaseCents = max(0, $lineTotalCents - $lineDiscountCents);
-            $lineVatCents = (int) round($taxBaseCents * ((float) $item['vat_rate'] / 100));
+            $effectiveVatRate = $applyVat ? (float) $item['vat_rate'] : 0.0;
+            $lineVatCents = (int) round($taxBaseCents * ($effectiveVatRate / 100));
 
             $item['line_discount_cents'] = $lineDiscountCents;
             $item['line_vat_cents'] = $lineVatCents;
+            $item['vat_rate'] = $effectiveVatRate;
 
             $vatTotalCents += $lineVatCents;
         }

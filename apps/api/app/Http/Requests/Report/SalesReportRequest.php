@@ -46,6 +46,7 @@ class SalesReportRequest extends FormRequest
     {
         return [
             'dealer_id' => ['nullable', 'integer', 'exists:dealers,id'],
+            'customer_id' => ['nullable', 'integer', 'exists:customers,id'],
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date', 'after_or_equal:date_from'],
             'breakdown' => ['nullable', Rule::in(['product', 'brand', 'customer'])],

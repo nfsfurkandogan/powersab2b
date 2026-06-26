@@ -46,6 +46,7 @@ class PosQuickProductSearchController extends Controller
         $validated = $request->validated();
         $limit = min((int) ($validated['limit'] ?? 20), 20);
         $search = trim((string) $validated['q']);
+        $codeOnly = (bool) ($validated['code_only'] ?? false);
 
         $dealerContext = $this->resolveDealerContext($request->user(), $validated);
         if ($dealerContext === null) {
@@ -96,12 +97,47 @@ class PosQuickProductSearchController extends Controller
         $normalizedSearch = ProductCodeNormalizer::normalize($search);
 
         if ($this->isLikelyProductCodeSearch($search)) {
+            $exactProductIds = $codeOnly
+                ? $this->resolveDirectProductCodeIds($search, $normalizedSearch, $limit)
+                : $this->resolveExactProductCodeIds($search, $normalizedSearch, $limit);
+            if ($exactProductIds !== []) {
+                $exactQuery = clone $query;
+                $exactItems = $exactQuery
+                    ->whereIn('products.id', $exactProductIds)
+                    ->orderByRaw($this->productIdOrderSql($exactProductIds), $exactProductIds)
+                    ->limit($limit)
+                    ->get();
+
+                if ($exactItems->isNotEmpty()) {
+                    $cache = $this->cacheStore();
+
+                    $stockScope = $this->resolveStockVisibilityScope($request->user());
+
+                    return response()->json([
+                        'data' => $this->mapProducts($exactItems, $cache, $dealerId, $request->user(), $stockScope),
+                        'limit' => $limit,
+                        'search_backend' => 'pos_quick',
+                    ]);
+                }
+            }
+
+            if ($codeOnly) {
+                $cache = $this->cacheStore();
+                $stockScope = $this->resolveStockVisibilityScope($request->user());
+
+                return response()->json([
+                    'data' => $this->mapProducts(collect(), $cache, $dealerId, $request->user(), $stockScope),
+                    'limit' => $limit,
+                    'search_backend' => 'pos_quick',
+                ]);
+            }
+
             $exactMatchGroupCodes = $this->shouldResolveExactCodeMatchGroups($search, $normalizedSearch)
                 ? $this->resolveExactCodeMatchGroupCodes($search, $normalizedSearch)
                 : [];
 
             if ($exactMatchGroupCodes !== []) {
-                $groupProductIds = $this->matchingGroupProductIds($exactMatchGroupCodes, $limit);
+                $groupProductIds = $this->matchingGroupProductIds($exactMatchGroupCodes, $limit, $search, $normalizedSearch);
 
                 if ($groupProductIds !== []) {
                     $groupQuery = clone $query;
@@ -121,28 +157,6 @@ class PosQuickProductSearchController extends Controller
                             'search_backend' => 'pos_quick',
                         ]);
                     }
-                }
-            }
-
-            $exactProductIds = $this->resolveExactProductCodeIds($search, $normalizedSearch, $limit);
-            if ($exactProductIds !== []) {
-                $exactQuery = clone $query;
-                $exactItems = $exactQuery
-                    ->whereIn('products.id', $exactProductIds)
-                    ->orderByRaw($this->productIdOrderSql($exactProductIds), $exactProductIds)
-                    ->limit($limit)
-                    ->get();
-
-                if ($exactItems->isNotEmpty()) {
-                    $cache = $this->cacheStore();
-
-                    $stockScope = $this->resolveStockVisibilityScope($request->user());
-
-                    return response()->json([
-                        'data' => $this->mapProducts($exactItems, $cache, $dealerId, $request->user(), $stockScope),
-                        'limit' => $limit,
-                        'search_backend' => 'pos_quick',
-                    ]);
                 }
             }
 
@@ -375,6 +389,11 @@ class PosQuickProductSearchController extends Controller
             return null;
         }
 
+        $userScope = $this->resolveUserSpecificStockVisibilityScope($user);
+        if ($userScope !== null) {
+            return $userScope;
+        }
+
         $permissions = CustomerFeaturePermissions::forUser($user);
         if (! in_array('search.stock', $permissions, true)) {
             return [
@@ -399,6 +418,58 @@ class PosQuickProductSearchController extends Controller
         $names = [];
 
         foreach ($warehouseDefinitions as $warehouse) {
+            if (! isset($selectedLookup[$warehouse['key']])) {
+                continue;
+            }
+
+            foreach ($warehouse['codes'] as $code) {
+                $normalizedCode = $this->normalizeScopeText($code);
+                if ($normalizedCode !== null) {
+                    $codes[] = $normalizedCode;
+                }
+            }
+
+            foreach ($warehouse['names'] as $name) {
+                $normalizedName = $this->normalizeScopeText($name);
+                if ($normalizedName !== null) {
+                    $names[] = $normalizedName;
+                }
+            }
+        }
+
+        return [
+            'codes' => array_values(array_unique($codes)),
+            'names' => array_values(array_unique($names)),
+        ];
+    }
+
+    /**
+     * @return array{codes:list<string>,names:list<string>}|null
+     */
+    private function resolveUserSpecificStockVisibilityScope($user): ?array
+    {
+        $warehouseKeys = match ($this->normalizeScopeText($user->username)) {
+            'ERZURUM.HIZLISATIS' => [
+                'search.stock.warehouse.erzurum_point',
+                'search.stock.warehouse.erzurum_depo',
+            ],
+            'AHMET.ARAC',
+            'HUSEYIN.OZGUNEY',
+            'MEHMET.AKSOY' => [
+                'search.stock.warehouse.erzurum_depo',
+            ],
+            default => [],
+        };
+
+        if ($warehouseKeys === []) {
+            return null;
+        }
+
+        $selectedLookup = array_flip($warehouseKeys);
+        $codes = [];
+        $names = [];
+
+        foreach (CustomerFeaturePermissions::stockWarehouseDefinitions() as $warehouse) {
             if (! isset($selectedLookup[$warehouse['key']])) {
                 continue;
             }
@@ -684,6 +755,75 @@ class PosQuickProductSearchController extends Controller
     /**
      * @return list<int>
      */
+    private function resolveDirectProductCodeIds(string $search, ?string $normalizedSearch, int $limit): array
+    {
+        $lookupValues = $this->directProductCodeLookupValues($search, $normalizedSearch);
+
+        if ($lookupValues === []) {
+            return [];
+        }
+
+        $ids = Product::query()
+            ->select('products.id')
+            ->where('products.is_active', true)
+            ->where(function (Builder $builder) use ($lookupValues): void {
+                $builder
+                    ->whereIn('products.sku', $lookupValues)
+                    ->orWhereIn('products.oem_code', $lookupValues);
+            })
+            ->limit($limit)
+            ->pluck('products.id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function directProductCodeLookupValues(string $search, ?string $normalizedSearch): array
+    {
+        $values = [];
+        $trimmed = trim($search);
+
+        foreach ([$trimmed, mb_strtoupper($trimmed, 'UTF-8'), $normalizedSearch] as $value) {
+            if (is_string($value) && trim($value) !== '') {
+                $values[] = trim($value);
+            }
+        }
+
+        if ($normalizedSearch !== null && preg_match('/^[A-Z0-9]+$/', $normalizedSearch) === 1) {
+            if (preg_match('/^([A-Z]+)([0-9].*)$/', $normalizedSearch, $matches) === 1) {
+                $values[] = $matches[1].' '.$matches[2];
+                $values[] = $matches[1].'-'.$matches[2];
+            }
+
+            $length = strlen($normalizedSearch);
+            for ($prefixLength = 2; $prefixLength <= min(4, $length - 2); $prefixLength++) {
+                $prefix = substr($normalizedSearch, 0, $prefixLength);
+                $suffix = substr($normalizedSearch, $prefixLength);
+
+                if (preg_match('/[0-9]/', $suffix) !== 1) {
+                    continue;
+                }
+
+                $values[] = $prefix.' '.$suffix;
+                $values[] = $prefix.'-'.$suffix;
+            }
+        }
+
+        return collect($values)
+            ->map(fn (string $value): string => trim($value))
+            ->filter(fn (string $value): bool => $value !== '')
+            ->unique(fn (string $value): string => mb_strtoupper($value, 'UTF-8'))
+            ->values()
+            ->all();
+    }
+
+    /**
+     * @return list<int>
+     */
     private function resolveExactProductCodeIds(string $search, ?string $normalizedSearch, int $limit): array
     {
         $ids = Product::query()
@@ -784,7 +924,7 @@ class PosQuickProductSearchController extends Controller
      * @param  list<string>  $groupCodes
      * @return list<int>
      */
-    private function matchingGroupProductIds(array $groupCodes, int $limit): array
+    private function matchingGroupProductIds(array $groupCodes, int $limit, string $search, ?string $normalizedSearch): array
     {
         $lookupCodes = collect($groupCodes)
             ->map(fn (string $groupCode): string => trim($groupCode))
@@ -821,12 +961,101 @@ class PosQuickProductSearchController extends Controller
 
         $this->applyPointProductVisibility($query);
 
-        return $query
+        $priorityProductIds = $this->resolveNormalizedProductCodeIds($search, $normalizedSearch, $limit);
+        $case = 'CASE '
+            .'WHEN products.sku = ? THEN 0 '
+            .'WHEN products.oem_code = ? THEN 1 ';
+        $bindings = [$search, $search];
+
+        if ($normalizedSearch !== null) {
+            $case .= 'WHEN '.$this->normalizedProductCodeSql('products.sku').' = ? THEN 2 '
+                .'WHEN '.$this->normalizedProductCodeSql('products.oem_code').' = ? THEN 3 '
+                .'WHEN EXISTS ('
+                .'SELECT 1 FROM product_code_aliases pca_exact '
+                .'WHERE pca_exact.product_id = products.id '
+                .'AND pca_exact.normalized_code = ?'
+                .') THEN 4 ';
+            $bindings[] = $normalizedSearch;
+            $bindings[] = $normalizedSearch;
+            $bindings[] = $normalizedSearch;
+        }
+
+        $case .= 'ELSE 5 END';
+
+        $groupProductIds = $query
+            ->orderByRaw($case, $bindings)
             ->orderByDesc('products.id')
             ->limit($limit)
             ->pluck('products.id')
             ->map(fn ($id) => (int) $id)
             ->all();
+
+        return collect([...$priorityProductIds, ...$groupProductIds])
+            ->unique()
+            ->take($limit)
+            ->values()
+            ->all();
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function resolveNormalizedProductCodeIds(string $search, ?string $normalizedSearch, int $limit): array
+    {
+        if ($normalizedSearch === null) {
+            return [];
+        }
+
+        $query = Product::query()
+            ->select('products.id')
+            ->where('products.is_active', true)
+            ->where(function (Builder $query): void {
+                $this->applyLogoProductFilter($query);
+            })
+            ->where(function (Builder $query) use ($search, $normalizedSearch): void {
+                $query
+                    ->where('products.sku', $search)
+                    ->orWhere('products.oem_code', $search)
+                    ->orWhereRaw($this->normalizedProductCodeSql('products.sku').' = ?', [$normalizedSearch])
+                    ->orWhereRaw($this->normalizedProductCodeSql('products.oem_code').' = ?', [$normalizedSearch])
+                    ->orWhereExists(function ($aliasQuery) use ($normalizedSearch): void {
+                        $aliasQuery->selectRaw('1')
+                            ->from('product_code_aliases as pca')
+                            ->whereColumn('pca.product_id', 'products.id')
+                            ->where('pca.normalized_code', $normalizedSearch);
+                    });
+            });
+
+        $this->applyPointProductVisibility($query);
+
+        return $query
+            ->orderByRaw($this->productCodePrioritySql($search, $normalizedSearch), [
+                $search,
+                $search,
+                $normalizedSearch,
+                $normalizedSearch,
+                $normalizedSearch,
+            ])
+            ->orderByDesc('products.id')
+            ->limit($limit)
+            ->pluck('products.id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+    }
+
+    private function productCodePrioritySql(string $search, ?string $normalizedSearch): string
+    {
+        return 'CASE '
+            .'WHEN products.sku = ? THEN 0 '
+            .'WHEN products.oem_code = ? THEN 1 '
+            .'WHEN '.$this->normalizedProductCodeSql('products.sku').' = ? THEN 2 '
+            .'WHEN '.$this->normalizedProductCodeSql('products.oem_code').' = ? THEN 3 '
+            .'WHEN EXISTS ('
+            .'SELECT 1 FROM product_code_aliases pca_exact '
+            .'WHERE pca_exact.product_id = products.id '
+            .'AND pca_exact.normalized_code = ?'
+            .') THEN 4 '
+            .'ELSE 5 END';
     }
 
     private function applyPointProductVisibility(Builder $query): void

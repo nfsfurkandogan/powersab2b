@@ -17,6 +17,8 @@ use App\Support\Pricing\DisplayCurrency;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
@@ -34,6 +36,7 @@ class CustomerCollectionController extends Controller
         $dateColumn = 'COALESCE(`date`, collection_date)';
         $user = $request->user();
         $displayUser = $user instanceof User ? $user : null;
+        $collectionSummary = $this->collectionSummaryPayload($customer, $dateFrom, $dateTo, $displayUser);
 
         if ($method === 'invoice') {
             $invoiceQuery = $this->invoiceQuery($customer, $dateFrom, $dateTo)
@@ -49,7 +52,8 @@ class CustomerCollectionController extends Controller
                     'date_from' => $dateFrom,
                     'date_to' => $dateTo,
                 ],
-                'tabs' => $this->collectionTabs($customer, $dateFrom, $dateTo, $displayUser),
+                'tabs' => $collectionSummary['tabs'],
+                'logo_sync' => $collectionSummary['logo_sync'],
                 'data' => collect($paginator->items())
                     ->map(fn (LedgerEntry $item) => $this->invoiceEntryPayload($item, $displayUser))
                     ->values(),
@@ -79,7 +83,8 @@ class CustomerCollectionController extends Controller
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
             ],
-            'tabs' => $this->collectionTabs($customer, $dateFrom, $dateTo, $displayUser),
+            'tabs' => $collectionSummary['tabs'],
+            'logo_sync' => $collectionSummary['logo_sync'],
             'data' => collect($paginator->items())
                 ->map(fn ($item) => (new CollectionResource($item))->toArray($request))
                 ->values(),
@@ -92,13 +97,18 @@ class CustomerCollectionController extends Controller
         ]);
     }
 
-    private function collectionTabs(Customer $customer, ?string $dateFrom, ?string $dateTo, ?User $user)
+    /**
+     * @return array{tabs:Collection<int, array{method:string,count:int,total_amount:string}>,logo_sync:array{draft:int,pending:int,reviewing:int,synced:int,failed:int,latest_synced_at:?string}}
+     */
+    private function collectionSummaryPayload(Customer $customer, ?string $dateFrom, ?string $dateTo, ?User $user): array
     {
-        return collect(['cash', 'transfer', 'check', 'cc', 'factory_cc', 'invoice'])
-            ->map(function (string $method) use ($customer, $dateFrom, $dateTo, $user): array {
-                $summary = $method === 'invoice'
-                    ? $this->invoiceTabSummary($customer, $dateFrom, $dateTo, $user)
-                    : $this->collectionTabSummary($customer, $dateFrom, $dateTo, $method, $user);
+        $collectionSummary = $this->collectionTabSummaries($customer, $dateFrom, $dateTo, $user);
+        $summaries = $collectionSummary['tabs'];
+        $summaries['invoice'] = $this->invoiceTabSummary($customer, $dateFrom, $dateTo, $user);
+
+        $tabs = collect(['cash', 'transfer', 'check', 'cc', 'factory_cc', 'invoice'])
+            ->map(function (string $method) use ($summaries): array {
+                $summary = $summaries[$method] ?? ['count' => 0, 'total_amount' => 0.0];
 
                 return [
                     'method' => $method,
@@ -107,31 +117,90 @@ class CustomerCollectionController extends Controller
                 ];
             })
             ->values();
+
+        return [
+            'tabs' => $tabs,
+            'logo_sync' => $collectionSummary['logo_sync'],
+        ];
     }
 
     /**
-     * @return array{count:int,total_amount:float}
+     * @return array{tabs:array<string, array{count:int,total_amount:float}>,logo_sync:array{draft:int,pending:int,reviewing:int,synced:int,failed:int,latest_synced_at:?string}}
      */
-    private function collectionTabSummary(Customer $customer, ?string $dateFrom, ?string $dateTo, string $method, ?User $user): array
+    private function collectionTabSummaries(Customer $customer, ?string $dateFrom, ?string $dateTo, ?User $user): array
     {
         $dateColumn = 'COALESCE(`date`, collection_date)';
-        $query = CollectionModel::query()
+        $channelExpression = $this->collectionChannelExpression();
+        $rows = CollectionModel::query()
             ->where('customer_id', $customer->id)
             ->when(! empty($dateFrom), fn ($q) => $q->whereRaw("DATE({$dateColumn}) >= ?", [$dateFrom]))
-            ->when(! empty($dateTo), fn ($q) => $q->whereRaw("DATE({$dateColumn}) <= ?", [$dateTo]));
-
-        $this->applyCollectionMethodFilter($query, $method);
-        $currencyTotals = (clone $query)
+            ->when(! empty($dateTo), fn ($q) => $q->whereRaw("DATE({$dateColumn}) <= ?", [$dateTo]))
+            ->selectRaw('method')
             ->selectRaw("UPPER(COALESCE(currency, 'TRY')) as currency")
+            ->selectRaw("{$channelExpression} as collection_channel")
+            ->selectRaw("COALESCE(sync_status, 'draft') as sync_status")
+            ->selectRaw('COUNT(*) as entry_count')
             ->selectRaw('SUM(amount) as total_amount')
-            ->groupByRaw("UPPER(COALESCE(currency, 'TRY'))")
+            ->selectRaw('MAX(last_synced_at) as latest_synced_at')
+            ->groupByRaw("method, UPPER(COALESCE(currency, 'TRY')), {$channelExpression}, COALESCE(sync_status, 'draft')")
             ->get();
 
+        $summaries = [
+            'cash' => ['count' => 0, 'total_amount' => 0.0],
+            'transfer' => ['count' => 0, 'total_amount' => 0.0],
+            'check' => ['count' => 0, 'total_amount' => 0.0],
+            'cc' => ['count' => 0, 'total_amount' => 0.0],
+            'factory_cc' => ['count' => 0, 'total_amount' => 0.0],
+        ];
+        $logoSync = [
+            'draft' => 0,
+            'pending' => 0,
+            'reviewing' => 0,
+            'synced' => 0,
+            'failed' => 0,
+            'latest_synced_at' => null,
+        ];
+
+        foreach ($rows as $row) {
+            $method = (string) $row->method;
+            $summaryKey = match (true) {
+                $method === 'cc' && (string) $row->collection_channel === 'factory' => 'factory_cc',
+                $method === 'cc' => 'cc',
+                $method === 'check' || $method === 'note' => 'check',
+                default => $method,
+            };
+
+            if (! array_key_exists($summaryKey, $summaries)) {
+                continue;
+            }
+
+            $summaries[$summaryKey]['count'] += (int) $row->entry_count;
+            $summaries[$summaryKey]['total_amount'] += DisplayCurrency::convertPrice(
+                (float) $row->total_amount,
+                (string) $row->currency,
+                $user
+            );
+
+            $status = (string) $row->sync_status;
+
+            if (array_key_exists($status, $logoSync)) {
+                $logoSync[$status] += (int) $row->entry_count;
+            }
+
+            if ($row->latest_synced_at !== null) {
+                $logoSync['latest_synced_at'] = collect([$logoSync['latest_synced_at'], (string) $row->latest_synced_at])
+                    ->filter()
+                    ->max();
+            }
+        }
+
+        if ($logoSync['latest_synced_at'] !== null) {
+            $logoSync['latest_synced_at'] = Carbon::parse($logoSync['latest_synced_at'])->toJSON();
+        }
+
         return [
-            'count' => (int) (clone $query)->count(),
-            'total_amount' => (float) $currencyTotals->sum(
-                fn ($row) => DisplayCurrency::convertPrice((float) $row->total_amount, (string) $row->currency, $user)
-            ),
+            'tabs' => $summaries,
+            'logo_sync' => $logoSync,
         ];
     }
 
@@ -193,6 +262,16 @@ class CustomerCollectionController extends Controller
             ->where('type', 'invoice')
             ->when(! empty($dateFrom), fn ($q) => $q->whereRaw('DATE(COALESCE(`date`, entry_date)) >= ?', [$dateFrom]))
             ->when(! empty($dateTo), fn ($q) => $q->whereRaw('DATE(COALESCE(`date`, entry_date)) <= ?', [$dateTo]));
+    }
+
+    private function collectionChannelExpression(): string
+    {
+        return match (DB::connection()->getDriverName()) {
+            'pgsql' => "reference_fields->>'collection_channel'",
+            'mysql', 'mariadb' => "JSON_UNQUOTE(JSON_EXTRACT(reference_fields, '$.collection_channel'))",
+            'sqlite' => "json_extract(reference_fields, '$.collection_channel')",
+            default => 'NULL',
+        };
     }
 
     /**

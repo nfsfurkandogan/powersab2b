@@ -21,6 +21,7 @@ use App\Support\Warehouse\CartWarehouseOptions;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
@@ -202,6 +203,117 @@ class WarehouseShipmentApiTest extends TestCase
             ->assertJsonPath('data.0.origin.source', 'order_checkout')
             ->assertJsonPath('data.0.origin.note', $orderNote)
             ->assertJsonPath('data.0.invoice.reference_no', $orderResponse->json('order.order_no'));
+    }
+
+    public function test_order_detail_uses_erzurum_depo_logo_shelf_address_for_warehouse_print(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-PRINT-RAF');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-WH-PRINT-RAF',
+            'sku' => 'SKU-WH-PRINT-RAF',
+            'quantity' => 2,
+            'stock_available' => 20,
+        ]);
+
+        $ctx['product']->forceFill([
+            'meta' => [
+                'shelf_address' => 'GENEL-RAF',
+                'integrations' => [
+                    'logo' => [
+                        'payload' => [
+                            'raw' => [
+                                'RAF25' => 'ERZ-RAF-25',
+                                'RAF55' => 'SAMSUN-RAF-55',
+                            ],
+                            'logo_stock' => [
+                                'warehouses' => [
+                                    [
+                                        'warehouse_code' => '3',
+                                        'warehouse_name' => 'SAMSUN DEPO',
+                                        'available_total' => 4,
+                                        'shelf_key' => '55',
+                                    ],
+                                    [
+                                        'warehouse_code' => '1',
+                                        'warehouse_name' => 'ERZURUM DEPO',
+                                        'available_total' => 13,
+                                        'shelf_key' => '25',
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])->save();
+
+        $this
+            ->getJson('/api/orders/'.$ctx['order']->id)
+            ->assertOk()
+            ->assertJsonPath('order.items.0.logo_stock.erzurum_depo_available_total', 13)
+            ->assertJsonPath('order.items.0.shelf_address', 'ERZ-RAF-25');
+    }
+
+    public function test_shipment_detail_uses_selected_warehouse_logo_stock_for_available_total(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-SHIP-ERZ-STOCK');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-WH-SHIP-ERZ-STOCK',
+            'sku' => 'SKU-WH-SHIP-ERZ-STOCK',
+            'quantity' => 5,
+            'stock_available' => 20,
+            'stock_reserved' => 0,
+            'warehouse_code' => '1',
+        ]);
+
+        $ctx['product']->forceFill([
+            'meta' => [
+                'integrations' => [
+                    'logo' => [
+                        'payload' => [
+                            'logo_stock' => [
+                                'warehouses' => [
+                                    [
+                                        'warehouse_code' => '0',
+                                        'warehouse_name' => 'ERZURUM POINT',
+                                        'available_total' => 20,
+                                    ],
+                                    [
+                                        'warehouse_code' => '1',
+                                        'warehouse_name' => 'ERZURUM DEPO',
+                                        'available_total' => 4,
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])->save();
+
+        $shipmentId = (int) $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ])
+            ->assertCreated()
+            ->assertJsonPath('data.remaining_items.0.logo_stock.available_total', 4)
+            ->json('data.shipment.id');
+
+        $this->postJson("/api/warehouse/shipments/{$shipmentId}/scan", [
+            'barcode' => $ctx['product']->sku,
+            'qty' => 5,
+        ])
+            ->assertOk()
+            ->assertJsonPath('data.shipment.status', 'picking')
+            ->assertJsonPath('data.shipped_items.0.shipped_qty', 4)
+            ->assertJsonPath('data.remaining_items.0.remaining_qty', 1)
+            ->assertJsonPath('data.remaining_items.0.logo_stock.available_total', 4);
     }
 
     public function test_batum_checkout_does_not_write_checkout_summary_mode(): void
@@ -388,6 +500,64 @@ class WarehouseShipmentApiTest extends TestCase
             ->assertSee('SHP-PRN-001');
     }
 
+    public function test_label_print_returns_large_shipping_label(): void
+    {
+        $dealer = $this->createDealer('DLR-LBL-001');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-LBL-001',
+            'customer_name' => 'Tekmil Otomotiv Bilal Tekmil',
+        ]);
+
+        $ctx['customer']->forceFill([
+            'phone' => null,
+            'city' => null,
+            'district' => null,
+            'meta' => [
+                'integrations' => [
+                    'logo' => [
+                        'payload' => [
+                            'raw' => [
+                                'ADDR1' => 'Yeni San. Sitesi G Blok No:7',
+                                'CITY' => 'Erzurum',
+                                'TOWN' => 'Horasan',
+                                'TELNRS1' => '05326229277',
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])->save();
+
+        $shipment = Shipment::query()->create([
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+            'shipment_no' => 'SHP-LBL-001',
+            'status' => 'draft',
+            'created_by' => $warehouseUser->id,
+        ]);
+
+        $response = $this->get('/api/warehouse/shipments/'.$shipment->id.'/print/label?package_no=1&package_total=2&desi=3&ship_time=5.06.2026%2010:58:31');
+
+        $response
+            ->assertOk()
+            ->assertHeader('content-type', 'text/html; charset=UTF-8')
+            ->assertSee('Kargo Etiketi')
+            ->assertSee('SHP-LBL-001')
+            ->assertSee('TEKMİL OTOMOTİV BİLAL TEKMİL')
+            ->assertSee('YENİ SAN. SİTESİ G BLOK NO:7')
+            ->assertSee('HORASAN/ERZURUM/HORASAN')
+            ->assertSee('05326229277')
+            ->assertSee('Sevkiyat')
+            ->assertSee('Sipariş')
+            ->assertSee('ORD-LBL-001')
+            ->assertSee('5.06.2026 10:58:31')
+            ->assertDontSee('3 Desi')
+            ->assertDontSee('Koli No: 1/2');
+    }
+
     public function test_salesperson_cannot_access_print_endpoints(): void
     {
         $dealer = $this->createDealer('DLR-PRN-002');
@@ -445,6 +615,27 @@ class WarehouseShipmentApiTest extends TestCase
             ->assertJsonPath('data.0.order_no', 'ORD-READY-001');
 
         $this->assertNotSame($draftOrder['order']->id, $inScopeApproved['order']->id);
+    }
+
+    public function test_ready_orders_can_be_found_by_printed_order_barcode_id(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-BARCODE');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-BARCODE-LOOKUP',
+            'customer_code' => 'SCAN-CUSTOMER',
+            'customer_name' => 'Barcode Lookup Customer',
+        ]);
+
+        $response = $this->getJson('/api/warehouse/orders/ready?q='.$ctx['order']->id);
+
+        $response
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $ctx['order']->id)
+            ->assertJsonPath('data.0.order_no', 'ORD-BARCODE-LOOKUP');
     }
 
     public function test_warehouse_user_can_view_order_detail_in_scope(): void
@@ -677,6 +868,195 @@ class WarehouseShipmentApiTest extends TestCase
         ]);
     }
 
+    public function test_open_draft_shipment_resyncs_when_order_item_changes(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-DYN-001');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-WH-DYN-001',
+            'sku' => 'SKU-DYN-OLD',
+            'product_name' => 'Old Shipment Product',
+            'quantity' => 2,
+            'unit_net_price' => 100,
+        ]);
+
+        $createResponse = $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ]);
+
+        $createResponse
+            ->assertCreated()
+            ->assertJsonPath('data.remaining_items.0.sku', 'SKU-DYN-OLD')
+            ->assertJsonPath('data.remaining_items.0.unit_price', '100.00');
+
+        $shipmentId = (int) $createResponse->json('data.shipment.id');
+
+        $replacementProduct = Product::withoutEvents(function (): Product {
+            return Product::query()->create([
+                'sku' => 'SKU-DYN-NEW',
+                'oem_code' => 'OEM-DYN-NEW',
+                'name' => 'New Dynamic Product',
+                'vat_rate' => 10,
+                'is_active' => true,
+                'meta' => ['barcode' => 'BC-DYN-NEW'],
+            ]);
+        });
+
+        StockSummary::query()->create([
+            'product_id' => $replacementProduct->id,
+            'available_total' => 13,
+            'reserved_total' => 0,
+            'updated_at' => now(),
+        ]);
+
+        $ctx['orderItem']->forceFill([
+            'product_id' => $replacementProduct->id,
+            'quantity' => 3,
+            'unit_net_price' => 275,
+            'tax_rate' => 10,
+            'line_total' => 825,
+        ])->save();
+
+        $ctx['order']->forceFill([
+            'subtotal' => 825,
+            'tax_total' => 82.50,
+            'grand_total' => 907.50,
+        ])->save();
+
+        $syncResponse = $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ]);
+
+        $syncResponse
+            ->assertCreated()
+            ->assertJsonPath('data.shipment.id', $shipmentId)
+            ->assertJsonPath('data.shipment.order.grand_total', '907.50')
+            ->assertJsonPath('data.remaining_items.0.sku', 'SKU-DYN-NEW')
+            ->assertJsonPath('data.remaining_items.0.name', 'New Dynamic Product')
+            ->assertJsonPath('data.remaining_items.0.ordered_qty', 3)
+            ->assertJsonPath('data.remaining_items.0.unit_price', '275.00')
+            ->assertJsonPath('data.remaining_items.0.vat_rate', '10.00');
+
+        $this->assertDatabaseMissing('shipment_items', [
+            'shipment_id' => $shipmentId,
+            'product_id' => $ctx['product']->id,
+        ]);
+    }
+
+    public function test_open_shipment_can_add_order_item_product(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-ADD-001');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-WH-ADD-001',
+            'quantity' => 1,
+            'unit_net_price' => 100,
+        ]);
+
+        $newProduct = Product::withoutEvents(function (): Product {
+            return Product::query()->create([
+                'sku' => 'SKU-WH-ADD',
+                'oem_code' => 'OEM-WH-ADD',
+                'name' => 'Added Shipment Product',
+                'vat_rate' => 20,
+                'is_active' => true,
+                'meta' => ['barcode' => 'BC-WH-ADD'],
+            ]);
+        });
+
+        StockSummary::query()->create([
+            'product_id' => $newProduct->id,
+            'available_total' => 11,
+            'reserved_total' => 0,
+            'updated_at' => now(),
+        ]);
+
+        $createResponse = $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ]);
+
+        $shipmentId = (int) $createResponse->json('data.shipment.id');
+
+        $response = $this->postJson("/api/warehouse/shipments/{$shipmentId}/add-item", [
+            'product_id' => $newProduct->id,
+            'quantity' => 3,
+            'unit_net_price' => 50,
+            'tax_rate' => 20,
+        ]);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('data.message', 'Ürün siparişe eklendi.')
+            ->assertJsonPath('data.totals.ordered_qty_total', 4)
+            ->assertJsonPath('data.shipment.order.grand_total', '300.00');
+
+        $this->assertDatabaseHas('order_items', [
+            'order_id' => $ctx['order']->id,
+            'product_id' => $newProduct->id,
+            'quantity' => 3,
+            'unit_net_price' => '50.00',
+            'line_total' => '150.00',
+        ]);
+
+        $this->assertDatabaseHas('shipment_items', [
+            'shipment_id' => $shipmentId,
+            'product_id' => $newProduct->id,
+            'ordered_qty' => 3,
+            'shipped_qty' => 0,
+        ]);
+    }
+
+    public function test_open_shipment_can_update_item_quantity(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-QTY-003');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-WH-QTY-003',
+            'quantity' => 2,
+            'unit_net_price' => 80,
+            'tax_rate' => 10,
+        ]);
+
+        $createResponse = $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ]);
+
+        $shipmentId = (int) $createResponse->json('data.shipment.id');
+        $shipmentItemId = (int) $createResponse->json('data.remaining_items.0.id');
+
+        $response = $this->patchJson("/api/warehouse/shipments/{$shipmentId}/items/{$shipmentItemId}/quantity", [
+            'quantity' => 5,
+        ]);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('data.message', 'Sipariş miktarı güncellendi.')
+            ->assertJsonPath('data.remaining_items.0.ordered_qty', 5)
+            ->assertJsonPath('data.remaining_items.0.remaining_qty', 5)
+            ->assertJsonPath('data.shipment.order.grand_total', '440.00');
+
+        $this->assertDatabaseHas('order_items', [
+            'id' => $ctx['orderItem']->id,
+            'quantity' => 5,
+            'line_total' => '400.00',
+        ]);
+
+        $this->assertDatabaseHas('shipment_items', [
+            'id' => $shipmentItemId,
+            'ordered_qty' => 5,
+        ]);
+    }
+
     public function test_can_create_scan_and_finalize_shipment(): void
     {
         $dealer = $this->createDealer('DLR-FIN-001');
@@ -722,6 +1102,7 @@ class WarehouseShipmentApiTest extends TestCase
             ->assertJsonPath('data.shipment.status', 'shipped')
             ->assertJsonPath('data.shipment.logo_sync_status', 'queued')
             ->assertJsonPath('data.shipment.order.status', 'shipped')
+            ->assertJsonCount(0, 'data.shipped_items')
             ->assertJsonPath('data.message', 'Sevkiyat finalize edildi.');
 
         $stock = StockSummary::query()->findOrFail($ctx['product']->id);
@@ -738,6 +1119,110 @@ class WarehouseShipmentApiTest extends TestCase
             'type' => 'out',
             'source' => 'shipment',
             'source_id' => $shipmentId,
+        ]);
+    }
+
+    public function test_scan_caps_full_row_pick_to_available_stock_and_keeps_remainder(): void
+    {
+        $dealer = $this->createDealer('DLR-WH-STOCK-CAP');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-WH-STOCK-CAP',
+            'quantity' => 5,
+            'stock_available' => 4,
+            'stock_reserved' => 0,
+        ]);
+
+        $shipmentId = (int) $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ])->json('data.shipment.id');
+
+        $this->postJson("/api/warehouse/shipments/{$shipmentId}/scan", [
+            'barcode' => $ctx['product']->sku,
+            'qty' => 5,
+        ])
+            ->assertOk()
+            ->assertJsonPath('data.shipment.status', 'picking')
+            ->assertJsonPath('data.shipped_items.0.shipped_qty', 4)
+            ->assertJsonPath('data.shipped_items.0.remaining_qty', 1)
+            ->assertJsonPath('data.remaining_items.0.remaining_qty', 1)
+            ->assertJsonPath('data.totals.shipped_qty_total', 4)
+            ->assertJsonPath('data.totals.remaining_qty_total', 1);
+
+        $this->assertDatabaseHas('shipment_items', [
+            'shipment_id' => $shipmentId,
+            'product_id' => $ctx['product']->id,
+            'ordered_qty' => 5,
+            'shipped_qty' => 4,
+        ]);
+    }
+
+    public function test_finalize_shipment_can_export_invoice_to_logo_immediately(): void
+    {
+        config()->set('integrations.logo.shipments.immediate_export.enabled', true);
+        config()->set('integrations.logo.shipments.immediate_export.url', 'https://logo-bridge.test/shipments/export');
+        config()->set('integrations.logo.shipments.immediate_export.token', 'test-token');
+
+        Http::fake([
+            'https://logo-bridge.test/shipments/export' => Http::response([
+                'status' => 'synced',
+                'external_ref' => 'INVOICE-12345',
+                'meta' => [
+                    'invoice_ref' => 12345,
+                    'clfline_ref' => 67890,
+                ],
+            ]),
+        ]);
+
+        $dealer = $this->createDealer('DLR-LOGO-NOW');
+        $warehouseUser = $this->createUserWithRole('warehouse', $dealer);
+        $this->actingAs($warehouseUser);
+
+        $ctx = $this->createApprovedOrderContext($dealer, $warehouseUser, [
+            'order_no' => 'ORD-LOGO-NOW',
+            'quantity' => 1,
+            'unit_net_price' => 100,
+            'customer_code' => '120-25-011',
+            'customer_name' => 'Favori Yag',
+        ]);
+
+        $shipmentId = (int) $this->postJson('/api/warehouse/shipments', [
+            'order_id' => $ctx['order']->id,
+            'warehouse_id' => $ctx['warehouse']->id,
+        ])->json('data.shipment.id');
+
+        $this->postJson("/api/warehouse/shipments/{$shipmentId}/scan", [
+            'barcode' => $ctx['product']->sku,
+            'qty' => 1,
+        ])->assertOk();
+
+        $this->postJson("/api/warehouse/shipments/{$shipmentId}/finalize")
+            ->assertOk()
+            ->assertJsonPath('data.shipment.logo_sync_status', 'synced')
+            ->assertJsonPath('data.shipment.logo_external_ref', 'INVOICE-12345')
+            ->assertJsonPath('data.message', 'Sevkiyat finalize edildi ve Logo faturasi aktarildi.');
+
+        Http::assertSent(function ($request): bool {
+            $payload = $request->data();
+
+            return $request->url() === 'https://logo-bridge.test/shipments/export'
+                && $request->hasHeader('Authorization', 'Bearer test-token')
+                && data_get($payload, 'record.shipment_id') !== null
+                && data_get($payload, 'record.logo.document_type') === 'wholesale_sales_invoice'
+                && data_get($payload, 'record.logo.ledger_trcode') === 38;
+        });
+
+        $this->assertDatabaseHas('integration_sync_states', [
+            'system' => 'logo',
+            'domain' => 'warehouse-shipments',
+            'direction' => 'outbound',
+            'entity_type' => Shipment::class,
+            'entity_id' => $shipmentId,
+            'status' => 'synced',
+            'external_ref' => 'INVOICE-12345',
         ]);
     }
 
