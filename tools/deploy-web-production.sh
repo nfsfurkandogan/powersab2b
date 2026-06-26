@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEB_DIR="$ROOT_DIR/apps/web"
 
 REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_HOST="${REMOTE_HOST:-72.60.89.10}"
+REMOTE_HOST="${REMOTE_HOST:-62.72.20.30}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/powersab2b.com/web}"
 

@@ -25,15 +25,19 @@ return new class extends Migration
             $table->index(['dealer_id', 'method', 'date'], 'collections_dealer_method_date_index');
         });
 
+        $grammar = DB::connection()->getQueryGrammar();
+        $dateColumn = $grammar->wrap('date');
+        $referenceFieldsExpression = match (DB::getDriverName()) {
+            'pgsql' => "json_build_object('reference_no', reference_no, 'legacy_meta', meta)",
+            default => "JSON_OBJECT('reference_no', reference_no, 'legacy_meta', meta)",
+        };
+
         DB::statement("
             UPDATE collections
             SET
-                `date` = collection_date,
+                {$dateColumn} = collection_date,
                 created_by_user_id = collected_by_user_id,
-                reference_fields = JSON_OBJECT(
-                    'reference_no', reference_no,
-                    'legacy_meta', meta
-                )
+                reference_fields = {$referenceFieldsExpression}
         ");
     }
 

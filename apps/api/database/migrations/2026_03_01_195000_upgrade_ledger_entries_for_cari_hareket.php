@@ -24,11 +24,15 @@ return new class extends Migration
             $table->index(['dealer_id', 'type', 'date'], 'ledger_entries_dealer_type_date_index');
         });
 
+        $grammar = DB::connection()->getQueryGrammar();
+        $dateColumn = $grammar->wrap('date');
+        $typeColumn = $grammar->wrap('type');
+
         DB::statement("
             UPDATE ledger_entries
             SET
-                `date` = entry_date,
-                `type` = CASE
+                {$dateColumn} = entry_date,
+                {$typeColumn} = CASE
                     WHEN order_id IS NOT NULL THEN 'invoice'
                     WHEN collection_id IS NOT NULL THEN 'payment'
                     WHEN entry_type = 'debit' THEN 'debit'
